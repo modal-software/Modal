@@ -75,7 +75,7 @@ typedef struct {
   Kind kind;
 } Keyword;
 
-Token tag(Kind kind, const char *start, int len, int line, int col);
+Token token_make(Kind kind, const char *start, int len, int line, int col);
 void init(Tokenizer *t, const char *buffer);
 Token next(Tokenizer *t);
 
