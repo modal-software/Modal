@@ -38,6 +38,7 @@ typedef enum {
   ELLIPSIS,
   DOTDOT,
   ARROW,
+  STRING,
 } Kind;
 
 typedef enum {
@@ -48,7 +49,7 @@ typedef enum {
   INT,
   FLOAT,
   FSTRING,
-  STRING,
+  STRING_LIT,
   BLOCK_COMMENT,
   LINE_COMMENT,
   PREPROC,
