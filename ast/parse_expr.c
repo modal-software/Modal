@@ -1,4 +1,3 @@
-#include "ast.c"
 #include "parser.h"
 #include <stdlib.h>
 
