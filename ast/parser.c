@@ -33,45 +33,6 @@ void parser_consume(Parser *p, Kind kind, const char *msg) {
   parser_error_at(p, &p->current, msg);
 }
 
-void parser_error_at(Parser *p, Token *tok, const char *fmt, ...) {
-  p->had_error = 1;
-
-  fprintf(stderr, "error [%s:%d:%d]: ", p->filename, tok->line, tok->col);
-
-  va_list args;
-  va_start(args, fmt);
-  vfprintf(stderr, fmt, args);
-  va_end(args);
-
-  fprintf(stderr, "\n  | ");
-
-  // Mostra linha do fonte (simples por agora)
-  const char *line_start = tok->start;
-  while (line_start > p->lexer->buffer && *(line_start - 1) != '\n')
-    line_start--;
-  const char *line_end = tok->start;
-  while (*line_end && *line_end != '\n')
-    line_end++;
-  fprintf(stderr, "%.*s\n  | ", (int)(line_end - line_start), line_start);
-
-  // Seta o ^
-  for (int i = 1; i < tok->col; i++)
-    fputc(' ', stderr);
-  fprintf(stderr, "^\n\n");
-}
-
-// Pula tokens até achar ; ou } ou EOF (recovery básico)
-void parser_synchronize(Parser *p) {
-  parser_advance(p);
-  while (p->current.kind != TOK_EOF) {
-    if (p->previous.kind == ';')
-      return;
-    if (p->current.kind == RBRACE)
-      return;
-    parser_advance(p);
-  }
-}
-
 // O entry point principal – parseia múltiplos statements até EOF
 AstNode *parse_program(Parser *p) {
   AstNode **stmts = NULL;
