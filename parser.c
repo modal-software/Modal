@@ -71,7 +71,7 @@ void error_at(Parser *p, Token *tok, const char *msg, const char *example_msg) {
     fputc(' ', stderr);
 
   fprintf(stderr, "^\n");
-  fprintf(stderr, "\nTry using: %s\n", example_msg);
+  warn_msg(example_msg);
   exit(1);
 }
 

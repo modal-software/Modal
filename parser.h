@@ -2,6 +2,7 @@
 #define PARSER_H
 
 #include "tokenizer/tokenizer.h"
+#include <stdio.h>
 
 typedef enum {
   AST_NUMBER,
@@ -58,6 +59,10 @@ typedef struct {
   ParseFn infix;
   Precedence precedence;
 } ParseRule;
+
+static void warn_msg(const char *msg) {
+  fprintf(stderr, "\nTry using: %s\n", msg);
+}
 
 void parser_init(Parser *p, Tokenizer *t, const char *filename);
 void parse_program(Parser *p);
