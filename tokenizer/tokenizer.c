@@ -93,8 +93,7 @@ Token next(Tokenizer *t) {
 
           if (curr == '\\' && peek_next(t) == '\n') {
             // Line continuation: pula o \n e continua na próxima linha
-            advance(t); // consome \
-                advance(t);  // consome \n
+            advance(t); // consome \n
             t->line++;  // atualiza linha (col volta pra 1 no advance)
             len += 2;
             continue;
@@ -105,7 +104,7 @@ Token next(Tokenizer *t) {
         }
 
         t->state = START; // volta pro estado normal
-        return token_make(PREPROC, start, len, start_line, start_col);
+        return token_make((Kind)PREPROC, start, len, start_line, start_col);
       }
 
       start = t->buffer + t->pos;
