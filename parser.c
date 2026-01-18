@@ -174,9 +174,9 @@ void parse_block(Parser *p) {
 // Statements parsing. Where things happen (success expression or errors)
 void parse_statement(Parser *p) {
   if (match(p, TEST)) {
-    expect(p, (Kind)IDENTIFIER, "expected `test` name", 1,
-           "test test_name {\n -- code goes "
-           "here \n}");
+    const char *msg = "\n\n test test_name {\n   -- code goes "
+                      "here \n  }";
+    expect(p, (Kind)IDENTIFIER, "expected `test` name", 1, msg);
     parse_block(p);
     return;
   }
