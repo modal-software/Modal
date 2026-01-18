@@ -3,7 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-const char *kind_to_string(Kind kind) {
+const char *parse_kind_to_string(Kind kind) {
   switch (kind) {
   case TOK_EOF:
     return "end of file";
@@ -26,7 +26,7 @@ const char *kind_to_string(Kind kind) {
   }
 }
 
-void get_source_line(const char *src, int line) {
+void parse_get_source_line(const char *src, int line) {
   int curr = 1;
   const char *p = src;
 
@@ -43,51 +43,59 @@ void get_source_line(const char *src, int line) {
   fprintf(stderr, "%.*s\n", (int)(p - start), start);
 }
 
-void parser_advance(Parser *p) {
+void parse_advance(Parser *p) {
   p->prev = p->curr;
   p->curr = next(p->tokenizer);
 }
 
-int match(Parser *p, Kind kind) {
+int parse_match(Parser *p, Kind kind) {
   if (p->curr.kind == kind) {
-    parser_advance(p);
+    parse_advance(p);
     return 1;
   }
   return 0;
 }
 
-void error_at(Parser *p, Token *tok, const char *msg, const char *example_msg) {
+// __attribute__((format(printf, 2, 3))) __attribute__((noreturn)) void
+// ast_error(Token *token, const char *format, ...) {
+//   va_list ap;
+//   va_start(ap, format);
+//   fprintf(stderr, "Error: Line %d, column %d: ", token->line, token->col);
+//   vfprintf(stderr, format, ap);
+//   fprintf(stderr, "\n");
+//   va_end(ap);
+//   exit(1);
+// }
+
+__attribute__((noreturn)) void error_at(Parser *ctx, Token *tok,
+                                        const char *msg, const char *hint) {
   fprintf(stderr,
           "error: %s\n"
           " --> %s:%d:%d\n"
           "  |\n"
           "%2d| ",
-          msg, p->filename, tok->line, tok->col, tok->line);
+          msg, ctx->filename, tok->line, tok->col, tok->line);
 
-  get_source_line(p->tokenizer->buffer, tok->line);
+  parse_get_source_line(ctx->tokenizer->buffer, tok->line);
 
   fprintf(stderr, "  | ");
   for (int i = 1; i < tok->col; i++)
     fputc(' ', stderr);
 
   fprintf(stderr, "^\n");
-  warn_msg(example_msg);
+
+  if (hint) {
+    warn_msg(hint);
+  }
   exit(1);
 }
 
-void expect(Parser *p, Kind kind, const char *header_msg, int msg_num, ...) {
-  va_list args;
-  va_start(args, msg_num);
-  if (msg_num > 0) {
-    const char *exp_msg = va_arg(args, const char *);
-    error_at(p, &p->curr, header_msg, exp_msg);
-  }
+void parse_expect(Parser *p, Kind kind, const char *msg, const char *hint) {
+  error_at(p, &p->curr, msg, hint);
 
-  if (!match(p, kind)) {
-    error_at(p, &p->curr, header_msg, NULL);
+  if (!parse_match(p, kind)) {
+    error_at(p, &p->curr, msg, NULL);
   }
-
-  va_end(args);
 }
 
 /* ---------- Grammar ----------

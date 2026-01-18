@@ -57,12 +57,17 @@ typedef Ast *(*ParseFn)(Parser *);
 typedef struct {
   ParseFn prefix;
   ParseFn infix;
-  Precedence precedence;
+  Precedence node;
 } ParseRule;
 
 static void warn_msg(const char *msg) {
   fprintf(stderr, "\nTry using: %s\n", msg);
 }
+
+void error_at(Parser *p, Token *token, const char *msg, const char *wmsg);
+
+__attribute__((format(printf, 2, 3))) void ast_error(Token *token,
+                                                     const char *format, ...);
 
 void parser_init(Parser *p, Tokenizer *t, const char *filename);
 void parse_program(Parser *p);
