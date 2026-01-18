@@ -35,7 +35,7 @@ AstNode *parse_statement(Parser *p);  // em parse_stmt.c
 AstNode *parse_block(Parser *p);      // em parse_stmt.c
 AstNode *parse_assert(Parser *p);     // em parse_stmt.c
 // Futuro:
-// AstNode  *parse_test_decl(Parser *p);
+AstNode *parse_test_decl(Parser *p);
 // AstNode  *parse_declaration(Parser *p);        // fn, struct, var...
 
 #endif // PARSER_H
