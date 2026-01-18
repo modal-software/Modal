@@ -36,7 +36,7 @@ AstNode *ast_new_block(Token open_tok, AstNode **stmts, size_t count) {
   AstNode *node = malloc(sizeof(AstNode));
   if (!node)
     return NULL;
-  // Aloca array de children (C17 style, sem VLA)
+
   AstNode **children = malloc(count * sizeof(AstNode *));
   if (!children) {
     free(node);
@@ -47,6 +47,54 @@ AstNode *ast_new_block(Token open_tok, AstNode **stmts, size_t count) {
   *node = (AstNode){.kind = AST_BLOCK,
                     .token = open_tok,
                     .data = {.block_or_group = {children, count}}};
+  return node;
+}
+
+void ast_free(AstNode *node) {
+  if (!node)
+    return;             // null safe — por quê? Evita crash em erros parciais
+  switch (node->kind) { // por tipo — por quê? Libera filhos só onde tem
+  case AST_BIN_OP:
+    ast_free(node->data.binop.left);
+    ast_free(node->data.binop.right);
+    break;
+  case AST_UNARY_OP:
+    ast_free(node->data.unary.expr);
+    break;
+  case AST_BLOCK:
+  case AST_PAREN_GROUP:
+    for (size_t i = 0; i < node->data.block_or_group.count; i++) {
+      ast_free(
+          node->data.block_or_group
+              .stmts[i]); // recursão em filhos — por quê? Libera árvore toda
+    }
+    free(node->data.block_or_group
+             .stmts); // array depois — por quê? Ordem certa evita dangling
+    break;
+  case AST_TEST_STMT:
+    ast_free(node->data.test.block);
+  case AST_ASSERT_STMT:
+    // TODO: liberar nome/body/expr se tiverem — por quê? Ainda não definidos no
+    // ast.h
+    break;
+  default:
+    break; // lits/idents não tem filhos
+  }
+  free(node); // nó base por último — por quê? Clean up completo
+}
+
+AstNode *ast_new_test(Token token, AstNode *block) {
+  AstNode *node = malloc(sizeof(AstNode));
+  if (!node)
+    return NULL;
+
+  *node = (AstNode){.kind = AST_TEST_STMT,
+                    .token = block->token,
+                    .data = {.test = {
+                                 .name = token.start,
+                                 .len = token.len,
+                                 .block = block,
+                             }}};
   return node;
 }
 
