@@ -1,5 +1,6 @@
 #include "tokenizer.h"
 #include <ctype.h>
+#include <stdio.h>
 #include <string.h>
 
 static const Keyword keywords[] = {
@@ -60,14 +61,34 @@ Token next(Tokenizer *t) {
   for (;;) {
     char c = peek(t);
 
-    if (c == '\0') {
+    if (!c) {
       return token_make(TOK_EOF, t->buffer + t->pos, 0, t->line, t->col);
     }
+    // printf(
+    //     "tokenizer peek inicial: '%c' (code %d) pos=%d
+    //     buffer[0..10]=%.10s\n", peek(t), (int)peek(t), t->pos, t->buffer);
 
     switch (t->state) {
 
     case START:
+      if (c == '"') { // Início de string! — por quê? " abre o capítulo
+        start = t->buffer + t->pos; // Marca começo
+        start_line = t->line;
+        start_col = t->col;
+        advance(t);        // Pula o "
+        t->state = STRING; // Entra no modo string — por quê? Pra consumir
+                           // até fim
+        continue;
+      }
+
       if (c == ' ' || c == '\t' || c == '\r') {
+        advance(t);
+        continue;
+      }
+
+      /* Ident / keyword */
+      if (isalpha(c) || c == '_') {
+        t->state = (State)IDENTIFIER;
         advance(t);
         continue;
       }
@@ -111,13 +132,6 @@ Token next(Tokenizer *t) {
       start_line = t->line;
       start_col = t->col;
 
-      /* Ident / keyword */
-      if (isalpha(c) || c == '_') {
-        t->state = (State)IDENTIFIER;
-        advance(t);
-        continue;
-      }
-
       /* Number */
       if (isdigit(c)) {
         t->state = INT;
@@ -126,7 +140,7 @@ Token next(Tokenizer *t) {
       }
 
       /* Line comment */
-      if (c == '/' && peek_next(t) == '/') {
+      if (c == '-' && peek_next(t) == '-') {
         t->state = LINE_COMMENT;
         advance(t);
         advance(t);
@@ -134,7 +148,7 @@ Token next(Tokenizer *t) {
       }
 
       /* Block comment */
-      if (c == '/' && peek_next(t) == '*') {
+      if (c == '-' && peek_next(t) == '{') {
         t->state = BLOCK_COMMENT;
         advance(t);
         advance(t);
@@ -234,8 +248,23 @@ Token next(Tokenizer *t) {
         t->state = START;
         return token_make(NUMBER, start, len, start_line, start_col);
       }
-
-      // Comments
+    case STRING:
+      if (c == '"') {
+        advance(t);
+        int len = (int)((t->buffer + t->pos) - start);
+        // se quiser sem aspas
+        t->state = START; // Volta ao normal
+        return token_make((Kind)STRING, start, len, start_line,
+                          start_col); // Retorna o token string — por quê?
+                                      // Parser vê como unidade
+      }
+      if (c == '\0') { // EOF sem fechar? Erro
+        t->state = START;
+        return token_make(UNKNOWN, start, (int)((t->buffer + t->pos) - start),
+                          start_line, start_col);
+      }
+      advance(t); // Consome char normal dentro da string
+      continue;
     case LINE_COMMENT:
       if (c == '\n' || c == '\0') {
         t->state = START;
