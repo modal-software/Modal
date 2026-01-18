@@ -48,6 +48,7 @@ typedef enum {
   INT,
   FLOAT,
   FSTRING,
+  STRING,
   BLOCK_COMMENT,
   LINE_COMMENT,
   PREPROC,
