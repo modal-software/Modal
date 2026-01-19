@@ -31,7 +31,7 @@ int main(int argc, char **argv) {
   if (parser.had_error) {
     fprintf(stderr, "Parse falhou com erros.\n");
   } else {
-    printf("Parse OK! AST root kind: %d\n", root ? root->kind : 0);
+    // printf("Parse OK! AST root kind: %d\n", root ? root->kind : 0);
     // Aqui você pode printar a AST ou gerar código depois
   }
 
