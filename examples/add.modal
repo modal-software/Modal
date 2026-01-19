@@ -1,0 +1,3 @@
+test "nome" {
+    assert 1 + 2 
+}

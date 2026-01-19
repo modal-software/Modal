@@ -19,3 +19,15 @@
 Macros,
 - Estrutura de dados: Structs, traits/interfaces, types ou typedef
 - Compile-time checking, algo como templates ou comptime do zig
+
+### Build cmd
+```bash
+
+gcc -std=c17 -Wall -Wextra \                                                                                                                                                 14:15:41
+                                   main.c \
+                                   parser.c \
+                                   tokenizer/tokenizer.c \
+                                   -I. \
+                                   -o lang
+
+```

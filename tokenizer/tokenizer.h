@@ -38,6 +38,7 @@ typedef enum {
   ELLIPSIS,
   DOTDOT,
   ARROW,
+  STRING,
 } Kind;
 
 typedef enum {
@@ -48,9 +49,14 @@ typedef enum {
   INT,
   FLOAT,
   FSTRING,
+  STRING_LIT,
+  STATE_IDENTIFIER,
   BLOCK_COMMENT,
   LINE_COMMENT,
   PREPROC,
+  IF,
+  WHILE,
+  FOR,
 } State;
 
 typedef struct {
@@ -75,7 +81,7 @@ typedef struct {
   Kind kind;
 } Keyword;
 
-Token tag(Kind kind, const char *start, int len, int line, int col);
+Token token_make(Kind kind, const char *start, int len, int line, int col);
 void init(Tokenizer *t, const char *buffer);
 Token next(Tokenizer *t);
 

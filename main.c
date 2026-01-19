@@ -1,44 +1,42 @@
-#include "parser.h"
+#include "ast/parser.h"
+#include "lib/compiler/test_runner.h"
 #include "tokenizer/tokenizer.h"
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
-
-static char *read_file(const char *path) {
-  FILE *f = fopen(path, "rb");
-  if (!f) {
-    perror(path);
-    exit(1);
-  }
-
-  fseek(f, 0, SEEK_END);
-  long size = ftell(f);
-  rewind(f);
-
-  char *buf = malloc(size + 1);
-  fread(buf, 1, size, f);
-  buf[size] = 0;
-
-  fclose(f);
-  return buf;
-}
 
 int main(int argc, char **argv) {
   if (argc < 2) {
-    fprintf(stderr, "usage: %s <file.mal>\n", argv[0]);
+    fprintf(stderr, "Uso: %s arquivo.modal\n", argv[0]);
     return 1;
   }
 
-  char *src = read_file(argv[1]);
+  FILE *f = fopen(argv[1], "rb");
+  if (!f)
+    return 1;
+  fseek(f, 0, SEEK_END);
+  long size = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  char *buffer = malloc(size + 1);
+  fread(buffer, 1, size, f);
+  buffer[size] = '\0';
+  fclose(f);
 
-  Tokenizer t;
-  init(&t, src);
+  Tokenizer lexer;
+  init(&lexer, buffer);
 
-  Parser p;
-  parser_init(&p, &t, argv[1]);
-  parse_program(&p);
+  Parser parser;
+  parser_init(&parser, &lexer, argv[1]);
 
-  free(src);
-  return 0;
+  AstNode *root = parse_program(&parser);
+
+  if (parser.had_error) {
+    fprintf(stderr, "erros falhou com erros.\n");
+  } else {
+    printf("AST root kind: %d\n", root ? root->kind : 0);
+    run_tests(root);
+  }
+
+  ast_free(root);
+  free(buffer);
+  return parser.had_error ? 1 : 0;
 }
