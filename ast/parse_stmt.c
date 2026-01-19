@@ -5,111 +5,133 @@
 // macro fn sum(num: i8) -> i8
 char *run_macro_blocK(Parser *p, LexerState *l);
 
-AstNode *parse_block(Parser *p) {
-  if (!parser_match(p, LBRACE)) {
-    parser_error_at(p, &p->current, "expected '{' to start block");
-    return NULL;
-  }
-
-  Token open_tok = p->previous;
-
-  AstNode **stmts = NULL;
-  size_t count = 0, cap = 4;
-
-  stmts = malloc(cap * sizeof(AstNode *));
-  if (!stmts)
-    return NULL;
-
-  while (p->current.kind != RBRACE && p->current.kind != TOK_EOF) {
-    AstNode *stmt = parse_statement(p);
-    if (p->had_error || !stmt) {
-      parser_synchronize(p);
-      continue;
-    }
-
-    if (count >= cap) {
-      cap *= 2;
-      AstNode **new_stmts = realloc(stmts, cap * sizeof(AstNode *));
-      if (!new_stmts) {
-        free(stmts);
+AstNode *parse_block(Parser *p)
+{
+    if (!parser_match(p, LBRACE))
+    {
+        parser_error_at(p, &p->current, "expected '{' to start block");
         return NULL;
-      }
-      stmts = new_stmts;
     }
-    stmts[count++] = stmt;
-  }
 
-  parser_consume(p, RBRACE, "expected '}' at end of block");
-  return ast_new_block(open_tok, stmts, count);
+    Token open_tok = p->previous;
+
+    AstNode **stmts = NULL;
+    size_t count = 0, cap = 4;
+
+    stmts = malloc(cap * sizeof(AstNode *));
+    if (!stmts)
+    {
+        return NULL;
+    }
+
+    while (p->current.kind != RBRACE && p->current.kind != TOK_EOF)
+    {
+        AstNode *stmt = parse_statement(p);
+        if (p->had_error || !stmt)
+        {
+            parser_synchronize(p);
+            continue;
+        }
+
+        if (count >= cap)
+        {
+            cap *= 2;
+            AstNode **new_stmts = realloc(stmts, cap * sizeof(AstNode *));
+            if (!new_stmts)
+            {
+                free(stmts);
+                return NULL;
+            }
+            stmts = new_stmts;
+        }
+        stmts[count++] = stmt;
+    }
+
+    parser_consume(p, RBRACE, "expected '}' at end of block");
+    return ast_new_block(open_tok, stmts, count);
 }
 
-AstNode *parse_assert(Parser *p) {
-  AstNode *expr = parse_expression(p);
-  if (!expr)
-    return NULL;
-
-  return ast_new_assert(expr);
-}
-
-AstNode *parse_statement(Parser *p) {
-  // Handle keywords first, before trying to parse as expression
-  switch (p->current.kind) {
-  case ASSERT:
-    parser_advance(p);
-    return parse_assert(p);
-
-  case TEST: {
-    parser_advance(p);
-
-    // Check if someone used an identifier instead of a string
-    if (p->current.kind == IDENTIFIER) {
-      parser_error_at(p, &p->current,
-                      "test name must be a string literal (use quotes: test "
-                      "\"name\" { ... })");
-      return NULL;
-    }
-
-    // Expect string literal for test name
-    if (p->current.kind != STRING) {
-      parser_error_at(p, &p->current, "expected string literal after 'test'");
-      return NULL;
-    }
-
-    Token test_name = p->current;
-
-    // Validate that the string is not empty (includes quotes, so min 3 chars)
-    if (test_name.len < 3) {
-      parser_error_at(p, &test_name, "test name cannot be empty");
-      return NULL;
-    }
-
-    parser_advance(p);
-
-    // Expect opening brace
-    if (p->current.kind != LBRACE) {
-      parser_error_at(p, &p->current, "expected '{' after test name");
-      return NULL;
-    }
-
-    // Parse the block
-    AstNode *block = parse_block(p);
-    if (!block) {
-      return NULL;
-    }
-
-    return ast_new_test(test_name, block);
-  }
-
-  case LBRACE:
-    return parse_block(p);
-
-  default: {
-    // Try to parse as expression statement
+AstNode *parse_assert(Parser *p)
+{
     AstNode *expr = parse_expression(p);
-    if (expr)
-      return expr;
-    parser_error_at(p, &p->current, "unexpected statement");
-    return NULL;
-  }
-  }
+    if (!expr)
+    {
+        return NULL;
+    }
+
+    return ast_new_assert(expr);
+}
+
+AstNode *parse_statement(Parser *p)
+{
+    // Handle keywords first, before trying to parse as expression
+    switch (p->current.kind)
+    {
+    case ASSERT:
+        parser_advance(p);
+        return parse_assert(p);
+
+    case TEST:
+    {
+        parser_advance(p);
+
+        // Check if someone used an identifier instead of a string
+        if (p->current.kind == IDENTIFIER)
+        {
+            parser_error_at(p, &p->current,
+                            "test name must be a string literal (use quotes: test "
+                            "\"name\" { ... })");
+            return NULL;
+        }
+
+        // Expect string literal for test name
+        if (p->current.kind != STRING)
+        {
+            parser_error_at(p, &p->current, "expected string literal after 'test'");
+            return NULL;
+        }
+
+        Token test_name = p->current;
+
+        // Validate that the string is not empty (includes quotes, so min 3 chars)
+        if (test_name.len < 3)
+        {
+            parser_error_at(p, &test_name, "test name cannot be empty");
+            return NULL;
+        }
+
+        parser_advance(p);
+
+        // Expect opening brace
+        if (p->current.kind != LBRACE)
+        {
+            parser_error_at(p, &p->current, "expected '{' after test name");
+            return NULL;
+        }
+
+        // Parse the block
+        AstNode *block = parse_block(p);
+        if (!block)
+        {
+            return NULL;
+        }
+
+        return ast_new_test(test_name, block);
+    }
+
+    case LBRACE:
+        return parse_block(p);
+
+    default:
+    {
+        // Try to parse as expression statement
+        AstNode *expr = parse_expression(p);
+        if (expr)
+        {
+            return expr;
+        }
+        parser_error_at(p, &p->current, "unexpected statement");
+        return NULL;
+    }
+    }
 }
