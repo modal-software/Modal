@@ -41,21 +41,19 @@ AstNode *parse_block(Parser *p) {
 }
 
 AstNode *parse_assert(Parser *p) {
-  // Token kw_tok = p->previous;          // o "assert"
   AstNode *expr = parse_expression(p); // recursão pra expr completa
   if (!expr)
     return NULL;
 
   // Opcional: ; mas sync cuida
   // if (p->current.kind == OPERATOR && *p->current.start == ';') {
-  //   parser_advance(p);
+  parser_advance(p);
   // }
 
   return ast_new_assert(expr);
 }
 
 AstNode *parse_statement(Parser *p) {
-  AstNode *expr = parse_expression(p);
   switch (p->current.kind) {
   case ASSERT:
     parser_advance(p);
@@ -64,12 +62,26 @@ AstNode *parse_statement(Parser *p) {
   case TEST:
     parser_advance(p);
 
-    if (p->current.kind != (Kind)STRING) {
-      parser_error_at(p, &p->current, "`test` must receive a name");
+    if (p->current.kind == IDENTIFIER) {
+      parser_error_at(p, &p->current,
+                      "test name must be a string literal (use quotes: test "
+                      "\"name\" { ... })");
       return NULL;
     }
 
-    Token test_name = p->current;
+    if (p->current.kind != STRING) {
+      parser_error_at(p, &p->current, "expected string literal after `test`");
+      return NULL;
+    }
+
+    Token test = p->current;
+    printf("test len %c", p->current.len);
+
+    if (test.len < 3) {
+      parser_error_at(p, &test, "test need to have a name definition");
+      return NULL;
+    }
+
     parser_advance(p);
 
     if (p->current.kind != LBRACE) {
@@ -77,24 +89,21 @@ AstNode *parse_statement(Parser *p) {
       return NULL;
     }
 
-    // Parse the test block
     AstNode *block = parse_block(p);
-    if (!block) {
+    if (!block)
       return NULL;
-    }
 
-    // Create test node (you'll need to define this structure)
-    AstNode *test_node = create_test_node(test_name, block);
-    return test_node;
+    return ast_new_test(test, block);
 
-  case LBRACE: // bloco solto { ... }
+  case LBRACE:
     return parse_block(p);
 
-  default:
-    // Tenta como expr stmt (futuro: var x = expr;)
+  default: {
+    AstNode *expr = parse_expression(p);
     if (expr)
       return expr; // por agora, expr é stmt
     parser_error_at(p, &p->current, "statement inesperado");
     return NULL;
+  }
   }
 }
