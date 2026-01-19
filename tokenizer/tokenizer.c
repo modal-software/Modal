@@ -17,7 +17,7 @@ static Kind get_keyword(const char *s, int len) {
       return keywords[i].kind;
     }
   }
-  return (Kind)IDENTIFIER;
+  return IDENTIFIER;
 }
 
 char peek(Tokenizer *t) { return t->buffer[t->pos]; }
@@ -71,8 +71,8 @@ Token next(Tokenizer *t) {
 
     switch (t->state) {
     case START:
-      if (c == '"') { // Início de string! — por quê? " abre o capítulo
-        start = t->buffer + t->pos; // Marca começo
+      if (c == '"') {
+        start = t->buffer + t->pos;
         start_line = t->line;
         start_col = t->col;
         advance(t);
@@ -80,12 +80,11 @@ Token next(Tokenizer *t) {
         continue;
       }
 
-      if (c == ' ' || c == '\t' || c == '\r') {
+      if (isspace(c) || c == '\t' || c == '\r') {
         advance(t);
         continue;
       }
 
-      /* Ident / keyword */
       if (isalpha(c) || c == '_') {
         t->state = (State)IDENTIFIER;
         advance(t);
@@ -101,7 +100,6 @@ Token next(Tokenizer *t) {
         const char *start = t->buffer + t->pos;
         int start_line = t->line;
         int start_col = t->col;
-
         int len = 0;
 
         // Consome até o fim da linha lógica (respeitando \ no final da linha)
@@ -131,14 +129,12 @@ Token next(Tokenizer *t) {
       start_line = t->line;
       start_col = t->col;
 
-      /* Number */
       if (isdigit(c)) {
         t->state = INT;
         advance(t);
         continue;
       }
 
-      /* Line comment */
       if (c == '-' && peek_next(t) == '-') {
         t->state = LINE_COMMENT;
         advance(t);
@@ -146,7 +142,6 @@ Token next(Tokenizer *t) {
         continue;
       }
 
-      /* Block comment */
       if (c == '-' && peek_next(t) == '{') {
         t->state = BLOCK_COMMENT;
         advance(t);
@@ -154,7 +149,6 @@ Token next(Tokenizer *t) {
         continue;
       }
 
-      /* Operators / punctuation */
       advance(t);
       switch (c) {
       case '(':
@@ -208,7 +202,6 @@ Token next(Tokenizer *t) {
 
       return token_make(OPERATOR, start, 1, start_line, start_col);
 
-      // Identifiers
     case IDENTIFIER:
       if (isalnum(c) || c == '_') {
         advance(t);
@@ -220,7 +213,6 @@ Token next(Tokenizer *t) {
                           start_col);
       }
 
-      // Numbers
     case INT:
       if (isdigit(c)) {
         advance(t);
