@@ -18,6 +18,7 @@ typedef enum {
   TOK_STRING,
   TOK_PREPROC,
   // Keywords
+  TOK_FUNCTION,
   TOK_TEST,
   TOK_ASSERT,
   TOK_SIZEOF,
