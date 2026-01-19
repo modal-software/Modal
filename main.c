@@ -1,4 +1,5 @@
 #include "ast/parser.h"
+#include "lib/compiler/test_runner.h"
 #include "tokenizer/tokenizer.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,10 +30,10 @@ int main(int argc, char **argv) {
   AstNode *root = parse_program(&parser);
 
   if (parser.had_error) {
-    fprintf(stderr, "Parse falhou com erros.\n");
+    fprintf(stderr, "erros falhou com erros.\n");
   } else {
-    // printf("Parse OK! AST root kind: %d\n", root ? root->kind : 0);
-    // Aqui você pode printar a AST ou gerar código depois
+    printf("AST root kind: %d\n", root ? root->kind : 0);
+    run_tests(root);
   }
 
   ast_free(root);
