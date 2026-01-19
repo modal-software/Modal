@@ -1,3 +1,4 @@
+// tokenizer.c
 #include "tokenizer.h"
 #include <ctype.h>
 #include <stdio.h>
@@ -84,6 +85,8 @@ Token next(Tokenizer *t) {
   int start_line = 0;
   int start_col = 0;
 
+  // printf("%s", t->buffer);
+
   for (;;) {
     char c = peek(t);
 
@@ -91,9 +94,7 @@ Token next(Tokenizer *t) {
       return token_make(TOK_EOF, t->buffer + t->pos, 0, t->line, t->col);
     }
     // Debugger to token validation purposes (experimental)
-    // printf(
-    //     "tokenizer peek inicial: '%c' (code %d) pos=%d
-    //     buffer[0..10]=%.10s\n", peek(t), (int)peek(t), t->pos, t->buffer);
+    // printf("token: '%c' (code %d)\npos=%d\n\n", c, (int)c, t->pos);
 
     switch (t->state) {
     case START:
@@ -101,7 +102,8 @@ Token next(Tokenizer *t) {
         start = t->buffer + t->pos;
         start_line = t->line;
         start_col = t->col;
-        t->state = STRING_LIT;
+        t->state = START;
+
         advance(t);
 
         continue;
@@ -138,9 +140,8 @@ Token next(Tokenizer *t) {
           }
 
           if (curr == '\\' && peek_next(t) == '\n') {
-            // Line continuation: pula o \n e continua na próxima linha
-            advance(t); // consome \n
-            t->line++;  // atualiza linha (col volta pra 1 no advance)
+            advance(t);
+            t->line++;
             len += 2;
             continue;
           }
@@ -180,6 +181,7 @@ Token next(Tokenizer *t) {
       advance(t);
       switch (c) {
       case '(':
+        printf("STATE: '('\ntoken: '%c'\n\n", c);
         return token_make(LPAREN, start, 1, start_line, start_col);
       case ')':
         return token_make(RPAREN, start, 1, start_line, start_col);
@@ -234,15 +236,11 @@ Token next(Tokenizer *t) {
       if (isalnum(c) || c == '_') {
         advance(t);
         continue;
-      } else {
-        int len = (int)((t->buffer + t->pos) - start);
-        t->state = START;
-        // Kind k = get_keyword(start, len);
-        // const char *a = kind_to_string(k);
-        // printf("IDENTIFIER terminado: '%.*s' → kind=%s\n", len, start, a);
-        return token_make(get_keyword(start, len), start, len, start_line,
-                          start_col);
       }
+      int len = (int)((t->buffer + t->pos) - start);
+      t->state = START;
+      return token_make(get_keyword(start, len), start, len, start_line,
+                        start_col);
 
     case INT:
       if (isdigit(c)) {
@@ -271,23 +269,45 @@ Token next(Tokenizer *t) {
         return token_make(NUMBER, start, len, start_line, start_col);
       }
     case STRING_LIT: {
-      while (peek(t) != '\0' && peek(t) != '"') {
-        if (peek(t) == '\\') {
-          advance(t);
-          if (peek(t) != '\0') {
-            advance(t); // Skip escaped char
+      const char *buf = t->buffer;
+      int pos = t->pos;
+      printf("%c", pos);
+
+      while (buf[pos] != '\0' && buf[pos] != '"') {
+        if (buf[pos] == '\\') {
+          pos++;
+          t->col++;
+          if (buf[pos] != '\0') {
+            if (buf[pos] == 'n') {
+              pos++;
+              t->col++;
+            } else {
+              pos++;
+              t->col++;
+            }
           }
         } else {
-          advance(t);
+          if (buf[pos] == '\n') {
+            t->line++;
+            t->col = 1;
+          } else {
+            t->col++;
+          }
+          pos++;
         }
       }
 
-      if (peek(t) == '"') {
-        advance(t); // Consume closing quote
+      // Update tokenizer position
+      t->pos = pos;
+
+      // Consume closing quote if present
+      if (buf[pos] == '"') {
+        t->pos++;
+        t->col++;
       }
 
-      int len = (int)((t->buffer + t->pos) - start);
-      t->state = START; // Return to normal state
+      int len = (int)((buf + t->pos) - start);
+      t->state = START;
       return token_make(STRING, start, len, start_line, start_col);
     }
     case LINE_COMMENT:

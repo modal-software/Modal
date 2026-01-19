@@ -54,6 +54,9 @@ typedef enum {
   BLOCK_COMMENT,
   LINE_COMMENT,
   PREPROC,
+  IF,
+  WHILE,
+  FOR,
 } State;
 
 typedef struct {
