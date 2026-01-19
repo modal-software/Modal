@@ -79,23 +79,23 @@ void run_tests(AstNode *program) {
   }
 
   // Print summary
-  printf("\n═══════════════════════════════════════\n");
-  printf("           Test Summary\n");
-  printf("═══════════════════════════════════════\n");
-  printf("Total:  %d\n", results.total);
-  printf("Passed: %d ", results.passed);
-  if (results.passed > 0)
-    printf("✓");
-  printf("\n");
-  printf("Failed: %d ", results.failed);
-  if (results.failed > 0)
-    printf("✗");
-  printf("\n");
-
-  if (results.failed == 0 && results.total > 0) {
-    printf("\n🎉 All tests passed!\n");
-  } else if (results.failed > 0) {
-    printf("\n❌ Some tests failed.\n");
-  }
-  printf("═══════════════════════════════════════\n\n");
+  // printf("\n═══════════════════════════════════════\n");
+  // printf("           Test Summary\n");
+  // printf("═══════════════════════════════════════\n");
+  // printf("Total:  %d\n", results.total);
+  // printf("Passed: %d ", results.passed);
+  // if (results.passed > 0)
+  //   printf("✓");
+  // printf("\n");
+  // printf("Failed: %d ", results.failed);
+  // if (results.failed > 0)
+  //   printf("✗");
+  // printf("\n");
+  //
+  // if (results.failed == 0 && results.total > 0) {
+  //   printf("\n🎉 All tests passed!\n");
+  // } else if (results.failed > 0) {
+  //   printf("\n❌ Some tests failed.\n");
+  // }
+  // printf("═══════════════════════════════════════\n\n");
 }
