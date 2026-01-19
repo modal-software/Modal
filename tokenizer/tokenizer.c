@@ -3,6 +3,29 @@
 #include <stdio.h>
 #include <string.h>
 
+const char *kind_to_string(Kind kind) {
+  switch (kind) {
+  case TOK_EOF:
+    return "end of file";
+  case LPAREN:
+    return "(";
+  case RPAREN:
+    return ")";
+  case LBRACE:
+    return "{";
+  case RBRACE:
+    return "}";
+  case NUMBER:
+    return "number";
+  case IDENTIFIER:
+    return "identifier";
+  case OPERATOR:
+    return "operator";
+  default:
+    return "unknown token";
+  }
+}
+
 static const Keyword keywords[] = {
     {"test", 4, TEST},   {"assert", 6, ASSERT},     {"sizeof", 6, SIZEOF},
     {"defer", 5, DEFER}, {"autofree", 8, AUTOFREE}, {"alias", 5, ALIAS},
@@ -20,7 +43,10 @@ static Kind get_keyword(const char *s, int len) {
   return IDENTIFIER;
 }
 
-char peek(Tokenizer *t) { return t->buffer[t->pos]; }
+char peek(Tokenizer *t) {
+  printf("%.s", t->buffer);
+  return t->buffer[t->pos];
+}
 
 char peek_next(Tokenizer *t) { return t->buffer[t->pos + 1]; }
 
@@ -75,6 +101,7 @@ Token next(Tokenizer *t) {
         start = t->buffer + t->pos;
         start_line = t->line;
         start_col = t->col;
+        t->state = STRING_LIT;
         advance(t);
 
         continue;
@@ -84,9 +111,10 @@ Token next(Tokenizer *t) {
         advance(t);
         continue;
       }
+      // printf("START: c='%c' code=%d\n", c, (int)c);
 
       if (isalpha(c) || c == '_') {
-        t->state = (State)IDENTIFIER;
+        t->state = STATE_IDENTIFIER;
         advance(t);
         continue;
       }
@@ -202,13 +230,16 @@ Token next(Tokenizer *t) {
 
       return token_make(OPERATOR, start, 1, start_line, start_col);
 
-    case IDENTIFIER:
+    case STATE_IDENTIFIER:
       if (isalnum(c) || c == '_') {
         advance(t);
         continue;
       } else {
         int len = (int)((t->buffer + t->pos) - start);
         t->state = START;
+        // Kind k = get_keyword(start, len);
+        // const char *a = kind_to_string(k);
+        // printf("IDENTIFIER terminado: '%.*s' → kind=%s\n", len, start, a);
         return token_make(get_keyword(start, len), start, len, start_line,
                           start_col);
       }
