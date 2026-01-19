@@ -5,78 +5,83 @@
 #define MODAL_VERSION "0.0.1"
 
 // Token kinds - what the token represents
-typedef enum {
-  TOK_EOF,
-  TOK_LPAREN,
-  TOK_RPAREN,
-  TOK_LBRACE,
-  TOK_RBRACE,
-  TOK_OPERATOR,
-  TOK_IDENTIFIER,
-  TOK_UNKNOWN,
-  TOK_NUMBER,
-  TOK_STRING,
-  TOK_PREPROC,
-  // Keywords
-  TOK_FUNCTION,
-  TOK_TEST,
-  TOK_ASSERT,
-  TOK_SIZEOF,
-  TOK_DEFER,
-  TOK_AUTOFREE,
-  TOK_ALIAS,
-  TOK_USE,
-  TOK_COMPTIME,
-  TOK_UNION,
-  TOK_ASM,
-  TOK_VOLATILE,
-  TOK_ASYNC,
-  TOK_AWAIT,
-  TOK_AND,
-  TOK_OR,
-  // Multi-char operators
-  TOK_Q_DOT,
-  TOK_QQ_EQ,
-  TOK_QQ,
-  TOK_QUESTION,
-  TOK_PIPE,
-  TOK_DCOLON,
-  TOK_ELLIPSIS,
-  TOK_DOTDOT,
-  TOK_ARROW,
+typedef enum
+{
+    TOK_EOF,
+    TOK_LPAREN,
+    TOK_RPAREN,
+    TOK_LBRACE,
+    TOK_RBRACE,
+    TOK_OPERATOR,
+    TOK_IDENTIFIER,
+    TOK_UNKNOWN,
+    TOK_NUMBER,
+    TOK_STRING,
+    TOK_PREPROC,
+    // Keywords
+    TOK_FUNCTION,
+    TOK_TEST,
+    TOK_ASSERT,
+    TOK_SIZEOF,
+    TOK_DEFER,
+    TOK_AUTOFREE,
+    TOK_ALIAS,
+    TOK_USE,
+    TOK_COMPTIME,
+    TOK_UNION,
+    TOK_ASM,
+    TOK_VOLATILE,
+    TOK_ASYNC,
+    TOK_AWAIT,
+    TOK_AND,
+    TOK_OR,
+    // Multi-char operators
+    TOK_Q_DOT,
+    TOK_QQ_EQ,
+    TOK_QQ,
+    TOK_QUESTION,
+    TOK_PIPE,
+    TOK_DCOLON,
+    TOK_ELLIPSIS,
+    TOK_DOTDOT,
+    TOK_ARROW,
 } TokenKind;
 
 // Lexer states - internal scanning state machine
-typedef enum {
-  LEX_STATE_START,
-  LEX_STATE_IDENTIFIER,
-  LEX_STATE_NUMBER_INT,
-  LEX_STATE_NUMBER_FLOAT,
-  LEX_STATE_STRING_LIT,
-  LEX_STATE_LINE_COMMENT,
-  LEX_STATE_BLOCK_COMMENT,
+typedef enum
+{
+    LEX_STATE_START,
+    LEX_STATE_IDENTIFIER,
+    LEX_STATE_NUMBER_INT,
+    LEX_STATE_NUMBER_FLOAT,
+    LEX_STATE_STRING_LIT,
+    LEX_STATE_LINE_COMMENT,
+    LEX_STATE_BLOCK_COMMENT,
 } LexerState;
 
-typedef struct {
-  TokenKind kind;
-  const char *start;
-  int len;
-  int line;
-  int col;
+typedef struct
+{
+    TokenKind kind;
+    const char *start;
+    int len;
+    int line;
+    int col;
 } Token;
 
-typedef struct {
-  const char *buffer;
-  int pos;
-  int line;
-  int col;
-  LexerState state;
+typedef struct
+{
+    const char *buffer;
+    int pos;
+    int line;
+    int col;
+    LexerState state;
 } Tokenizer;
 
-typedef struct {
-  const char *kw;
-  size_t len;
-  TokenKind kind;
+typedef struct
+{
+    const char *kw;
+    size_t len;
+    TokenKind kind;
 } Keyword;
 
 Token token_make(TokenKind kind, const char *start, int len, int line, int col);
