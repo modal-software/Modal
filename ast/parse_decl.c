@@ -1,3 +1,4 @@
+#include "ast.h"
 #include "parser.h"
 #include <stdlib.h>
 
@@ -19,5 +20,5 @@ AstNode *parse_test_decl(Parser *p) {
   AstNode **stmts = malloc(2 * sizeof(AstNode *)); // nome + body
   stmts[0] = name;
   stmts[1] = body;
-  return ast_new_block(p->previous, stmts, 2);
+  return ast_new_test(p->previous, *stmts);
 }
