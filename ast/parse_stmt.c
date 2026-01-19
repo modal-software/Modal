@@ -59,41 +59,49 @@ AstNode *parse_statement(Parser *p) {
     parser_advance(p);
     return parse_assert(p);
 
-  case TEST:
-    parser_advance(p);
-
-    if (p->current.kind == IDENTIFIER) {
-      parser_error_at(p, &p->current,
-                      "test name must be a string literal (use quotes: test "
-                      "\"name\" { ... })");
-      return NULL;
-    }
-
-    if (p->current.kind != STRING) {
-      parser_error_at(p, &p->current, "expected string literal after `test`");
-      return NULL;
-    }
-
-    Token test = p->current;
-    printf("test len %c", p->current.len);
-
-    if (test.len < 3) {
-      parser_error_at(p, &test, "test need to have a name definition");
-      return NULL;
-    }
-
-    parser_advance(p);
-
-    if (p->current.kind != LBRACE) {
-      parser_error_at(p, &p->current, "expected '{' after test name");
-      return NULL;
-    }
-
-    AstNode *block = parse_block(p);
-    if (!block)
-      return NULL;
-
-    return ast_new_test(test, block);
+    // case TEST:
+    //   parser_advance(p);
+    //
+    //   if (p->current.kind != LBRACE) {
+    //     parser_error_at(p, &p->current, "`test` statement missing block");
+    //     return NULL;
+    //   }
+    //
+    //   if (p->current.kind == IDENTIFIER) {
+    //     parser_error_at(p, &p->current,
+    //                     "test name must be a string literal (use quotes: test
+    //                     "
+    //                     "\"name\" { ... })");
+    //     return NULL;
+    //   }
+    //
+    //   if (p->current.kind != STRING) {
+    //     parser_error_at(p, &p->current, "expected string literal after
+    //     `test`"); return NULL;
+    //   }
+    //
+    //   Token test = p->current;
+    //   printf("test len %c", p->current.len);
+    //
+    //   if (test.len < 3) {
+    //     parser_error_at(p, &test, "test need to have a name definition");
+    //     return NULL;
+    //   }
+    //
+    //   parser_advance(p);
+    //
+    //   if (p->current.kind != LBRACE) {
+    //     parser_error_at(p, &p->current, "expected '{' after test name");
+    //     return NULL;
+    //   }
+    //
+    //   AstNode *block = parse_block(p);
+    //   if (!block) {
+    //     // parser_error_at(p, &p->current, "expected '{' after test name");
+    //     return NULL;
+    //   }
+    //
+    //   return ast_new_test(test, block);
 
   case LBRACE:
     return parse_block(p);
