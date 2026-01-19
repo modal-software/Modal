@@ -88,11 +88,14 @@ AstNode *ast_new_test(Token token, AstNode *block) {
   if (!node)
     return NULL;
 
+  const char *name_without_quotes = token.start + 1;
+  size_t len = token.len - 2;
+
   *node = (AstNode){.kind = AST_TEST_STMT,
-                    .token = block->token,
+                    .token = token,
                     .data = {.test = {
-                                 .name = token.start,
-                                 .len = token.len,
+                                 .name = name_without_quotes,
+                                 .len = len,
                                  .block = block,
                              }}};
   return node;
