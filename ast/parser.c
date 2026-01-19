@@ -8,7 +8,7 @@ void parser_init(Parser *p, Tokenizer *lexer, const char *filename) {
   p->lexer = lexer;
   p->filename = filename;
   p->had_error = 0;
-  p->current = next(lexer); // prime token
+  p->current = next(lexer);
   p->previous = (Token){0};
 }
 
@@ -33,7 +33,6 @@ void parser_consume(Parser *p, Kind kind, const char *msg) {
   parser_error_at(p, &p->current, msg);
 }
 
-// O entry point principal – parseia múltiplos statements até EOF
 AstNode *parse_program(Parser *p) {
   AstNode **stmts = NULL;
   size_t count = 0;
@@ -50,13 +49,19 @@ AstNode *parse_program(Parser *p) {
       continue;
     }
 
-    if (count >= cap) {
-      cap *= 2;
-      stmts = realloc(stmts, cap * sizeof(AstNode *));
+    if (stmt) { // Only add non-null statements
+      if (count >= cap) {
+        cap *= 2;
+        AstNode **new_stmts = realloc(stmts, cap * sizeof(AstNode *));
+        if (!new_stmts) {
+          free(stmts);
+          return NULL;
+        }
+        stmts = new_stmts;
+      }
+      stmts[count++] = stmt;
     }
-    stmts[count++] = stmt;
   }
 
-  return ast_new_block(p->current, stmts,
-                       count); // root = block de top-level stmts
+  return ast_new_block(p->current, stmts, count);
 }
