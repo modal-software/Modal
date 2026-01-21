@@ -1,5 +1,6 @@
 // ast.c (adicione ao seu projeto)
 #include "ast.h"
+#include "../lib/compiler/test_runner.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -85,6 +86,7 @@ void ast_free(AstNode *node)
         break;
     case AST_TEST_STMT:
         ast_free(node->data.test.block);
+        run_tests(node);
     case AST_ASSERT_STMT:
         // TODO: liberar nome/body/expr se tiverem — por quê? Ainda não definidos no
         // ast.h

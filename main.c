@@ -1,5 +1,5 @@
+#include "ast/ast.h"
 #include "ast/parser.h"
-#include "lib/compiler/test_runner.h"
 #include "tokenizer/tokenizer.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,7 +40,6 @@ int main(int argc, char **argv)
     else
     {
         printf("AST root kind: %d\n", root ? root->kind : 0);
-        run_tests(root);
     }
 
     ast_free(root);
