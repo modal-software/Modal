@@ -85,7 +85,6 @@ void run_tests(AstNode *program)
 
     results = (TestResults){0, 0, 0};
 
-    // Iterate through top-level statements
     if (program->kind == AST_BLOCK)
     {
         for (size_t i = 0; i < program->data.block_or_group.count; i++)
@@ -98,7 +97,7 @@ void run_tests(AstNode *program)
         }
     }
 
-    // Print summary printf("\n═══════════════════════════════════════\n");
+    printf("\n═══════════════════════════════════════\n");
     printf("           Test Summary\n");
     printf("═══════════════════════════════════════\n");
     printf("Total:  %d\n", results.total);
