@@ -10,6 +10,8 @@ typedef enum
     TOK_EOF,
     TOK_LPAREN,
     TOK_RPAREN,
+    TOK_COLON,
+    TOK_SEMICOLON,
     TOK_LBRACE,
     TOK_RBRACE,
     TOK_OPERATOR,
