@@ -2,7 +2,27 @@
 #ifndef AST_H
 #define AST_H
 
-#include "../tokenizer/tokenizer.h" // Token
+#include "../tokenizer/tokenizer.h"
+
+typedef enum
+{
+    T_VOID,
+    T_BOOL,
+
+    // Unsigned integers
+    T_U0,
+    T_U8,
+    T_U16,
+    T_U32,
+    T_U64,
+
+    // Signed Integers
+    T_I0,
+    T_i8,
+    T_I16,
+    T_I32,
+    T_I64,
+} TypeKind;
 
 typedef enum
 {
