@@ -86,11 +86,12 @@ void ast_free(AstNode *node)
         break;
     case AST_TEST_STMT:
         ast_free(node->data.test.block);
-        run_tests(node);
-    case AST_ASSERT_STMT:
-        // TODO: liberar nome/body/expr se tiverem — por quê? Ainda não definidos no
-        // ast.h
         break;
+    case AST_ASSERT_STMT:
+    {
+        ast_free(node->data.test.block);
+        break;
+    }
     default:
         break; // lits/idents não tem filhos
     }
@@ -108,6 +109,8 @@ AstNode *ast_new_test(Token token, AstNode *block)
     const char *name_without_quotes = token.start + 1;
     size_t len = token.len - 2;
 
+    run_tests(node);
+
     *node = (AstNode){.kind = AST_TEST_STMT,
                       .token = token,
                       .data = {.test = {
@@ -115,6 +118,7 @@ AstNode *ast_new_test(Token token, AstNode *block)
                                    .len = len,
                                    .block = block,
                                }}};
+
     return node;
 }
 
