@@ -11,6 +11,7 @@ typedef enum
     TOK_LPAREN,
     TOK_RPAREN,
     TOK_COLON,
+    TOK_COMMA,
     TOK_SEMICOLON,
     TOK_LBRACE,
     TOK_RBRACE,
