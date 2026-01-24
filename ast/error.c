@@ -1,7 +1,11 @@
 #include "parser.h"
-#include <ctype.h> // isprint pra sanitizar output
 #include <stdarg.h>
 #include <stdio.h>
+
+void fatal(const char *fmt)
+{
+    fprintf(stderr, fmt, "\n");
+}
 
 // Mostra erro com linha do fonte e ^
 void parser_error_at(Parser *p, Token *tok, const char *fmt, ...)
