@@ -1,5 +1,7 @@
 #include "allocators.h"
+#include "../../ast/error.h"
 #include <stdlib.h>
+#include <string.h>
 
 char *g_curr_filename = "unknown";
 static ArenaBlock *curr_block = NULL;
@@ -33,4 +35,17 @@ void *arena_alloc_raw(size_t size)
     *(size_t *)ptr = size;
 
     return alloc;
+}
+
+void *xmalloc(size_t size)
+{
+    return arena_alloc_raw(size);
+}
+
+void *xcalloc(size_t num, size_t size)
+{
+    size_t total = num * size;
+    void *p = arena_alloc_raw(total);
+    memset(p, 0, total);
+    return p;
 }
