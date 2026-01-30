@@ -24,6 +24,13 @@ typedef enum
     T_I64,
 } TypeKind;
 
+typedef struct Type
+{
+    TypeKind kind;
+    char *name;
+    struct Type *inner;
+} Type;
+
 typedef enum
 {
     AST_NUMBER_LIT,
