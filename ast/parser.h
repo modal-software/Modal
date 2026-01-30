@@ -9,18 +9,18 @@
 
 typedef struct Parser Parser;
 
-struct Parser {
-  Tokenizer *lexer;
-  Token current;
-  Token previous;
-  const char *filename;
-  int had_error; // flag pra saber se rolou erro em algum ponto
+struct Parser
+{
+    Tokenizer *lexer;
+    Token current;
+    Token previous;
+    const char *filename;
+    int had_error; // flag pra saber se rolou erro em algum ponto
 };
 
 // Inicialização e entry point principal
 void parser_init(Parser *p, Tokenizer *lexer, const char *filename);
-AstNode *
-parse_program(Parser *p); // retorna raiz da AST (um AST_BLOCK top-level)
+AstNode *parse_program(Parser *p); // retorna raiz da AST (um AST_BLOCK top-level)
 
 // Helpers de consumo e avanço (usados em todos parse_*.c)
 void parser_advance(Parser *p);

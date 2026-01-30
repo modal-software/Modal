@@ -4,10 +4,11 @@
 
 #include "../../ast/ast.h"
 
-typedef struct {
-  int total;
-  int passed;
-  int failed;
+typedef struct
+{
+    int total;
+    int passed;
+    int failed;
 } TestResults;
 
 void run_tests(AstNode *program);
