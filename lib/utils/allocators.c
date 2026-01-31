@@ -39,6 +39,11 @@ void *arena_alloc_raw(size_t size)
 
 void *xmalloc(size_t size)
 {
+    if (!size)
+    {
+        return NULL;
+    }
+
     return arena_alloc_raw(size);
 }
 
@@ -46,6 +51,39 @@ void *xcalloc(size_t num, size_t size)
 {
     size_t total = num * size;
     void *p = arena_alloc_raw(total);
-    memset(p, 0, total);
-    return p;
+    void *new_ptr = calloc(sizeof(p), total);
+    if (!new_ptr)
+    {
+        return NULL;
+    }
+
+    return (char *)new_ptr + sizeof(size_t);
+}
+
+void *xrealloc(void *ptr, size_t new_size)
+{
+    if (!ptr)
+    {
+        return xmalloc(new_size);
+    }
+    size_t *header = (size_t *)((char *)ptr - sizeof(size_t));
+    size_t old_size = *header;
+
+    if (new_size <= old_size)
+    {
+        return ptr;
+    }
+
+    size_t old_alloc_size = sizeof(size_t) + old_size;
+    size_t new_alloc_size = sizeof(size_t) + new_size;
+
+    void *new_ptr = realloc(header, new_alloc_size);
+    if (!new_ptr)
+    {
+        return NULL;
+    }
+
+    *(size_t *)new_ptr = new_size;
+
+    return (char *)new_ptr + sizeof(size_t);
 }
