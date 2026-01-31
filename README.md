@@ -1,4 +1,8 @@
-# coisas
+# Functionalities roadmap
+[] - Fix ast problems
+[] - Finish utilities allocators
+
+# Features roadmap
 - Interoperabilidade com C/C++.
 - Design de uso que evita alocações.
 - Design explicito, mas produtividade acima de explicitude.
@@ -19,11 +23,13 @@
 Macros,
 - Estrutura de dados: Structs, traits/interfaces, types ou typedef
 - Compile-time checking, algo como templates ou comptime do zig
+- Metaprogamação interessante
+- Foco inicial em low-level (expansão prevista)
 
 ### Build cmd
 ```bash
 
-gcc -std=c17 -Wall -Wextra \                                                                                                                                                 14:15:41
+gcc -std=c17 -Wall -Wextra \                                                                                                                                                 
                                    main.c \
                                    parser.c \
                                    tokenizer/tokenizer.c \
