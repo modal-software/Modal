@@ -60,22 +60,22 @@ void *xcalloc(size_t num, size_t size)
     return (char *)new_ptr + sizeof(size_t);
 }
 
-void *xrealloc(void *ptr, size_t new_size)
+void *xrealloc(void *ptr, size_t newsz)
 {
     if (!ptr)
     {
-        return xmalloc(new_size);
+        return xmalloc(newsz);
     }
     size_t *header = (size_t *)((char *)ptr - sizeof(size_t));
-    size_t old_size = *header;
+    size_t oldsz = *header;
 
-    if (new_size <= old_size)
+    if (newsz <= oldsz)
     {
         return ptr;
     }
 
-    size_t old_alloc_size = sizeof(size_t) + old_size;
-    size_t new_alloc_size = sizeof(size_t) + new_size;
+    size_t old_alloc_size = sizeof(size_t) + oldsz;
+    size_t new_alloc_size = sizeof(size_t) + newsz;
 
     void *new_ptr = realloc(header, new_alloc_size);
     if (!new_ptr)
@@ -83,7 +83,7 @@ void *xrealloc(void *ptr, size_t new_size)
         return NULL;
     }
 
-    *(size_t *)new_ptr = new_size;
+    *(size_t *)new_ptr = newsz;
 
     return (char *)new_ptr + sizeof(size_t);
 }
