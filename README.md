@@ -1,6 +1,6 @@
 # Functionalities roadmap
+[] - Finish arena allocators
 [] - Fix ast problems
-[] - Finish utilities allocators
 
 # Features roadmap
 - Interoperabilidade com C/C++.
