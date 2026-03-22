@@ -1,9 +1,9 @@
-CC = clang
-CFLAGS = -Wall -Wextra -g -std=c17 -I ./
+CC = gcc
+CFLAGS = -Wall -Wextra -g -std=c11 -I ./
 TARGET = jma
 LIBS = -lm -lpthread -ldl
 
-SRCS = ./tokenizer/tokenizer.c ./ast/parser.c ./ast/ast.c ./ast/error.c ./ast/parse_decl.c ./ast/parse_expr.c ./ast/parse_stmt.c ./lib/compiler/test_runner.c ./main.c  # adicione todos .c
+SRCS = ./lib/compiler/tokenizer/tokenizer.c ./lib/compiler/ast/parser.c ./lib/compiler/ast/ast.c ./lib/compiler/ast/error.c ./lib/compiler/ast/parse_decl.c ./lib/compiler/ast/parse_expr.c ./lib/compiler/ast/parse_stmt.c ./lib/compiler/test_runner.c ./main.c  # adicione todos .c
 OBJS = $(SRCS:.c=.o)  # mágica: tokenizer.c → tokenizer.o
 	
 # Paths
