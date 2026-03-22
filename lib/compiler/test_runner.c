@@ -79,11 +79,7 @@ void run_tests(AstNode *program)
         return;
     }
 
-    printf("\n═══════════════════════════════════════\n");
-    printf("         Running Modal Tests\n");
-    printf("═══════════════════════════════════════\n\n");
-
-    results = (TestResults){0, 0, 0};
+    const TestResults results = (TestResults){0, 0, 0};
 
     if (program->kind == AST_BLOCK)
     {
@@ -97,22 +93,14 @@ void run_tests(AstNode *program)
         }
     }
 
-    printf("\n═══════════════════════════════════════\n");
-    printf("           Test Summary\n");
-    printf("═══════════════════════════════════════\n");
-    printf("Total:  %d\n", results.total);
-    printf("Passed: %d ", results.passed);
     if (results.passed > 0)
     {
-        printf("✓");
+        printf("%d/%d", results.passed, results.total);
     }
-    printf("\n");
-    printf("Failed: %d ", results.failed);
     if (results.failed > 0)
     {
-        printf("✗");
+        printf("Failed: %d", results.failed);
     }
-    printf("\n");
 
     if (results.failed == 0 && results.total > 0)
     {
@@ -122,5 +110,4 @@ void run_tests(AstNode *program)
     {
         printf("\n❌ Some tests failed.\n");
     }
-    printf("═══════════════════════════════════════\n\n");
 }

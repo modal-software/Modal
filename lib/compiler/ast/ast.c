@@ -1,6 +1,6 @@
 // ast.c (adicione ao seu projeto)
 #include "ast.h"
-#include "../lib/compiler/test_runner.h"
+#include "../test_runner.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -115,7 +115,7 @@ void ast_free(AstNode *node)
         return; // null safe — por quê? Evita crash em erros parciais
     }
     switch (node->kind)
-    { // por tipo — por quê? Libera filhos só onde tem
+    {
     case AST_BIN_OP:
         ast_free(node->data.binop.left);
         ast_free(node->data.binop.right);

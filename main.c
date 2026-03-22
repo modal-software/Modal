@@ -36,13 +36,11 @@ int main(int argc, char **argv)
     if (parser.had_error)
     {
         fprintf(stderr, "erros falhou com erros.\n");
-    }
-    else
-    {
-        printf("AST root kind: %d\n", root ? root->kind : 0);
+        return 1;
     }
 
     ast_free(root);
     free(buffer);
-    return parser.had_error ? 1 : 0;
+    free(f);
+    return 0;
 }

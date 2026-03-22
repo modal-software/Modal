@@ -103,8 +103,4 @@ AstNode *ast_new_assert(AstNode *expr);
 AstNode *ast_new_number(Token tok, long long val);
 void ast_free(AstNode *node);
 
-// ... mais construtores
-
-void ast_free(AstNode *node); // recursivo, libera filhos primeiro
-
 #endif

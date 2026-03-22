@@ -2,7 +2,7 @@
 #ifndef TEST_RUNNER_H
 #define TEST_RUNNER_H
 
-#include "../../ast/ast.h"
+#include "ast/ast.h"
 
 typedef struct
 {

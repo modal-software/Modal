@@ -3,9 +3,9 @@
 #include <stdio.h>
 #include <string.h>
 
-const char *kind_to_string(TokenKind kind)
+const char *kind_to_string(TokenKind *kind)
 {
-    switch (kind)
+    switch (*kind)
     {
     case TOK_EOF:
         return "end of file";

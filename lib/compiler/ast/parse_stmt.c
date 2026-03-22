@@ -72,7 +72,6 @@ AstNode *parse_test(Parser *p)
         return NULL;
     }
 
-    // Expect string literal for test name
     if (p->current.kind != STRING)
     {
         parser_error_at(p, &p->current, "expected string literal after 'test'");
