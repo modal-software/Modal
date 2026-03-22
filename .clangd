@@ -1,0 +1,8 @@
+CompileFlags:
+  Compiler: clang
+  Add:
+    - --target=x86_64-pc-windows-gnu
+    - -std=c11
+    - -IC:\Users\marco\scoop\apps\llvm\21.1.6\lib\clang\21\include
+    - -IC:\Users\marco\scoop\apps\mingw\current\x86_64-w64-mingw32\include
+    - -IC:\Users\marco\scoop\apps\mingw\current\include
