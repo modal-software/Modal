@@ -1,7 +1,6 @@
-#include "ast/ast.h"
-#include "ast/parser.h"
-#include "lib/compiler/test_runner.h"
-#include "tokenizer/tokenizer.h"
+#include "lib/compiler/ast/ast.h"
+#include "lib/compiler/ast/parser.h"
+#include "lib/compiler/tokenizer/tokenizer.h"
 #include <stdio.h>
 #include <stdlib.h>
 

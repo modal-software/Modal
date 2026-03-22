@@ -1,4 +1,4 @@
-CC = gcc
+CC = clang
 CFLAGS = -Wall -Wextra -g -std=c17 -I ./
 TARGET = jma
 LIBS = -lm -lpthread -ldl
