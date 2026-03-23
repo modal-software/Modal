@@ -21,6 +21,7 @@ AstNode *parse_block(Parser *p)
     stmts = malloc(cap * sizeof(AstNode *));
     if (!stmts)
     {
+        free(stmts);
         return NULL;
     }
 
@@ -43,16 +44,20 @@ AstNode *parse_block(Parser *p)
                 return NULL;
             }
             stmts = new_stmts;
+            free(new_stmts);
         }
         stmts[count++] = stmt;
+        free(stmts);
     }
 
     parser_consume(p, RBRACE, "expected '}' at end of block");
     return ast_new_block(open_tok, stmts, count);
+    free(stmts);
 }
 
 AstNode *parse_assert(Parser *p)
 {
+    parser_advance(p);
     AstNode *expr = parse_expression(p);
     if (!expr)
     {
@@ -64,17 +69,18 @@ AstNode *parse_assert(Parser *p)
 
 AstNode *parse_test(Parser *p)
 {
+    parser_advance(p);
+    if (p->current.kind != STRING)
+    {
+        parser_error_at(p, &p->current, "expected string literal after 'test'");
+        return NULL;
+    }
+
     if (p->current.kind == IDENTIFIER)
     {
         parser_error_at(p, &p->current,
                         "test name must be a string literal (use quotes: test "
                         "\"name\" { ... })");
-        return NULL;
-    }
-
-    if (p->current.kind != STRING)
-    {
-        parser_error_at(p, &p->current, "expected string literal after 'test'");
         return NULL;
     }
 
@@ -87,12 +93,6 @@ AstNode *parse_test(Parser *p)
 
     parser_advance(p);
 
-    if (p->current.kind != LBRACE)
-    {
-        parser_error_at(p, &p->current, "expected '{' after test name");
-        return NULL;
-    }
-
     AstNode *block = parse_block(p);
     if (!block)
     {
@@ -100,6 +100,7 @@ AstNode *parse_test(Parser *p)
     }
 
     return ast_new_test(test_name, block);
+    free(block);
 };
 
 AstNode *parse_statement(Parser *p)
@@ -107,11 +108,9 @@ AstNode *parse_statement(Parser *p)
     switch (p->current.kind)
     {
     case ASSERT:
-        parser_advance(p);
         return parse_assert(p);
 
     case TEST:
-        parser_advance(p);
         return parse_test(p);
 
     case LBRACE:
