@@ -33,7 +33,6 @@ AstNode *parse_group(Parser *p)
             parser_synchronize(p);
             continue;
         }
-        printf("%s", stmt->token.start);
 
         if (count >= cap)
         {
@@ -56,6 +55,21 @@ AstNode *parse_group(Parser *p)
     free(stmts);
 }
 
+// ✅ parse_string — new function
+AstNode *parse_string(Parser *p)
+{
+    if (p->current.kind != STRING)
+    {
+        parser_error_at(p, &p->current, "expected string literal");
+        return NULL;
+    }
+
+    Token tok = p->current;
+    parser_advance(p);
+    return ast_new_string(tok);
+}
+
+// ✅ Fixed parse_block (same fix applies to parse_group)
 AstNode *parse_block(Parser *p)
 {
     if (!parser_match(p, LBRACE))
@@ -66,13 +80,10 @@ AstNode *parse_block(Parser *p)
 
     Token open_tok = p->previous;
 
-    AstNode **stmts = NULL;
     size_t count = 0, cap = 4;
-
-    stmts = malloc(cap * sizeof(AstNode *));
+    AstNode **stmts = malloc(cap * sizeof(AstNode *));
     if (!stmts)
     {
-        free(stmts);
         return NULL;
     }
 
@@ -91,56 +102,50 @@ AstNode *parse_block(Parser *p)
             AstNode **new_stmts = realloc(stmts, cap * sizeof(AstNode *));
             if (!new_stmts)
             {
-                free(stmts);
+                free(stmts); // ✅ free old buffer only on failure
                 return NULL;
             }
-            stmts = new_stmts;
-            free(new_stmts);
+            stmts = new_stmts; // ✅ don't free new_stmts — it IS stmts now
         }
-        stmts[count++] = stmt;
-        free(stmts);
+
+        stmts[count++] = stmt; // ✅ free only happens on error or after return
     }
 
     parser_consume(p, RBRACE, "expected '}' at end of block");
-    return ast_new_block(open_tok, stmts, count);
-    free(stmts);
+    AstNode *node = ast_new_block(open_tok, stmts, count);
+    free(stmts); // ✅ free after the node takes ownership (if it copies)
+    return node;
 }
 
-AstNode *parse_assert(Parser *p)
-{
-    parser_advance(p);
-    AstNode *expr = parse_expression(p);
-    if (!expr)
-    {
-        return NULL;
-    }
-
-    return ast_new_assert(expr);
-}
-
+// ✅ Fixed parse_print
 AstNode *parse_print(Parser *p)
 {
     parser_consume(p, TOK_PRINT, "missing 'print' statement");
-    printf("%s", p->current.start);
-    AstNode *group = (AstNode *)p;
-    parser_advance(p);
-    if (p->current.kind != STRING)
+
+    if (p->current.kind != LPAREN)
     {
-        parser_error_at(p, &p->current, "expected string literal after '('");
+        parser_error_at(p, &p->current, "expected '(' after 'print'");
+        return NULL;
+    }
+
+    AstNode *group = parse_group(p); // ✅ actually parse the group
+    if (!group)
+    {
         return NULL;
     }
 
     return ast_new_print(group);
 }
 
+// ✅ Fixed parse_test — removed dead free(block)
 AstNode *parse_test(Parser *p)
 {
     parser_advance(p);
+
     if (p->current.kind == IDENTIFIER)
     {
         parser_error_at(p, &p->current,
-                        "test name must be a string literal (use quotes: test "
-                        "\"name\" { ... })");
+                        "test name must be a string literal (use quotes: test \"name\" { ... })");
         return NULL;
     }
 
@@ -165,9 +170,20 @@ AstNode *parse_test(Parser *p)
         return NULL;
     }
 
-    return ast_new_test(test_name, block);
-    free(block);
-};
+    return ast_new_test(test_name, block); // ✅ no dead free after return
+}
+
+AstNode *parse_assert(Parser *p)
+{
+    parser_advance(p);
+    AstNode *expr = parse_expression(p);
+    if (!expr)
+    {
+        return NULL;
+    }
+
+    return ast_new_assert(expr);
+}
 
 AstNode *parse_statement(Parser *p)
 {

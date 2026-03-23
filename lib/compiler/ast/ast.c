@@ -2,6 +2,7 @@
 #include "ast.h"
 #include "../test_runner.h"
 #include "../writer.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -94,45 +95,6 @@ AstNode *ast_new_break_label(Token token)
     return NULL;
 }
 
-AstNode *ast_new_test(Token token, AstNode *block)
-{
-    AstNode *node = malloc(sizeof(AstNode));
-    if (!node)
-    {
-        return NULL;
-    }
-
-    const char *name_without_quotes = token.start + 1;
-    size_t len = token.len - 2;
-
-    run_tests(node);
-
-    *node = (AstNode){.kind = AST_TEST_STMT,
-                      .token = token,
-                      .data = {.test = {
-                                   .name = name_without_quotes,
-                                   .len = len,
-                                   .block = block,
-                               }}};
-
-    return node;
-}
-
-AstNode *ast_new_print(AstNode *group)
-{
-    AstNode *node = malloc(sizeof(AstNode));
-    if (!node)
-    {
-        return NULL;
-    }
-
-    write(node);
-    *node = (AstNode){.kind = AST_PRINT_STMT,
-                      .token = group->token,
-                      .data = {.print = {.group = group, .len = group->token.len}}};
-    return node;
-}
-
 // assert e test simples (expande depois)
 AstNode *ast_new_assert(AstNode *expr)
 {
@@ -147,12 +109,71 @@ AstNode *ast_new_assert(AstNode *expr)
     return node;
 }
 
+AstNode *ast_new_string(Token tok)
+{
+    AstNode *node = malloc(sizeof(AstNode));
+    if (!node)
+    {
+        return NULL;
+    }
+
+    *node = (AstNode){.kind = AST_STRING_LIT,
+                      .token = tok,
+                      .data = {.string = {.value = tok.start, .len = tok.len}}};
+    return node;
+}
+
+// ✅ Fixed ast_new_test
+AstNode *ast_new_test(Token token, AstNode *block)
+{
+    AstNode *node = malloc(sizeof(AstNode));
+    if (!node)
+    {
+        return NULL;
+    }
+
+    const char *name_without_quotes = token.start + 1;
+    size_t len = token.len - 2;
+
+    *node = (AstNode){// ✅ initialize FIRST
+                      .kind = AST_TEST_STMT,
+                      .token = token,
+                      .data = {.test = {
+                                   .name = name_without_quotes,
+                                   .len = len,
+                                   .block = block,
+                               }}};
+
+    run_tests(node); // ✅ THEN call with valid node
+    return node;
+}
+
+// ✅ Fixed ast_new_print
+AstNode *ast_new_print(AstNode *group)
+{
+    AstNode *node = malloc(sizeof(AstNode));
+    if (!node)
+    {
+        return NULL;
+    }
+
+    *node = (AstNode){// ✅ initialize FIRST
+                      .kind = AST_PRINT_STMT,
+                      .token = group->token,
+                      .data = {.print = {.group = group, .len = group->token.len}}};
+
+    write(node); // ✅ THEN call with valid node
+    return node;
+}
+
+// ✅ Fixed ast_free
 void ast_free(AstNode *node)
 {
     if (!node)
     {
-        return; // null safe — por quê? Evita crash em erros parciais
+        return;
     }
+
     switch (node->kind)
     {
     case AST_BIN_OP:
@@ -166,21 +187,20 @@ void ast_free(AstNode *node)
     case AST_PAREN_GROUP:
         for (size_t i = 0; i < node->data.block_or_group.count; i++)
         {
-            ast_free(node->data.block_or_group
-                         .stmts[i]); // recursão em filhos — por quê? Libera árvore toda
+            ast_free(node->data.block_or_group.stmts[i]);
         }
-        free(node->data.block_or_group.stmts); // array depois — por quê? Ordem certa evita dangling
+        free(node->data.block_or_group.stmts);
         break;
     case AST_TEST_STMT:
         ast_free(node->data.test.block);
         break;
     case AST_ASSERT_STMT:
-    {
-        ast_free(node->data.test.block);
+        ast_free(node->data.unary.expr); // ✅ fixed — was .test.block
+        break;
+    case AST_STRING_LIT: // ✅ new case — no children to free
+        break;
+    default:
         break;
     }
-    default:
-        break; // lits/idents não tem filhos
-    }
-    free(node); // nó base por último — por quê? Clean up completo
+    free(node);
 }
