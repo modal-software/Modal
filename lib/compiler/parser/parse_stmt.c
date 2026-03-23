@@ -79,7 +79,6 @@ AstNode *parse_test(Parser *p)
     }
 
     Token test_name = p->current;
-
     if (test_name.len < 3)
     {
         parser_error_at(p, &test_name, "test name cannot be empty");
