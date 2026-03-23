@@ -40,6 +40,5 @@ int main(int argc, char **argv)
 
     ast_free(root);
     free(buffer);
-    free(f);
     return 0;
 }
