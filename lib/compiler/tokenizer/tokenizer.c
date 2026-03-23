@@ -49,27 +49,21 @@ static TokenKind get_keyword(const char *s, int len)
     return TOK_IDENTIFIER;
 }
 
-static char peek(Tokenizer *t)
-{
-    return t->buffer[t->pos];
-}
-
-static char peek_next(Tokenizer *t)
-{
-    return t->buffer[t->pos + 1];
-}
+#define peek(t) ((t)->buffer[t->pos])
+#define peek_next(t) ((t)->buffer[(t)->pos + 1])
 
 static char advance(Tokenizer *t)
 {
     char c = t->buffer[t->pos++];
+    if (c != '\n')
+    {
+        t->col += 1;
+    }
+
     if (c == '\n')
     {
         t->line++;
         t->col = 1;
-    }
-    else
-    {
-        t->col++;
     }
     return c;
 }
@@ -138,12 +132,6 @@ Token next(Tokenizer *t)
                 continue;
             }
 
-            if (c == '\n')
-            {
-                advance(t);
-                continue;
-            }
-
             if (c == '#')
             {
                 start = t->buffer + t->pos;
@@ -162,7 +150,6 @@ Token next(Tokenizer *t)
                     if (curr == '\\' && peek_next(t) == '\n')
                     {
                         advance(t);
-                        t->line++;
                         len += 2;
                         continue;
                     }
@@ -190,14 +177,12 @@ Token next(Tokenizer *t)
             {
                 t->state = LEX_STATE_LINE_COMMENT;
                 advance(t);
-                advance(t);
                 continue;
             }
 
             if (c == '-' && peek_next(t) == '{')
             {
                 t->state = LEX_STATE_BLOCK_COMMENT;
-                advance(t);
                 advance(t);
                 continue;
             }
@@ -269,11 +254,9 @@ Token next(Tokenizer *t)
                 advance(t);
                 continue;
             }
-            {
-                int len = (int)((t->buffer + t->pos) - start);
-                t->state = LEX_STATE_START;
-                return token_make(get_keyword(start, len), start, len, start_line, start_col);
-            }
+            int len = (int)((t->buffer + t->pos) - start);
+            t->state = LEX_STATE_START;
+            return token_make(get_keyword(start, len), start, len, start_line, start_col);
 
         case LEX_STATE_NUMBER_INT:
             if (isdigit(c))
@@ -309,6 +292,7 @@ Token next(Tokenizer *t)
         {
             const char *buf = t->buffer;
             int pos = t->pos;
+            // printf("STRING_LIT entry: pos=%d char='%c'\n", pos, buf[pos]);
 
             while (buf[pos] != '\0' && buf[pos] != '"')
             {
@@ -337,23 +321,25 @@ Token next(Tokenizer *t)
                 }
             }
 
-            t->pos = pos;
-
             if (buf[pos] == '"')
             {
-                t->pos++;
+                pos++;
                 t->col++;
             }
+            t->pos = pos;
 
             int len = (int)((buf + t->pos) - start);
             t->state = LEX_STATE_START;
+            // printf("STRING_LIT exit: pos=%d len=%d raw='%.*s'\n", t->pos, len, len, start);
             return token_make(TOK_STRING, start, len, start_line, start_col);
         }
 
         case LEX_STATE_LINE_COMMENT:
             if (c == '\n' || c == '\0')
             {
+                advance(t);
                 t->state = LEX_STATE_START;
+                continue;
             }
             advance(t);
             continue;
