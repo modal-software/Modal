@@ -35,7 +35,6 @@ int main(int argc, char **argv)
 
     if (parser.had_error)
     {
-        fprintf(stderr, "erros falhou com erros.\n");
         return 1;
     }
 

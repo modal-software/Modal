@@ -41,6 +41,7 @@ typedef enum
     AST_BLOCK,
     AST_TEST_STMT,
     AST_ASSERT_STMT,
+    AST_PRINT_STMT,
     // futuro: AST_FN_DEF, AST_VAR_DECL, AST_STRUCT etc.
 } AstNodeKind;
 
@@ -90,6 +91,12 @@ struct AstNode
             AstNode *block;
         } test;
 
+        struct
+        {
+            size_t len;
+            AstNode *group;
+        } print;
+
         // AST_TEST_STMT, AST_ASSERT_STMT podem herdar fields de block + nome
     } data;
 };
@@ -97,8 +104,10 @@ struct AstNode
 AstNode *ast_new_number_lit(Token tok, long long val);
 AstNode *ast_new_ident(Token tok);
 AstNode *ast_new_binop(Token op_tok, AstNode *left, AstNode *right);
+AstNode *ast_new_group(Token open_brace, AstNode **stmts, size_t count);
 AstNode *ast_new_block(Token open_brace, AstNode **stmts, size_t count);
 AstNode *ast_new_test(Token token, AstNode *block);
+AstNode *ast_new_print(AstNode *group);
 AstNode *ast_new_assert(AstNode *expr);
 AstNode *ast_new_number(Token tok, long long val);
 void ast_free(AstNode *node);

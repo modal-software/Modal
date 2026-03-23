@@ -1,6 +1,7 @@
 // ast.c (adicione ao seu projeto)
 #include "ast.h"
 #include "../test_runner.h"
+#include "../writer.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -37,6 +38,28 @@ AstNode *ast_new_binop(Token op_tok, AstNode *left, AstNode *right)
     *node = (AstNode){
         .kind = AST_BIN_OP, .token = op_tok, .data = {.binop = {left, right, op_tok.kind}}};
     return node;
+}
+
+AstNode *ast_new_group(Token open_tok, AstNode **stmts, size_t count)
+{
+    AstNode *node = malloc(sizeof(AstNode));
+    if (!node)
+    {
+        return NULL;
+    }
+
+    AstNode **children = malloc(count * sizeof(AstNode *));
+    if (!children)
+    {
+        free(node);
+        return NULL;
+    }
+    memcpy(children, stmts, count * sizeof(AstNode *));
+
+    *node = (AstNode){
+        .kind = AST_PAREN_GROUP, .token = open_tok, .data = {.block_or_group = {children, count}}};
+    return node;
+    free(children);
 }
 
 AstNode *ast_new_block(Token open_tok, AstNode **stmts, size_t count)
@@ -92,6 +115,21 @@ AstNode *ast_new_test(Token token, AstNode *block)
                                    .block = block,
                                }}};
 
+    return node;
+}
+
+AstNode *ast_new_print(AstNode *group)
+{
+    AstNode *node = malloc(sizeof(AstNode));
+    if (!node)
+    {
+        return NULL;
+    }
+
+    write(node);
+    *node = (AstNode){.kind = AST_PRINT_STMT,
+                      .token = group->token,
+                      .data = {.print = {.group = group, .len = group->token.len}}};
     return node;
 }
 

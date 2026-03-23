@@ -34,8 +34,7 @@ static const Keyword keywords[] = {
     {"alias", 5, TOK_ALIAS}, {"use", 3, TOK_USE},           {"comptime", 8, TOK_COMPTIME},
     {"union", 5, TOK_UNION}, {"asm", 3, TOK_ASM},           {"volatile", 8, TOK_VOLATILE},
     {"async", 5, TOK_ASYNC}, {"await", 5, TOK_AWAIT},       {"and", 3, TOK_AND},
-    {"or", 2, TOK_OR},
-};
+    {"or", 2, TOK_OR},       {"print", 5, TOK_PRINT}};
 
 static TokenKind get_keyword(const char *s, int len)
 {
@@ -256,6 +255,7 @@ Token next(Tokenizer *t)
             }
             int len = (int)((t->buffer + t->pos) - start);
             t->state = LEX_STATE_START;
+            printf("%c", t->state);
             return token_make(get_keyword(start, len), start, len, start_line, start_col);
 
         case LEX_STATE_NUMBER_INT:
@@ -287,7 +287,6 @@ Token next(Tokenizer *t)
                 t->state = LEX_STATE_START;
                 return token_make(TOK_NUMBER, start, len, start_line, start_col);
             }
-
         case LEX_STATE_STRING_LIT:
         {
             const char *buf = t->buffer;
