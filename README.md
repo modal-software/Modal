@@ -1,33 +1,29 @@
-# coisas
-- Interoperabilidade com C/C++.
-- Design de uso que evita alocações.
-- Design explicito, mas produtividade acima de explicitude.
-- Performance (não tem jeito).
-- Compilador decente.
+# Roadmap
+- [] Finish arena allocators
+- [] Correction in tokenizer lib
+- [] Fix ast problems
+
+# Features roadmap
+- Interop: C/C++/(OBJ C/C++)/RUST even ZIG
 - Construção pensada em longo prazo.
 - Logs decente
-- Gerenciador de pacotes ou bibliotecas inseridas (variante de header)
-\0
-\0
-**Além disso**
+
+**Design**
+- Explicit
+- Drop/cleaning design, with switchable  memory features: (borrow checker, garbage collector or manual control)
+
+**Decisions to take**
+- Packages manager or libraries?
 - Buscar constancia em changes (evitar breaking changes), isso traz o interesse de usuários novos
-\0
-\0
+
 **Diferenciais (talves não sei)**
-- Baixo acoplamento em quaisquer funcionalidade
+- Complete standard library
+- Few reserved keywords
 - Definições parametrizadas (isso é top no zig)
-Macros,
-- Estrutura de dados: Structs, traits/interfaces, types ou typedef
-- Compile-time checking, algo como templates ou comptime do zig
+- metaprogramming/macros without sacrificing DX (Developer experience)
+- GEP -> General Ecosystem Platform (our core idea)
 
-### Build cmd
+### How to build
 ```bash
-
-gcc -std=c17 -Wall -Wextra \                                                                                                                                                 14:15:41
-                                   main.c \
-                                   parser.c \
-                                   tokenizer/tokenizer.c \
-                                   -I. \
-                                   -o lang
-
+make
 ```
