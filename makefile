@@ -17,8 +17,7 @@ modal: $(OBJS)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 run: modal
-	clear
-	./modal ./examples/add.modal
+	clear; ./modal ./examples/add.modal
 
 clean:
 	rm -f *.o modal
