@@ -1,7 +1,7 @@
 # Roadmap
-[] - Finish arena allocators
-[] - Correction in tokenizer lib
-[] - Fix ast problems
+- [] Finish arena allocators
+- [] Correction in tokenizer lib
+- [] Fix ast problems
 
 # Features roadmap
 - Interop: C/C++/(OBJ C/C++)/RUST even ZIG
