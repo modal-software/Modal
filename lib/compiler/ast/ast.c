@@ -58,6 +58,7 @@ AstNode *ast_new_block(Token open_tok, AstNode **stmts, size_t count)
     *node = (AstNode){
         .kind = AST_BLOCK, .token = open_tok, .data = {.block_or_group = {children, count}}};
     return node;
+    free(children);
 }
 
 AstNode *ast_new_break_label(Token token)

@@ -1,4 +1,4 @@
-#include "parser.h"
+#include "../parser/parser.h"
 #include <stdarg.h>
 #include <stdio.h>
 
@@ -7,17 +7,15 @@ void fatal(const char *fmt)
     fprintf(stderr, fmt, "\n");
 }
 
-// Mostra erro com linha do fonte e ^
 void parser_error_at(Parser *p, Token *tok, const char *fmt, ...)
 {
-    p->had_error = 1; // flag global — por quê? Pra main saber se parse deu bom
+    p->had_error = 1; // global state for application
 
     fprintf(stderr, "Erro [%s:%d:%d]: ", p->filename, tok->line, tok->col);
 
     va_list args;
     va_start(args, fmt);
-    vfprintf(stderr, fmt,
-             args); // mensagem flexível — por quê? Como printf, fácil usar %s %d etc.
+    vfprintf(stderr, fmt, args); // mensagem flexível — por quê? Como printf, fácil usar %s %d etc.
     va_end(args);
     fprintf(stderr, "\n");
 
@@ -27,19 +25,20 @@ void parser_error_at(Parser *p, Token *tok, const char *fmt, ...)
     {
         line_start--; // volta até começo da linha — por quê? Mostra contexto todo
     }
+
     const char *line_end = tok->start;
     while (*line_end && *line_end != '\n')
     {
-        line_end++; // até fim
+        // Doesnt stop until reach end
+        line_end++;
     }
 
-    fprintf(stderr, "%3d | %.*s\n", tok->line, (int)(line_end - line_start),
-            line_start); // linha numerada — por quê? Legível
+    fprintf(stderr, "%3d | %.*s", tok->line, (int)(line_end - line_start), line_start);
 
-    fprintf(stderr, "      | "); // alinhamento
+    fprintf(stderr, "\n    | ");
     for (int i = 1; i < tok->col; i++)
     {
-        fputc(' ', stderr); // espaços até coluna
+        fputc(' ', stderr);
     }
     fputc('^', stderr); // o ^
     fprintf(stderr, "\n");
