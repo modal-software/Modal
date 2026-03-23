@@ -8,7 +8,8 @@ int main(int argc, char **argv)
 {
     if (argc < 2)
     {
-        fprintf(stderr, "Uso: %s arquivo.modal\n", argv[0]);
+        fprintf(stderr, "%s: fatal: no input files\n", argv[0]);
+        printf("[Process exited %d]\n", EXIT_FAILURE);
         return 1;
     }
 
