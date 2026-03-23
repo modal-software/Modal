@@ -1,4 +1,4 @@
-#include "ast.h"
+#include "../ast/ast.h"
 #include "parser.h"
 
 // This function is deprecated - use parse_statement instead
