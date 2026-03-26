@@ -1,8 +1,5 @@
 // ast.c (adicione ao seu projeto)
 #include "ast.h"
-#include "../parser/parser.h"
-#include "../test_runner.h"
-#include "../writer.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -61,7 +58,6 @@ AstNode *ast_new_group(Token open_tok, AstNode **stmts, size_t count)
     *node = (AstNode){
         .kind = AST_PAREN_GROUP, .token = open_tok, .data = {.block_or_group = {children, count}}};
     return node;
-    free(children);
 }
 
 AstNode *ast_new_block(Token open_tok, AstNode **stmts, size_t count)
@@ -83,7 +79,6 @@ AstNode *ast_new_block(Token open_tok, AstNode **stmts, size_t count)
     *node = (AstNode){
         .kind = AST_BLOCK, .token = open_tok, .data = {.block_or_group = {children, count}}};
     return node;
-    free(children);
 }
 
 AstNode *ast_new_break_label(Token token)
@@ -144,7 +139,6 @@ AstNode *ast_new_test(Token token, AstNode *block)
                                    .block = block,
                                }}};
 
-    run_tests(node);
     return node;
 }
 
@@ -160,7 +154,6 @@ AstNode *ast_new_print(AstNode *group)
                       .token = group->token,
                       .data = {.print = {.group = group, .len = group->token.len}}};
 
-    write(node);
     return node;
 }
 
