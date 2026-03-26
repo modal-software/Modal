@@ -108,6 +108,13 @@ struct AstNode
     } data;
 };
 
+// Iterate over children of a BLOCK or PAREN_GROUP node.
+// Usage: AST_EACH(block_node, child) { /* use child */ }
+#define AST_EACH(block, child)                                                                     \
+    for (size_t _i = 0; _i < (block)->data.block_or_group.count &&                                \
+                          ((child) = (block)->data.block_or_group.stmts[_i], 1);                   \
+         _i++)
+
 AstNode *ast_new_number_lit(Token tok, long long val);
 AstNode *ast_new_ident(Token tok);
 AstNode *ast_new_binop(Token op_tok, AstNode *left, AstNode *right);
