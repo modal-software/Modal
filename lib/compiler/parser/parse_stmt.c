@@ -44,10 +44,8 @@ AstNode *parse_group(Parser *p)
                 return NULL;
             }
             stmts = new_stmts;
-            free(new_stmts);
         }
         stmts[count++] = stmt;
-        free(stmts);
     }
 
     parser_consume(p, RPAREN, "expected ')' at end of group");
@@ -102,8 +100,9 @@ AstNode *parse_block(Parser *p)
 
 AstNode *parse_string(Parser *p)
 {
-
-    return ast_new_string(p->current);
+    Token tok = p->current;
+    parser_advance(p);
+    return ast_new_string(tok);
 }
 
 AstNode *parse_print(Parser *p)
@@ -120,9 +119,6 @@ AstNode *parse_print(Parser *p)
     {
         return NULL;
     }
-    parse_string(p);
-
-    content->data.string.value = p->current.start;
 
     return ast_new_print(content);
 }

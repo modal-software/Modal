@@ -117,11 +117,11 @@ AstNode *ast_new_string(Token tok)
         return NULL;
     }
     const char *string_value = tok.start + 1;
-    printf("%s", string_value);
+    size_t string_len = tok.len - 2;
 
     *node = (AstNode){.kind = AST_STRING_LIT,
                       .token = tok,
-                      .data = {.string = {.value = string_value, .len = tok.len}}};
+                      .data = {.string = {.value = string_value, .len = string_len}}};
     return node;
 }
 
@@ -192,9 +192,9 @@ void ast_free(AstNode *node)
         ast_free(node->data.test.block);
         break;
     case AST_ASSERT_STMT:
-        ast_free(node->data.unary.expr); // ✅ fixed — was .test.block
+        ast_free(node->data.unary.expr);
         break;
-    case AST_STRING_LIT: // ✅ new case — no children to free
+    case AST_STRING_LIT:
         break;
     default:
         break;
