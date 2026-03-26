@@ -1,5 +1,6 @@
 // ast.c (adicione ao seu projeto)
 #include "ast.h"
+#include "../parser/parser.h"
 #include "../test_runner.h"
 #include "../writer.h"
 #include <stdio.h>
@@ -95,7 +96,6 @@ AstNode *ast_new_break_label(Token token)
     return NULL;
 }
 
-// assert e test simples (expande depois)
 AstNode *ast_new_assert(AstNode *expr)
 {
     AstNode *node = malloc(sizeof(AstNode));
@@ -116,14 +116,15 @@ AstNode *ast_new_string(Token tok)
     {
         return NULL;
     }
+    const char *string_value = tok.start + 1;
+    printf("%s", string_value);
 
     *node = (AstNode){.kind = AST_STRING_LIT,
                       .token = tok,
-                      .data = {.string = {.value = tok.start, .len = tok.len}}};
+                      .data = {.string = {.value = string_value, .len = tok.len}}};
     return node;
 }
 
-// ✅ Fixed ast_new_test
 AstNode *ast_new_test(Token token, AstNode *block)
 {
     AstNode *node = malloc(sizeof(AstNode));
@@ -135,8 +136,7 @@ AstNode *ast_new_test(Token token, AstNode *block)
     const char *name_without_quotes = token.start + 1;
     size_t len = token.len - 2;
 
-    *node = (AstNode){// ✅ initialize FIRST
-                      .kind = AST_TEST_STMT,
+    *node = (AstNode){.kind = AST_TEST_STMT,
                       .token = token,
                       .data = {.test = {
                                    .name = name_without_quotes,
@@ -144,11 +144,10 @@ AstNode *ast_new_test(Token token, AstNode *block)
                                    .block = block,
                                }}};
 
-    run_tests(node); // ✅ THEN call with valid node
+    run_tests(node);
     return node;
 }
 
-// ✅ Fixed ast_new_print
 AstNode *ast_new_print(AstNode *group)
 {
     AstNode *node = malloc(sizeof(AstNode));
@@ -157,16 +156,14 @@ AstNode *ast_new_print(AstNode *group)
         return NULL;
     }
 
-    *node = (AstNode){// ✅ initialize FIRST
-                      .kind = AST_PRINT_STMT,
+    *node = (AstNode){.kind = AST_PRINT_STMT,
                       .token = group->token,
                       .data = {.print = {.group = group, .len = group->token.len}}};
 
-    write(node); // ✅ THEN call with valid node
+    write(node);
     return node;
 }
 
-// ✅ Fixed ast_free
 void ast_free(AstNode *node)
 {
     if (!node)

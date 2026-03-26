@@ -52,24 +52,8 @@ AstNode *parse_group(Parser *p)
 
     parser_consume(p, RPAREN, "expected ')' at end of group");
     return ast_new_group(open_tok, stmts, count);
-    free(stmts);
 }
 
-// ✅ parse_string — new function
-AstNode *parse_string(Parser *p)
-{
-    if (p->current.kind != STRING)
-    {
-        parser_error_at(p, &p->current, "expected string literal");
-        return NULL;
-    }
-
-    Token tok = p->current;
-    parser_advance(p);
-    return ast_new_string(tok);
-}
-
-// ✅ Fixed parse_block (same fix applies to parse_group)
 AstNode *parse_block(Parser *p)
 {
     if (!parser_match(p, LBRACE))
@@ -102,42 +86,47 @@ AstNode *parse_block(Parser *p)
             AstNode **new_stmts = realloc(stmts, cap * sizeof(AstNode *));
             if (!new_stmts)
             {
-                free(stmts); // ✅ free old buffer only on failure
+                free(stmts);
                 return NULL;
             }
-            stmts = new_stmts; // ✅ don't free new_stmts — it IS stmts now
+            stmts = new_stmts;
         }
 
-        stmts[count++] = stmt; // ✅ free only happens on error or after return
+        stmts[count++] = stmt;
     }
 
     parser_consume(p, RBRACE, "expected '}' at end of block");
     AstNode *node = ast_new_block(open_tok, stmts, count);
-    free(stmts); // ✅ free after the node takes ownership (if it copies)
     return node;
 }
 
-// ✅ Fixed parse_print
+AstNode *parse_string(Parser *p)
+{
+
+    return ast_new_string(p->current);
+}
+
 AstNode *parse_print(Parser *p)
 {
     parser_consume(p, TOK_PRINT, "missing 'print' statement");
-
     if (p->current.kind != LPAREN)
     {
         parser_error_at(p, &p->current, "expected '(' after 'print'");
         return NULL;
     }
 
-    AstNode *group = parse_group(p); // ✅ actually parse the group
-    if (!group)
+    AstNode *content = parse_group(p);
+    if (!content)
     {
         return NULL;
     }
+    parse_string(p);
 
-    return ast_new_print(group);
+    content->data.string.value = p->current.start;
+
+    return ast_new_print(content);
 }
 
-// ✅ Fixed parse_test — removed dead free(block)
 AstNode *parse_test(Parser *p)
 {
     parser_advance(p);
@@ -170,7 +159,7 @@ AstNode *parse_test(Parser *p)
         return NULL;
     }
 
-    return ast_new_test(test_name, block); // ✅ no dead free after return
+    return ast_new_test(test_name, block);
 }
 
 AstNode *parse_assert(Parser *p)
