@@ -105,9 +105,9 @@ AstNode *parse_string(Parser *p)
     return ast_new_string(tok);
 }
 
-AstNode *parse_print(Parser *p)
+AstNode *parse_write(Parser *p)
 {
-    parser_consume(p, TOK_PRINT, "missing 'print' statement");
+    parser_consume(p, TOK_WRITE, "missing 'write' statement");
     if (p->current.kind != LPAREN)
     {
         parser_error_at(p, &p->current, "expected '(' after 'print'");
@@ -120,7 +120,7 @@ AstNode *parse_print(Parser *p)
         return NULL;
     }
 
-    return ast_new_print(content);
+    return ast_new_write(content);
 }
 
 AstNode *parse_test(Parser *p)
@@ -176,8 +176,8 @@ AstNode *parse_statement(Parser *p)
     {
     case ASSERT:
         return parse_assert(p);
-    case PRINT:
-        return parse_print(p);
+    case WRITE:
+        return parse_write(p);
     case LPAREN:
         return parse_group(p);
     case STRING:

@@ -38,7 +38,7 @@ typedef enum
     TOK_AWAIT,
     TOK_AND,
     TOK_OR,
-    TOK_PRINT,
+    TOK_WRITE,
     // Multi-char operators
     TOK_Q_DOT,
     TOK_QQ_EQ,
@@ -105,7 +105,7 @@ Token next(Tokenizer *t);
 #define STRING TOK_STRING
 #define TEST TOK_TEST
 #define ASSERT TOK_ASSERT
-#define PRINT TOK_PRINT
+#define WRITE TOK_WRITE
 #define SIZEOF TOK_SIZEOF
 #define DEFER TOK_DEFER
 #define AUTOFREE TOK_AUTOFREE

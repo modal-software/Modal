@@ -4,7 +4,7 @@
 
 void write(AstNode *program)
 {
-    if (program->kind != AST_PRINT_STMT)
+    if (program->kind != AST_WRITE_STMT)
     {
         return;
     }

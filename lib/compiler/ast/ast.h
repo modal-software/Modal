@@ -41,7 +41,7 @@ typedef enum
     AST_BLOCK,
     AST_TEST_STMT,
     AST_ASSERT_STMT,
-    AST_PRINT_STMT,
+    AST_WRITE_STMT,
     AST_STRING_LIT,
     // futuro: AST_FN_DEF, AST_VAR_DECL, AST_STRUCT etc.
 } AstNodeKind;
@@ -111,8 +111,8 @@ struct AstNode
 // Iterate over children of a BLOCK or PAREN_GROUP node.
 // Usage: AST_EACH(block_node, child) { /* use child */ }
 #define AST_EACH(block, child)                                                                     \
-    for (size_t _i = 0; _i < (block)->data.block_or_group.count &&                                \
-                          ((child) = (block)->data.block_or_group.stmts[_i], 1);                   \
+    for (size_t _i = 0; _i < (block)->data.block_or_group.count &&                                 \
+                        ((child) = (block)->data.block_or_group.stmts[_i], 1);                     \
          _i++)
 
 AstNode *ast_new_number_lit(Token tok, long long val);
@@ -121,7 +121,7 @@ AstNode *ast_new_binop(Token op_tok, AstNode *left, AstNode *right);
 AstNode *ast_new_group(Token open_brace, AstNode **stmts, size_t count);
 AstNode *ast_new_block(Token open_brace, AstNode **stmts, size_t count);
 AstNode *ast_new_test(Token token, AstNode *block);
-AstNode *ast_new_print(AstNode *group);
+AstNode *ast_new_write(AstNode *group);
 AstNode *ast_new_assert(AstNode *expr);
 AstNode *ast_new_number(Token tok, long long val);
 AstNode *ast_new_string(Token tok);

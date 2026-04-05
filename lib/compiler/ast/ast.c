@@ -142,7 +142,7 @@ AstNode *ast_new_test(Token token, AstNode *block)
     return node;
 }
 
-AstNode *ast_new_print(AstNode *group)
+AstNode *ast_new_write(AstNode *group)
 {
     AstNode *node = malloc(sizeof(AstNode));
     if (!node)
@@ -150,7 +150,7 @@ AstNode *ast_new_print(AstNode *group)
         return NULL;
     }
 
-    *node = (AstNode){.kind = AST_PRINT_STMT,
+    *node = (AstNode){.kind = AST_WRITE_STMT,
                       .token = group->token,
                       .data = {.print = {.group = group, .len = group->token.len}}};
 
