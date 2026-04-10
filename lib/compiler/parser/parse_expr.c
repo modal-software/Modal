@@ -1,6 +1,6 @@
-#include "parser.h"
 #include "../test_runner.h"
 #include "../writer.h"
+#include "parser.h"
 #include <stdlib.h>
 
 static AstNode *parse_primary(Parser *p)
@@ -150,7 +150,7 @@ void exec_node(AstNode *node)
 
     switch (node->kind)
     {
-    case AST_PRINT_STMT:
+    case AST_WRITE_STMT:
         write(node);
         break;
     case AST_TEST_STMT:

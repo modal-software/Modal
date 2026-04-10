@@ -9,14 +9,14 @@ void write(AstNode *program)
         return;
     }
 
-    AstNode *group = program->data.print.group;
+    AstNode *group = program->data.write.group;
     AstNode *child;
     AST_EACH(group, child)
     {
         switch (child->kind)
         {
         case AST_STRING_LIT:
-            printf("%.*s\n", (int)child->data.string.len, child->data.string.value);
+            fprintf(stdout, "%.*s\n", (int)child->data.string.len, child->data.string.value);
             break;
         default:
             break;
