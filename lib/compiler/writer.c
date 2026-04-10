@@ -10,13 +10,16 @@ void write(AstNode *program)
     }
 
     AstNode *group = program->data.print.group;
-    for (size_t i = 0; i < group->data.block_or_group.count; i++)
+    AstNode *child;
+    AST_EACH(group, child)
     {
-        AstNode *child = group->data.block_or_group.stmts[i];
         switch (child->kind)
-        case AST_STRING_LIT:
         {
+        case AST_STRING_LIT:
             printf("%.*s\n", (int)child->data.string.len, child->data.string.value);
+            break;
+        default:
+            break;
         }
     }
 }

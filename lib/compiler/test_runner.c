@@ -1,28 +1,8 @@
 #include "test_runner.h"
+#include "parser/parser.h"
 #include <stdio.h>
-#include <string.h>
 
 static TestResults results = {0, 0, 0};
-
-void print_test_name(const char *name, size_t len)
-{
-    printf("%.*s", (int)len, name);
-}
-
-int eval_assert(AstNode *expr)
-{
-    if (!expr)
-    {
-        return 0;
-    }
-
-    if (expr->kind == AST_BIN_OP)
-    {
-        return 1;
-    }
-
-    return 1;
-}
 
 void exec_test(AstNode *test_node)
 {
@@ -38,21 +18,19 @@ void exec_test(AstNode *test_node)
     results.total++;
 
     printf("Running test: \"");
-    print_test_name(name, name_len);
+    printf("%.*s", (int)name_len, name);
     printf("\" ... ");
 
     int test_passed = 1;
 
     if (block && block->kind == AST_BLOCK)
     {
-        for (size_t i = 0; i < block->data.block_or_group.count; i++)
+        AstNode *stmt;
+        AST_EACH(block, stmt)
         {
-            AstNode *stmt = block->data.block_or_group.stmts[i];
-
-            // Handle assert statements
-            if (stmt && stmt->kind == AST_ASSERT_STMT)
+            if (stmt->kind == AST_ASSERT_STMT)
             {
-                if (!eval_assert(stmt->data.unary.expr))
+                if (eval_expr(stmt->data.unary.expr) == 0)
                 {
                     test_passed = 0;
                     break;
@@ -60,6 +38,7 @@ void exec_test(AstNode *test_node)
             }
         }
     }
+
     if (test_passed)
     {
         printf("✓ PASSED\n\n");
@@ -72,25 +51,11 @@ void exec_test(AstNode *test_node)
     }
 }
 
-void run_tests(AstNode *program)
+void print_test_summary(void)
 {
-    if (!program)
+    if (results.total == 0)
     {
         return;
-    }
-
-    const TestResults results = (TestResults){0, 0, 0};
-
-    if (program->kind == AST_BLOCK)
-    {
-        for (size_t i = 0; i < program->data.block_or_group.count; i++)
-        {
-            AstNode *stmt = program->data.block_or_group.stmts[i];
-            if (stmt && stmt->kind == AST_TEST_STMT)
-            {
-                exec_test(stmt);
-            }
-        }
     }
 
     if (results.passed > 0)
@@ -102,12 +67,14 @@ void run_tests(AstNode *program)
         printf("Failed: %d", results.failed);
     }
 
-    if (results.failed == 0 && results.total > 0)
+    if (results.failed == 0)
     {
         printf("\n✓ All tests passed!\n");
     }
-    else if (results.failed > 0)
+    else
     {
         printf("\n❌ Some tests failed.\n");
     }
+
+    results = (TestResults){0, 0, 0};
 }

@@ -30,7 +30,7 @@ const char *kind_to_string(TokenKind *kind)
 
 static const Keyword keywords[] = {
     {"test", 4, TOK_TEST},   {"assert", 6, TOK_ASSERT},     {"sizeof", 6, TOK_SIZEOF},
-    {"defer", 5, TOK_DEFER}, {"autofree", 8, TOK_AUTOFREE}, {"fun", 8, TOK_FUNCTION},
+    {"defer", 5, TOK_DEFER}, {"autofree", 8, TOK_AUTOFREE}, {"fun", 3, TOK_FUNCTION},
     {"alias", 5, TOK_ALIAS}, {"use", 3, TOK_USE},           {"comptime", 8, TOK_COMPTIME},
     {"union", 5, TOK_UNION}, {"asm", 3, TOK_ASM},           {"volatile", 8, TOK_VOLATILE},
     {"async", 5, TOK_ASYNC}, {"await", 5, TOK_AWAIT},       {"and", 3, TOK_AND},
@@ -49,7 +49,7 @@ static TokenKind get_keyword(const char *s, int len)
 }
 
 #define peek(t) ((t)->buffer[t->pos])
-#define peek_next(t) ((t)->buffer[(t)->pos + 1])
+#define peek_next(t) ((t)->buffer[(t)->pos] ? (t)->buffer[(t)->pos + 1] : '\0')
 
 static char advance(Tokenizer *t)
 {
@@ -255,7 +255,6 @@ Token next(Tokenizer *t)
             }
             int len = (int)((t->buffer + t->pos) - start);
             t->state = LEX_STATE_START;
-            printf("%c", t->state);
             return token_make(get_keyword(start, len), start, len, start_line, start_col);
 
         case LEX_STATE_NUMBER_INT:

@@ -36,8 +36,12 @@ int main(int argc, char **argv)
 
     if (parser.had_error)
     {
+        ast_free(root);
+        free(buffer);
         return 1;
     }
+
+    exec_program(root);
 
     ast_free(root);
     free(buffer);

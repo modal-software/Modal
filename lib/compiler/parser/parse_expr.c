@@ -1,4 +1,6 @@
 #include "parser.h"
+#include "../test_runner.h"
+#include "../writer.h"
 #include <stdlib.h>
 
 static AstNode *parse_primary(Parser *p)
@@ -91,4 +93,86 @@ static AstNode *parse_term(Parser *p)
 AstNode *parse_expression(Parser *p)
 {
     return parse_term(p);
+}
+
+long long eval_expr(AstNode *expr)
+{
+    if (!expr)
+    {
+        return 0;
+    }
+
+    switch (expr->kind)
+    {
+    case AST_NUMBER_LIT:
+        return expr->data.number.value;
+
+    case AST_BIN_OP:
+    {
+        long long left = eval_expr(expr->data.binop.left);
+        long long right = eval_expr(expr->data.binop.right);
+        const char op = *expr->token.start;
+
+        switch (op)
+        {
+        case '+':
+            return left + right;
+        case '-':
+            return left - right;
+        case '*':
+            return left * right;
+        case '/':
+            return right != 0 ? left / right : 0;
+        case '=':
+            return left == right;
+        case '!':
+            return left != right;
+        case '<':
+            return left < right;
+        case '>':
+            return left > right;
+        default:
+            return 0;
+        }
+    }
+
+    default:
+        return 0;
+    }
+}
+
+void exec_node(AstNode *node)
+{
+    if (!node)
+    {
+        return;
+    }
+
+    switch (node->kind)
+    {
+    case AST_PRINT_STMT:
+        write(node);
+        break;
+    case AST_TEST_STMT:
+        exec_test(node);
+        break;
+    default:
+        break;
+    }
+}
+
+void exec_program(AstNode *root)
+{
+    if (!root || root->kind != AST_BLOCK)
+    {
+        return;
+    }
+
+    AstNode *stmt;
+    AST_EACH(root, stmt)
+    {
+        exec_node(stmt);
+    }
+
+    print_test_summary();
 }
