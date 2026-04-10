@@ -43,7 +43,6 @@ typedef enum
     AST_ASSERT_STMT,
     AST_WRITE_STMT,
     AST_STRING_LIT,
-    // futuro: AST_FN_DEF, AST_VAR_DECL, AST_STRUCT etc.
 } AstNodeKind;
 
 typedef struct AstNode AstNode;
@@ -51,7 +50,7 @@ typedef struct AstNode AstNode;
 struct AstNode
 {
     AstNodeKind kind;
-    Token token; // token principal (pra localização + valor)
+    Token token;
 
     union
     {
@@ -96,7 +95,7 @@ struct AstNode
         {
             size_t len;
             AstNode *group;
-        } print;
+        } write;
 
         struct
         {

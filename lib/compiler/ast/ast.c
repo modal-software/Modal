@@ -152,7 +152,7 @@ AstNode *ast_new_write(AstNode *group)
 
     *node = (AstNode){.kind = AST_WRITE_STMT,
                       .token = group->token,
-                      .data = {.print = {.group = group, .len = group->token.len}}};
+                      .data = {.write = {.group = group, .len = group->token.len}}};
 
     return node;
 }
