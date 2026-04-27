@@ -11,7 +11,7 @@ void parser_error_at(Parser *p, Token *tok, const char *fmt, ...)
 {
     p->had_error = 1; // global state for application
 
-    fprintf(stderr, "Erro [%s:%d:%d]: ", p->filename, tok->line, tok->col);
+    fprintf(stderr, "[%s:%d:%d] error: ", p->filename, tok->line, tok->col);
 
     va_list args;
     va_start(args, fmt);
@@ -57,7 +57,7 @@ void parser_synchronize(Parser *p)
         switch (p->current.kind)
         { // keywords que começam novo stmt
         case TEST:
-        case PRINT:
+        case WRITE:
         case ASSERT:
         case LBRACE:
         case RBRACE:

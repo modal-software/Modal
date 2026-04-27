@@ -2,6 +2,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#define PARSE_ASSERT(k, x, m)                                                                      \
+    do                                                                                             \
+    {                                                                                              \
+        if ((k) != (x))                                                                            \
+        {                                                                                          \
+            parser_error_at(p, &p->current, m);                                                    \
+            return NULL;                                                                           \
+        }                                                                                          \
+    } while (0)
+
 // macro fn sum(num: i8) -> i8
 char *run_macro_blocK(Parser *p, LexerState *l);
 
@@ -108,19 +118,14 @@ AstNode *parse_string(Parser *p)
 AstNode *parse_write(Parser *p)
 {
     parser_consume(p, TOK_WRITE, "missing 'write' statement");
-    if (p->current.kind != LPAREN)
-    {
-        parser_error_at(p, &p->current, "expected '(' after 'print'");
-        return NULL;
-    }
 
-    AstNode *content = parse_group(p);
-    if (!content)
-    {
-        return NULL;
-    }
+    PARSE_ASSERT(p->current.kind, STRING,
+                 "too few arguments to function 'write'; expected"
+                 " at least 1, have 0");
+    parse_statement(p);
 
-    return ast_new_write(content);
+    AstNode *a = (AstNode *)p;
+    return ast_new_write(a);
 }
 
 AstNode *parse_test(Parser *p)

@@ -34,7 +34,8 @@ static const Keyword keywords[] = {
     {"alias", 5, TOK_ALIAS}, {"use", 3, TOK_USE},           {"comptime", 8, TOK_COMPTIME},
     {"union", 5, TOK_UNION}, {"asm", 3, TOK_ASM},           {"volatile", 8, TOK_VOLATILE},
     {"async", 5, TOK_ASYNC}, {"await", 5, TOK_AWAIT},       {"and", 3, TOK_AND},
-    {"or", 2, TOK_OR},       {"write", 5, TOK_WRITE}};
+    {"or", 2, TOK_OR},       {"write", 5, TOK_WRITE},
+};
 
 static TokenKind get_keyword(const char *s, int len)
 {
