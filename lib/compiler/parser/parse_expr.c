@@ -3,57 +3,54 @@
 #include "parser.h"
 #include <stdlib.h>
 
-static AstNode *parse_primary(Parser *p)
-{
-    if (parser_match(p, NUMBER))
-    {
+AstNode *parse_primary(Parser *p) {
+    if (parser_match(p, NUMBER)) {
         long long val = strtoll(p->previous.start, NULL, 10);
         return ast_new_number(p->previous, val);
     }
 
-    if (parser_match(p, IDENTIFIER))
-    {
+    if (parser_match(p, IDENTIFIER)) {
         return ast_new_ident(p->previous);
     }
 
-    if (parser_match(p, LPAREN))
-    {
+    if (parser_match(p, LPAREN)) {
         AstNode *expr = parse_expression(p);
         parser_consume(p, RPAREN, "expected ')' after expression");
         return expr;
     }
 
+    if (parser_match(p, STRING)) {
+        // parser_consume(p, STRING, "expected string literal");
+        return ast_new_string(p->previous);
+    }
+
     // Give more helpful error messages
-    if (p->current.kind == STRING)
-    {
-        parser_error_at(p, &p->current, "unexpected string literal in expression");
+    if (p->current.kind == STRING) {
+        parser_error_at(p, &p->current,
+                        "unexpected string literal in expression");
         return NULL;
     }
 
-    parser_error_at(p, &p->current, "expected expression (number, identifier, or '(')");
+    parser_error_at(p, &p->current,
+                    "expected expression (number, identifier, or '(')");
     return NULL;
 }
 
-static AstNode *parse_factor(Parser *p)
-{
+static AstNode *parse_factor(Parser *p) {
     AstNode *left = parse_primary(p);
-    if (!left)
-    {
+    if (!left) {
         return NULL;
     }
 
-    while (p->current.kind == OPERATOR)
-    {
+    while (p->current.kind == OPERATOR) {
         char op = *p->current.start;
-        if (op != '*' && op != '/')
-        {
+        if (op != '*' && op != '/') {
             break;
         }
         Token op_tok = p->current;
         parser_advance(p);
         AstNode *right = parse_primary(p);
-        if (!right)
-        {
+        if (!right) {
             ast_free(left);
             return NULL;
         }
@@ -62,26 +59,21 @@ static AstNode *parse_factor(Parser *p)
     return left;
 }
 
-static AstNode *parse_term(Parser *p)
-{
+static AstNode *parse_term(Parser *p) {
     AstNode *left = parse_factor(p);
-    if (!left)
-    {
+    if (!left) {
         return NULL;
     }
 
-    while (p->current.kind == OPERATOR)
-    {
+    while (p->current.kind == OPERATOR) {
         char op = *p->current.start;
-        if (op != '+' && op != '-')
-        {
+        if (op != '+' && op != '-') {
             break;
         }
         Token op_tok = p->current;
         parser_advance(p);
         AstNode *right = parse_factor(p);
-        if (!right)
-        {
+        if (!right) {
             ast_free(left);
             return NULL;
         }
@@ -90,31 +82,23 @@ static AstNode *parse_term(Parser *p)
     return left;
 }
 
-AstNode *parse_expression(Parser *p)
-{
-    return parse_term(p);
-}
+AstNode *parse_expression(Parser *p) { return parse_term(p); }
 
-long long eval_expr(AstNode *expr)
-{
-    if (!expr)
-    {
+long long eval_expr(AstNode *expr) {
+    if (!expr) {
         return 0;
     }
 
-    switch (expr->kind)
-    {
+    switch (expr->kind) {
     case AST_NUMBER_LIT:
         return expr->data.number.value;
 
-    case AST_BIN_OP:
-    {
+    case AST_BIN_OP: {
         long long left = eval_expr(expr->data.binop.left);
         long long right = eval_expr(expr->data.binop.right);
         const char op = *expr->token.start;
 
-        switch (op)
-        {
+        switch (op) {
         case '+':
             return left + right;
         case '-':
@@ -141,15 +125,12 @@ long long eval_expr(AstNode *expr)
     }
 }
 
-void exec_node(AstNode *node)
-{
-    if (!node)
-    {
+void exec_node(AstNode *node) {
+    if (!node) {
         return;
     }
 
-    switch (node->kind)
-    {
+    switch (node->kind) {
     case AST_WRITE_STMT:
         write(node);
         break;
@@ -161,18 +142,13 @@ void exec_node(AstNode *node)
     }
 }
 
-void exec_program(AstNode *root)
-{
-    if (!root || root->kind != AST_BLOCK)
-    {
+void exec_program(AstNode *root) {
+    if (!root || root->kind != AST_BLOCK) {
         return;
     }
 
     AstNode *stmt;
-    AST_EACH(root, stmt)
-    {
-        exec_node(stmt);
-    }
+    AST_EACH(root, stmt) { exec_node(stmt); }
 
     print_test_summary();
 }
