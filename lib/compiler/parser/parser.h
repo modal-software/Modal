@@ -9,8 +9,7 @@
 
 typedef struct Parser Parser;
 
-struct Parser
-{
+struct Parser {
     Tokenizer *lexer;
     Token current;
     Token previous;
@@ -20,7 +19,8 @@ struct Parser
 
 // Inicialização e entry point principal
 void parser_init(Parser *p, Tokenizer *lexer, const char *filename);
-AstNode *parse_program(Parser *p); // retorna raiz da AST (um AST_BLOCK top-level)
+AstNode *
+parse_program(Parser *p); // retorna raiz da AST (um AST_BLOCK top-level)
 
 // Helpers de consumo e avanço (usados em todos parse_*.c)
 void parser_advance(Parser *p);
@@ -30,13 +30,14 @@ void parser_error_at(Parser *p, Token *tok, const char *fmt, ...);
 void parser_synchronize(Parser *p); // recovery básico após erro
 
 // Funções de parse expostas (pra modularidade — cada uma em seu .c)
-AstNode *parse_expression(Parser *p); // em parse_expr.c
-long long eval_expr(AstNode *expr);   // em parse_expr.c
-void exec_node(AstNode *node);        // em parse_expr.c
-void exec_program(AstNode *root);     // em parse_expr.c
-AstNode *parse_statement(Parser *p);  // em parse_stmt.c
-AstNode *parse_block(Parser *p);      // em parse_stmt.c
-AstNode *parse_assert(Parser *p);     // em parse_stmt.c
+AstNode *parse_primary(Parser *p); // em parse_expr.c
+AstNode *parse_expression(Parser *p);
+long long eval_expr(AstNode *expr);  // em parse_expr.c
+void exec_node(AstNode *node);       // em parse_expr.c
+void exec_program(AstNode *root);    // em parse_expr.c
+AstNode *parse_statement(Parser *p); // em parse_stmt.c
+AstNode *parse_block(Parser *p);     // em parse_stmt.c
+AstNode *parse_assert(Parser *p);    // em parse_stmt.c
 // Futuro:
 AstNode *parse_test_decl(Parser *p);
 // AstNode  *parse_declaration(Parser *p);        // fn, struct, var...
