@@ -2,23 +2,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#define PARSE_ASSERT(k, x, m)                                                                      \
-    do                                                                                             \
-    {                                                                                              \
-        if ((k) != (x))                                                                            \
-        {                                                                                          \
-            parser_error_at(p, &p->current, m);                                                    \
-            return NULL;                                                                           \
-        }                                                                                          \
+#define PARSE_ASSERT(k, x, m)                                                  \
+    do {                                                                       \
+        if ((k) != (x)) {                                                      \
+            parser_error_at(p, &p->current, m);                                \
+            return NULL;                                                       \
+        }                                                                      \
     } while (0)
 
 // macro fn sum(num: i8) -> i8
 char *run_macro_blocK(Parser *p, LexerState *l);
 
-AstNode *parse_group(Parser *p)
-{
-    if (!parser_match(p, LPAREN))
-    {
+AstNode *parse_group(Parser *p) {
+    if (!parser_match(p, LPAREN)) {
         parser_error_at(p, &p->current, "expected '(' to start group");
         return NULL;
     }
@@ -29,27 +25,22 @@ AstNode *parse_group(Parser *p)
     size_t count = 0, cap = 4;
 
     stmts = malloc(cap * sizeof(AstNode *));
-    if (!stmts)
-    {
+    if (!stmts) {
         free(stmts);
         return NULL;
     }
 
-    while (p->current.kind != RPAREN && p->current.kind != TOK_EOF)
-    {
+    while (p->current.kind != RPAREN && p->current.kind != TOK_EOF) {
         AstNode *stmt = parse_statement(p);
-        if (p->had_error || !stmt)
-        {
+        if (p->had_error || !stmt) {
             parser_synchronize(p);
             continue;
         }
 
-        if (count >= cap)
-        {
+        if (count >= cap) {
             cap *= 2;
             AstNode **new_stmts = realloc(stmts, cap * sizeof(AstNode *));
-            if (!new_stmts)
-            {
+            if (!new_stmts) {
                 free(stmts);
                 return NULL;
             }
@@ -58,14 +49,12 @@ AstNode *parse_group(Parser *p)
         stmts[count++] = stmt;
     }
 
-    parser_consume(p, RPAREN, "expected ')' at end of group");
+    PARSE_ASSERT(p->current.kind, RPAREN, "expected ')' at end of group");
     return ast_new_group(open_tok, stmts, count);
 }
 
-AstNode *parse_block(Parser *p)
-{
-    if (!parser_match(p, LBRACE))
-    {
+AstNode *parse_block(Parser *p) {
+    if (!parser_match(p, LBRACE)) {
         parser_error_at(p, &p->current, "expected '{' to start block");
         return NULL;
     }
@@ -74,26 +63,21 @@ AstNode *parse_block(Parser *p)
 
     size_t count = 0, cap = 4;
     AstNode **stmts = malloc(cap * sizeof(AstNode *));
-    if (!stmts)
-    {
+    if (!stmts) {
         return NULL;
     }
 
-    while (p->current.kind != RBRACE && p->current.kind != TOK_EOF)
-    {
+    while (p->current.kind != RBRACE && p->current.kind != TOK_EOF) {
         AstNode *stmt = parse_statement(p);
-        if (p->had_error || !stmt)
-        {
+        if (p->had_error || !stmt) {
             parser_synchronize(p);
             continue;
         }
 
-        if (count >= cap)
-        {
+        if (count >= cap) {
             cap *= 2;
             AstNode **new_stmts = realloc(stmts, cap * sizeof(AstNode *));
-            if (!new_stmts)
-            {
+            if (!new_stmts) {
                 free(stmts);
                 return NULL;
             }
@@ -108,46 +92,32 @@ AstNode *parse_block(Parser *p)
     return node;
 }
 
-AstNode *parse_string(Parser *p)
-{
-    Token tok = p->current;
-    parser_advance(p);
-    return ast_new_string(tok);
-}
-
-AstNode *parse_write(Parser *p)
-{
+AstNode *parse_write(Parser *p) {
     parser_consume(p, TOK_WRITE, "missing 'write' statement");
 
-    PARSE_ASSERT(p->current.kind, STRING,
-                 "too few arguments to function 'write'; expected"
-                 " at least 1, have 0");
-    parse_statement(p);
+    if (p->current.kind == TOK_LPAREN) parser_advance(p);
 
-    AstNode *a = (AstNode *)p;
+    AstNode *a = parse_primary(p); 
     return ast_new_write(a);
 }
 
-AstNode *parse_test(Parser *p)
-{
+AstNode *parse_test(Parser *p) {
     parser_advance(p);
 
-    if (p->current.kind == IDENTIFIER)
-    {
+    if (p->current.kind == IDENTIFIER) {
         parser_error_at(p, &p->current,
-                        "test name must be a string literal (use quotes: test \"name\" { ... })");
+                        "test name must be a string literal (use quotes: test "
+                        "\"name\" { ... })");
         return NULL;
     }
 
-    if (p->current.kind != STRING)
-    {
+    if (p->current.kind != STRING) {
         parser_error_at(p, &p->current, "expected string literal after 'test'");
         return NULL;
     }
 
     Token test_name = p->current;
-    if (test_name.len < 3)
-    {
+    if (test_name.len < 3) {
         parser_error_at(p, &test_name, "test name cannot be empty");
         return NULL;
     }
@@ -155,45 +125,32 @@ AstNode *parse_test(Parser *p)
     parser_advance(p);
 
     AstNode *block = parse_block(p);
-    if (!block)
-    {
+    if (!block) {
         return NULL;
     }
 
     return ast_new_test(test_name, block);
 }
 
-AstNode *parse_assert(Parser *p)
-{
+AstNode *parse_assert(Parser *p) {
     parser_advance(p);
     AstNode *expr = parse_expression(p);
-    if (!expr)
-    {
+    if (!expr) {
         return NULL;
     }
 
     return ast_new_assert(expr);
 }
 
-AstNode *parse_statement(Parser *p)
-{
-    switch (p->current.kind)
-    {
+AstNode *parse_statement(Parser *p) {
+    switch (p->current.kind) {
     case ASSERT:
         return parse_assert(p);
     case WRITE:
         return parse_write(p);
-    case LPAREN:
-        return parse_group(p);
-    case STRING:
-        return parse_string(p);
     case TEST:
         return parse_test(p);
-    case LBRACE:
-        return parse_block(p);
-
-    default:
-    {
+    default: {
         parser_error_at(p, &p->current, "unexpected statement");
         return NULL;
     }
