@@ -19,5 +19,8 @@ modal: $(OBJS)
 run: modal
 	clear; ./modal ./examples/add.modal
 
+verbose: modal
+	./modal ./examples/add.modal
+
 clean:
 	rm -f *.o modal
