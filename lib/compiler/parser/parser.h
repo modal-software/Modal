@@ -9,10 +9,22 @@
 
 typedef struct Parser Parser;
 
+// typedef enum
+// {
+//     STX_GROUPED,
+//     STX_LITERAL
+// } ParserStyle;
+//
+// typedef struct
+// {
+//     ParserStyle style;
+// } ctx;
+
 struct Parser
 {
     Tokenizer *lexer;
     Token current;
+    // ctx Context; // <-- goes there
     Token previous;
     const char *filename;
     int had_error; // flag pra saber se rolou erro em algum ponto
@@ -34,6 +46,10 @@ AstNode *parse_expression(Parser *p); // em parse_expr.c
 long long eval_expr(AstNode *expr);   // em parse_expr.c
 void exec_node(AstNode *node);        // em parse_expr.c
 void exec_program(AstNode *root);     // em parse_expr.c
+AstNode *parse_group(Parser *p);      // em parse_stmt.c
+AstNode *parse_string(Parser *p);     // em parse_stmt.c
+AstNode *parse_write(Parser *p);      // em parse_stmt.c
+AstNode *parse_assert(Parser *p);     // em parse_stmt.c
 AstNode *parse_statement(Parser *p);  // em parse_stmt.c
 AstNode *parse_block(Parser *p);      // em parse_stmt.c
 AstNode *parse_assert(Parser *p);     // em parse_stmt.c
