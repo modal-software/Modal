@@ -11,11 +11,11 @@ void parser_error_at(Parser *p, Token *tok, const char *fmt, ...)
 {
     p->had_error = 1; // global state for application
 
-    fprintf(stderr, "Erro [%s:%d:%d]: ", p->filename, tok->line, tok->col);
+    fprintf(stderr, "\nerror [%s:%d:%d]: ", p->filename, tok->line, tok->col);
 
     va_list args;
     va_start(args, fmt);
-    vfprintf(stderr, fmt, args); // mensagem flexível — por quê? Como printf, fácil usar %s %d etc.
+    vfprintf(stderr, fmt, args);
     va_end(args);
     fprintf(stderr, "\n");
 
