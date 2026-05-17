@@ -1,5 +1,4 @@
 #include "../test_runner.h"
-#include "../writer.h"
 #include "parser.h"
 #include <stdlib.h>
 
@@ -18,81 +17,79 @@ static AstNode *parse_primary(Parser *p)
 
     if (parser_match(p, LPAREN))
     {
-        AstNode *expr = parse_expression(p);
-        parser_consume(p, RPAREN, "expected ')' after expression");
-        return expr;
+        return parse_group(p);
     }
 
-    // Give more helpful error messages
     if (p->current.kind == STRING)
     {
-        parser_error_at(p, &p->current, "unexpected string literal in expression");
-        return NULL;
+        return parse_string(p);
     }
 
     parser_error_at(p, &p->current, "expected expression (number, identifier, or '(')");
     return NULL;
 }
 
-static AstNode *parse_factor(Parser *p)
-{
-    AstNode *left = parse_primary(p);
-    if (!left)
-    {
-        return NULL;
-    }
-
-    while (p->current.kind == OPERATOR)
-    {
-        char op = *p->current.start;
-        if (op != '*' && op != '/')
-        {
-            break;
-        }
-        Token op_tok = p->current;
-        parser_advance(p);
-        AstNode *right = parse_primary(p);
-        if (!right)
-        {
-            ast_free(left);
-            return NULL;
-        }
-        left = ast_new_binop(op_tok, left, right);
-    }
-    return left;
-}
-
-static AstNode *parse_term(Parser *p)
-{
-    AstNode *left = parse_factor(p);
-    if (!left)
-    {
-        return NULL;
-    }
-
-    while (p->current.kind == OPERATOR)
-    {
-        char op = *p->current.start;
-        if (op != '+' && op != '-')
-        {
-            break;
-        }
-        Token op_tok = p->current;
-        parser_advance(p);
-        AstNode *right = parse_factor(p);
-        if (!right)
-        {
-            ast_free(left);
-            return NULL;
-        }
-        left = ast_new_binop(op_tok, left, right);
-    }
-    return left;
-}
+// static AstNode *parse_factor(Parser *p)
+// {
+//     AstNode *left = parse_primary(p);
+//     if (!left)
+//     {
+//         return NULL;
+//     }
+//
+//     while (p->current.kind == OPERATOR)
+//     {
+//         char op = *p->current.start;
+//         if (op != '*' && op != '/')
+//         {
+//             break;
+//         }
+//         Token op_tok = p->current;
+//         parser_advance(p);
+//         AstNode *right = parse_primary(p);
+//         if (!right)
+//         {
+//             ast_free(left);
+//             return NULL;
+//         }
+//         left = ast_new_binop(op_tok, left, right);
+//     }
+//     return left;
+// }
+//
+// static AstNode *parse_term(Parser *p)
+// {
+//
+//     AstNode *left = parse_factor(p);
+//     if (!left)
+//     {
+//         return NULL;
+//     }
+//
+//     while (p->current.kind == OPERATOR)
+//     {
+//         char op = *p->current.start;
+//         if (op != '+' && op != '-')
+//         {
+//             break;
+//         }
+//         Token op_tok = p->current;
+//         parser_advance(p);
+//         AstNode *right = parse_factor(p);
+//         if (!right)
+//         {
+//             ast_free(left);
+//             return NULL;
+//         }
+//         left = ast_new_binop(op_tok, left, right);
+//     }
+//     return left;
+// }
 
 AstNode *parse_expression(Parser *p)
 {
-    return parse_term(p);
+
+    return parse_primary(p);
 }
 
 long long eval_expr(AstNode *expr)
@@ -150,9 +147,9 @@ void exec_node(AstNode *node)
 
     switch (node->kind)
     {
-    case AST_WRITE_STMT:
-        write(node);
-        break;
+    // case AST_WRITE_STMT:
+    //     write(node);
+    //     break;
     case AST_TEST_STMT:
         exec_test(node);
         break;
@@ -163,7 +160,7 @@ void exec_node(AstNode *node)
 
 void exec_program(AstNode *root)
 {
-    if (!root || root->kind != AST_BLOCK)
+    if (!root || root->kind != AST_BLOCK || root->kind != AST_PAREN_GROUP)
     {
         return;
     }
