@@ -1,3 +1,2 @@
 write "print para literais"
-
-write("print com parenteses multiplos argumentos")
+write("print com parenteses multiplos argumentos"
