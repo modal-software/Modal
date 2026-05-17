@@ -111,12 +111,11 @@ AstNode *ast_new_string(Token tok)
     {
         return NULL;
     }
-    const char *string_value = tok.start + 1;
-    size_t string_len = tok.len - 2;
 
     *node = (AstNode){.kind = AST_STRING_LIT,
                       .token = tok,
-                      .data = {.string = {.value = string_value, .len = string_len}}};
+                      .data = {.string = {.value = tok.start, .len = tok.len}}};
+
     return node;
 }
 
@@ -142,7 +141,7 @@ AstNode *ast_new_test(Token token, AstNode *block)
     return node;
 }
 
-AstNode *ast_new_write(AstNode *group)
+AstNode *ast_new_write(AstNode *n, Fmt fmt)
 {
     AstNode *node = malloc(sizeof(AstNode));
     if (!node)
@@ -150,9 +149,17 @@ AstNode *ast_new_write(AstNode *group)
         return NULL;
     }
 
-    *node = (AstNode){.kind = AST_WRITE_STMT,
-                      .token = group->token,
-                      .data = {.write = {.group = group, .len = group->token.len}}};
+    if (n->kind != AST_PAREN_GROUP)
+    {
+
+        *node = (AstNode){.kind = AST_WRITE_STMT,
+                          .token = n->token,
+                          .data = {.write = {.group = NULL, fmt = fmt}}};
+        return node;
+    }
+
+    *node = (AstNode){
+        .kind = AST_WRITE_STMT, .token = n->token, .data = {.write = {.group = n, fmt = fmt}}};
 
     return node;
 }
@@ -188,6 +195,7 @@ void ast_free(AstNode *node)
         ast_free(node->data.unary.expr);
         break;
     case AST_STRING_LIT:
+        ast_free(node);
         break;
     default:
         break;

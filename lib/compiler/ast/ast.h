@@ -4,6 +4,7 @@
 
 #include "../tokenizer/tokenizer.h"
 
+// unused
 typedef enum
 {
     T_VOID,
@@ -24,6 +25,7 @@ typedef enum
     T_I64,
 } TypeKind;
 
+// unused
 typedef struct Type
 {
     TypeKind kind;
@@ -46,6 +48,12 @@ typedef enum
 } AstNodeKind;
 
 typedef struct AstNode AstNode;
+
+typedef enum
+{
+    FMT_GROUPED,
+    FMT_LITERAL
+} Fmt;
 
 struct AstNode
 {
@@ -93,8 +101,8 @@ struct AstNode
 
         struct
         {
-            size_t len;
             AstNode *group;
+            Fmt fmt;
         } write;
 
         struct
@@ -120,7 +128,7 @@ AstNode *ast_new_binop(Token op_tok, AstNode *left, AstNode *right);
 AstNode *ast_new_group(Token open_brace, AstNode **stmts, size_t count);
 AstNode *ast_new_block(Token open_brace, AstNode **stmts, size_t count);
 AstNode *ast_new_test(Token token, AstNode *block);
-AstNode *ast_new_write(AstNode *group);
+AstNode *ast_new_write(AstNode *n, Fmt fmt);
 AstNode *ast_new_assert(AstNode *expr);
 AstNode *ast_new_number(Token tok, long long val);
 AstNode *ast_new_string(Token tok);
