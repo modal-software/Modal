@@ -4,6 +4,7 @@
 
 #include "../tokenizer/tokenizer.h"
 
+// unused
 typedef enum
 {
     T_VOID,
@@ -24,6 +25,7 @@ typedef enum
     T_I64,
 } TypeKind;
 
+// unused
 typedef struct Type
 {
     TypeKind kind;
@@ -41,15 +43,22 @@ typedef enum
     AST_BLOCK,
     AST_TEST_STMT,
     AST_ASSERT_STMT,
-    // futuro: AST_FN_DEF, AST_VAR_DECL, AST_STRUCT etc.
+    AST_WRITE_STMT,
+    AST_STRING_LIT,
 } AstNodeKind;
 
 typedef struct AstNode AstNode;
 
+typedef enum
+{
+    FMT_GROUPED,
+    FMT_LITERAL
+} Fmt;
+
 struct AstNode
 {
     AstNodeKind kind;
-    Token token; // token principal (pra localização + valor)
+    Token token;
 
     union
     {
@@ -90,17 +99,39 @@ struct AstNode
             AstNode *block;
         } test;
 
+        struct
+        {
+            AstNode *group;
+            Fmt fmt;
+        } write;
+
+        struct
+        {
+            size_t len;
+            const char *value;
+        } string;
+
         // AST_TEST_STMT, AST_ASSERT_STMT podem herdar fields de block + nome
     } data;
 };
 
+// Iterate over children of a BLOCK or PAREN_GROUP node.
+// Usage: AST_EACH(block_node, child) { /* use child */ }
+#define AST_EACH(block, child)                                                                     \
+    for (size_t _i = 0; _i < (block)->data.block_or_group.count &&                                 \
+                        ((child) = (block)->data.block_or_group.stmts[_i], 1);                     \
+         _i++)
+
 AstNode *ast_new_number_lit(Token tok, long long val);
 AstNode *ast_new_ident(Token tok);
 AstNode *ast_new_binop(Token op_tok, AstNode *left, AstNode *right);
+AstNode *ast_new_group(Token open_brace, AstNode **stmts, size_t count);
 AstNode *ast_new_block(Token open_brace, AstNode **stmts, size_t count);
 AstNode *ast_new_test(Token token, AstNode *block);
+AstNode *ast_new_write(AstNode *n, Fmt fmt);
 AstNode *ast_new_assert(AstNode *expr);
 AstNode *ast_new_number(Token tok, long long val);
+AstNode *ast_new_string(Token tok);
 void ast_free(AstNode *node);
 
 #endif

@@ -8,7 +8,8 @@ int main(int argc, char **argv)
 {
     if (argc < 2)
     {
-        fprintf(stderr, "Uso: %s arquivo.modal\n", argv[0]);
+        fprintf(stderr, "%s: fatal: no input files\n", argv[0]);
+        printf("[Process exited %d]\n", EXIT_FAILURE);
         return 1;
     }
 
@@ -35,12 +36,14 @@ int main(int argc, char **argv)
 
     if (parser.had_error)
     {
-        fprintf(stderr, "erros falhou com erros.\n");
+        ast_free(root);
+        free(buffer);
         return 1;
     }
 
+    exec_program(root);
+
     ast_free(root);
     free(buffer);
-    free(f);
     return 0;
 }

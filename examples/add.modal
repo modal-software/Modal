@@ -1,1 +1,3 @@
-test "test" {}
+write "print para literais"
+
+write("print com parenteses multiplos argumentos")

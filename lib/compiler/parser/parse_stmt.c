@@ -5,11 +5,11 @@
 // macro fn sum(num: i8) -> i8
 char *run_macro_blocK(Parser *p, LexerState *l);
 
-AstNode *parse_block(Parser *p)
+AstNode *parse_group(Parser *p)
 {
-    if (!parser_match(p, LBRACE))
+    if (p->current.kind == LPAREN)
     {
-        parser_error_at(p, &p->current, "expected '{' to start block");
+        parser_error_at(p, &p->current, "expected '(' to start group");
         return NULL;
     }
 
@@ -22,6 +22,58 @@ AstNode *parse_block(Parser *p)
     if (!stmts)
     {
         free(stmts);
+        return NULL;
+    }
+
+    while (p->current.kind != RPAREN && p->current.kind != TOK_EOF)
+    {
+        AstNode *stmt = parse_statement(p);
+        if (p->had_error || !stmt)
+        {
+            parser_synchronize(p);
+            continue;
+        }
+
+        if (count >= cap)
+        {
+            cap *= 2;
+            AstNode **new_stmts = realloc(stmts, cap * sizeof(AstNode *));
+            if (!new_stmts)
+            {
+                free(stmts);
+                return NULL;
+            }
+            stmts = new_stmts;
+        }
+        stmts[count++] = stmt;
+    }
+
+    if (p->current.kind != RPAREN)
+    {
+
+        parser_error_at(p, &p->current, "expected ')' at end of group");
+        free(stmts);
+        return NULL;
+    }
+
+    parser_advance(p);
+    return ast_new_group(open_tok, stmts, count);
+}
+
+AstNode *parse_block(Parser *p)
+{
+    if (!parser_match(p, LBRACE))
+    {
+        parser_error_at(p, &p->current, "expected '{' to start block");
+        return NULL;
+    }
+
+    Token open_tok = p->previous;
+
+    size_t count = 0, cap = 4;
+    AstNode **stmts = malloc(cap * sizeof(AstNode *));
+    if (!stmts)
+    {
         return NULL;
     }
 
@@ -44,43 +96,60 @@ AstNode *parse_block(Parser *p)
                 return NULL;
             }
             stmts = new_stmts;
-            free(new_stmts);
         }
+
         stmts[count++] = stmt;
-        free(stmts);
     }
 
     parser_consume(p, RBRACE, "expected '}' at end of block");
-    return ast_new_block(open_tok, stmts, count);
-    free(stmts);
+    AstNode *node = ast_new_block(open_tok, stmts, count);
+    return node;
 }
 
-AstNode *parse_assert(Parser *p)
+AstNode *parse_string(Parser *p)
 {
+    Token tok = p->current;
+    fprintf(stdout, "%.*s\n", tok.len - 2, tok.start + 1);
     parser_advance(p);
-    AstNode *expr = parse_expression(p);
-    if (!expr)
+    return ast_new_string(tok);
+}
+
+AstNode *parse_write(Parser *p)
+{
+    parser_consume(p, TOK_WRITE, "missing 'write' statement");
+
+    AstNode *arg = {0};
+    Fmt fmt = 0;
+
+    if (p->current.kind == LPAREN)
     {
-        return NULL;
+        arg = parse_expression(p);
+        fmt = FMT_GROUPED;
     }
 
-    return ast_new_assert(expr);
+    if (p->current.kind == STRING)
+    {
+        arg = parse_expression(p);
+        fmt = FMT_LITERAL;
+    }
+
+    return ast_new_write(arg, fmt);
 }
 
 AstNode *parse_test(Parser *p)
 {
     parser_advance(p);
-    if (p->current.kind != STRING)
-    {
-        parser_error_at(p, &p->current, "expected string literal after 'test'");
-        return NULL;
-    }
 
     if (p->current.kind == IDENTIFIER)
     {
         parser_error_at(p, &p->current,
-                        "test name must be a string literal (use quotes: test "
-                        "\"name\" { ... })");
+                        "test name must be a string literal (use quotes: test \"name\" { ... })");
+        return NULL;
+    }
+
+    if (p->current.kind != STRING)
+    {
+        parser_error_at(p, &p->current, "expected string literal after 'test'");
         return NULL;
     }
 
@@ -100,8 +169,19 @@ AstNode *parse_test(Parser *p)
     }
 
     return ast_new_test(test_name, block);
-    free(block);
-};
+}
+
+AstNode *parse_assert(Parser *p)
+{
+    parser_advance(p);
+    AstNode *expr = parse_expression(p);
+    if (!expr)
+    {
+        return NULL;
+    }
+
+    return ast_new_assert(expr);
+}
 
 AstNode *parse_statement(Parser *p)
 {
@@ -109,20 +189,19 @@ AstNode *parse_statement(Parser *p)
     {
     case ASSERT:
         return parse_assert(p);
-
+    case WRITE:
+        return parse_write(p);
+    // case LPAREN:
+    //     return parse_group(p);
+    case STRING:
+        return parse_string(p);
     case TEST:
         return parse_test(p);
-
     case LBRACE:
         return parse_block(p);
 
     default:
     {
-        AstNode *expr = parse_expression(p);
-        if (expr)
-        {
-            return expr;
-        }
         parser_error_at(p, &p->current, "unexpected statement");
         return NULL;
     }

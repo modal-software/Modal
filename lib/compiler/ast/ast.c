@@ -1,6 +1,6 @@
 // ast.c (adicione ao seu projeto)
 #include "ast.h"
-#include "../test_runner.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -39,6 +39,27 @@ AstNode *ast_new_binop(Token op_tok, AstNode *left, AstNode *right)
     return node;
 }
 
+AstNode *ast_new_group(Token open_tok, AstNode **stmts, size_t count)
+{
+    AstNode *node = malloc(sizeof(AstNode));
+    if (!node)
+    {
+        return NULL;
+    }
+
+    AstNode **children = malloc(count * sizeof(AstNode *));
+    if (!children)
+    {
+        free(node);
+        return NULL;
+    }
+    memcpy(children, stmts, count * sizeof(AstNode *));
+
+    *node = (AstNode){
+        .kind = AST_PAREN_GROUP, .token = open_tok, .data = {.block_or_group = {children, count}}};
+    return node;
+}
+
 AstNode *ast_new_block(Token open_tok, AstNode **stmts, size_t count)
 {
     AstNode *node = malloc(sizeof(AstNode));
@@ -70,31 +91,6 @@ AstNode *ast_new_break_label(Token token)
     return NULL;
 }
 
-AstNode *ast_new_test(Token token, AstNode *block)
-{
-    AstNode *node = malloc(sizeof(AstNode));
-    if (!node)
-    {
-        return NULL;
-    }
-
-    const char *name_without_quotes = token.start + 1;
-    size_t len = token.len - 2;
-
-    run_tests(node);
-
-    *node = (AstNode){.kind = AST_TEST_STMT,
-                      .token = token,
-                      .data = {.test = {
-                                   .name = name_without_quotes,
-                                   .len = len,
-                                   .block = block,
-                               }}};
-
-    return node;
-}
-
-// assert e test simples (expande depois)
 AstNode *ast_new_assert(AstNode *expr)
 {
     AstNode *node = malloc(sizeof(AstNode));
@@ -108,12 +104,73 @@ AstNode *ast_new_assert(AstNode *expr)
     return node;
 }
 
+AstNode *ast_new_string(Token tok)
+{
+    AstNode *node = malloc(sizeof(AstNode));
+    if (!node)
+    {
+        return NULL;
+    }
+
+    *node = (AstNode){.kind = AST_STRING_LIT,
+                      .token = tok,
+                      .data = {.string = {.value = tok.start, .len = tok.len}}};
+
+    return node;
+}
+
+AstNode *ast_new_test(Token token, AstNode *block)
+{
+    AstNode *node = malloc(sizeof(AstNode));
+    if (!node)
+    {
+        return NULL;
+    }
+
+    const char *name_without_quotes = token.start + 1;
+    size_t len = token.len - 2;
+
+    *node = (AstNode){.kind = AST_TEST_STMT,
+                      .token = token,
+                      .data = {.test = {
+                                   .name = name_without_quotes,
+                                   .len = len,
+                                   .block = block,
+                               }}};
+
+    return node;
+}
+
+AstNode *ast_new_write(AstNode *n, Fmt fmt)
+{
+    AstNode *node = malloc(sizeof(AstNode));
+    if (!node)
+    {
+        return NULL;
+    }
+
+    if (n->kind != AST_PAREN_GROUP)
+    {
+
+        *node = (AstNode){.kind = AST_WRITE_STMT,
+                          .token = n->token,
+                          .data = {.write = {.group = NULL, fmt = fmt}}};
+        return node;
+    }
+
+    *node = (AstNode){
+        .kind = AST_WRITE_STMT, .token = n->token, .data = {.write = {.group = n, fmt = fmt}}};
+
+    return node;
+}
+
 void ast_free(AstNode *node)
 {
     if (!node)
     {
-        return; // null safe — por quê? Evita crash em erros parciais
+        return;
     }
+
     switch (node->kind)
     {
     case AST_BIN_OP:
@@ -127,21 +184,21 @@ void ast_free(AstNode *node)
     case AST_PAREN_GROUP:
         for (size_t i = 0; i < node->data.block_or_group.count; i++)
         {
-            ast_free(node->data.block_or_group
-                         .stmts[i]); // recursão em filhos — por quê? Libera árvore toda
+            ast_free(node->data.block_or_group.stmts[i]);
         }
-        free(node->data.block_or_group.stmts); // array depois — por quê? Ordem certa evita dangling
+        free(node->data.block_or_group.stmts);
         break;
     case AST_TEST_STMT:
         ast_free(node->data.test.block);
         break;
     case AST_ASSERT_STMT:
-    {
-        ast_free(node->data.test.block);
+        ast_free(node->data.unary.expr);
+        break;
+    case AST_STRING_LIT:
+        ast_free(node);
+        break;
+    default:
         break;
     }
-    default:
-        break; // lits/idents não tem filhos
-    }
-    free(node); // nó base por último — por quê? Clean up completo
+    free(node);
 }

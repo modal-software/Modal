@@ -3,8 +3,8 @@ CFLAGS = -Wall -Wextra -g -std=c17 -I ./
 TARGET = jma
 LIBS = -lm -lpthread -ldl
 
-SRCS = ./lib/compiler/tokenizer/tokenizer.c ./lib/compiler/parser/parser.c ./lib/compiler/ast/ast.c ./lib/compiler/ast/error.c ./lib/compiler/parser/parse_decl.c ./lib/compiler/parser/parse_expr.c ./lib/compiler/parser/parse_stmt.c ./lib/compiler/test_runner.c ./main.c  # adicione todos .c
-OBJS = $(SRCS:.c=.o)  # mágica: tokenizer.c → tokenizer.o
+SRCS = ./lib/compiler/tokenizer/tokenizer.c ./lib/compiler/parser/parser.c ./lib/compiler/ast/ast.c ./lib/compiler/ast/error.c ./lib/compiler/parser/parse_decl.c ./lib/compiler/parser/parse_expr.c ./lib/compiler/parser/parse_stmt.c ./lib/compiler/test_runner.c ./lib/compiler/writer.c ./main.c  # adicione todos .c
+OBJS = $(SRCS:.c=.o)
 	
 # Paths
 PREFIX ?= /usr/local
@@ -15,6 +15,12 @@ modal: $(OBJS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
+
+run: modal
+	clear; ./modal ./examples/add.modal
+
+verbose: modal
+	./modal ./examples/add.modal
 
 clean:
 	rm -f *.o modal

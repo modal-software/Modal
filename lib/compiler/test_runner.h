@@ -11,6 +11,10 @@ typedef struct
     int failed;
 } TestResults;
 
-void run_tests(AstNode *program);
+// Execute a single AST_TEST_STMT node.
+void exec_test(AstNode *test_node);
+
+// Print the accumulated test summary. Call once after all tests.
+void print_test_summary(void);
 
 #endif
