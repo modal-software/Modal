@@ -7,7 +7,7 @@ char *run_macro_blocK(Parser *p, LexerState *l);
 
 AstNode *parse_group(Parser *p)
 {
-    if (!parser_match(p, LPAREN))
+    if (p->current.kind == LPAREN)
     {
         parser_error_at(p, &p->current, "expected '(' to start group");
         return NULL;
@@ -48,7 +48,15 @@ AstNode *parse_group(Parser *p)
         stmts[count++] = stmt;
     }
 
-    parser_consume(p, RPAREN, "expected ')' at end of group");
+    if (p->current.kind != RPAREN)
+    {
+
+        parser_error_at(p, &p->current, "expected ')' at end of group");
+        free(stmts);
+        return NULL;
+    }
+
+    parser_advance(p);
     return ast_new_group(open_tok, stmts, count);
 }
 
@@ -101,6 +109,7 @@ AstNode *parse_block(Parser *p)
 AstNode *parse_string(Parser *p)
 {
     Token tok = p->current;
+    fprintf(stdout, "%.*s\n", tok.len - 2, tok.start + 1);
     parser_advance(p);
     return ast_new_string(tok);
 }
@@ -108,19 +117,23 @@ AstNode *parse_string(Parser *p)
 AstNode *parse_write(Parser *p)
 {
     parser_consume(p, TOK_WRITE, "missing 'write' statement");
-    if (p->current.kind != LPAREN)
+
+    AstNode *arg = {0};
+    Fmt fmt = 0;
+
+    if (p->current.kind == LPAREN)
     {
-        parser_error_at(p, &p->current, "expected '(' after 'print'");
-        return NULL;
+        arg = parse_expression(p);
+        fmt = FMT_GROUPED;
     }
 
-    AstNode *content = parse_group(p);
-    if (!content)
+    if (p->current.kind == STRING)
     {
-        return NULL;
+        arg = parse_expression(p);
+        fmt = FMT_LITERAL;
     }
 
-    return ast_new_write(content);
+    return ast_new_write(arg, fmt);
 }
 
 AstNode *parse_test(Parser *p)
@@ -178,8 +191,8 @@ AstNode *parse_statement(Parser *p)
         return parse_assert(p);
     case WRITE:
         return parse_write(p);
-    case LPAREN:
-        return parse_group(p);
+    // case LPAREN:
+    //     return parse_group(p);
     case STRING:
         return parse_string(p);
     case TEST:
