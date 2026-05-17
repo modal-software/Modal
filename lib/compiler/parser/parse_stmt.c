@@ -1,15 +1,16 @@
 #include "parser.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 // macro fn sum(num: i8) -> i8
 char *run_macro_blocK(Parser *p, LexerState *l);
 
 AstNode *parse_group(Parser *p)
 {
-    if (p->current.kind == LPAREN)
+    if (p->previous.kind != LPAREN)
     {
-        parser_error_at(p, &p->current, "expected '(' to start group");
+        parser_error_at(p, &p->previous, "expected '(' to start group");
         return NULL;
     }
 
@@ -109,7 +110,10 @@ AstNode *parse_block(Parser *p)
 AstNode *parse_string(Parser *p)
 {
     Token tok = p->current;
-    fprintf(stdout, "%.*s\n", tok.len - 2, tok.start + 1);
+    const char *str = tok.start + 1;
+    int strl = tok.len - 2;
+
+    write(STDOUT_FILENO, str, strl);
     parser_advance(p);
     return ast_new_string(tok);
 }
