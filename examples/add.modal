@@ -1,1 +1,3 @@
-write("funcionando finalmente um print")
+write "print para literais"
+
+write("print com parenteses multiplos argumentos")
