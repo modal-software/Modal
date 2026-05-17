@@ -57,7 +57,7 @@ void parser_synchronize(Parser *p)
         switch (p->current.kind)
         { // keywords que começam novo stmt
         case TEST:
-        case PRINT:
+        case WRITE:
         case ASSERT:
         case LBRACE:
         case RBRACE:
