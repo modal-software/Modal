@@ -1,5 +1,5 @@
-#include "../ast/ast.h"
-#include "parser.h"
+#include "ast/ast.h"
+#include "parser/parser.h"
 
 // This function is deprecated - use parse_statement instead
 // Kept for compatibility but should be removed

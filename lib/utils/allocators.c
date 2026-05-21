@@ -1,5 +1,5 @@
-#include "allocators.h"
-#include "../compiler/ast/error.h"
+#include "utils/allocators.h"
+#include "compiler/ast/error.h"
 #include <stdlib.h>
 #include <string.h>
 

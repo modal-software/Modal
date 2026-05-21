@@ -1,5 +1,5 @@
-#include "../test_runner.h"
-#include "parser.h"
+#include "test_runner.h"
+#include "parser/parser.h"
 #include <stdlib.h>
 #include <unistd.h>
 

@@ -2,7 +2,7 @@
 #ifndef AST_H
 #define AST_H
 
-#include "../tokenizer/tokenizer.h"
+#include "tokenizer/tokenizer.h"
 
 // unused
 typedef enum
