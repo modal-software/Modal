@@ -5,6 +5,7 @@
 #include "../tokenizer/tokenizer.h" // Token, TokenKind, Tokenizer
 
 #include <stdarg.h> // va_list (pra error variádico)
+#include <stdbool.h>
 #include <stddef.h> // size_t
 
 typedef struct Parser Parser;
@@ -29,6 +30,30 @@ struct Parser
     const char *filename;
     int had_error; // flag pra saber se rolou erro em algum ponto
 };
+
+typedef enum
+{
+    SYNTAX_DEFAULT,
+    SYNTAX_USER,
+    SYNTAX_BUILTIN
+} SyntaxOrigin;
+
+typedef struct SyntaxRule
+{
+    const char *keyword;
+    SyntaxOrigin origin;
+    // SyntaxExpandFn expand;
+    int precedence;
+    void *user_data;
+} SyntaxRule;
+
+typedef struct
+{
+    SyntaxRule **rules;
+    size_t count;
+    size_t capacity;
+    bool locked;
+} SyntaxRegistry;
 
 // Inicialização e entry point principal
 void parser_init(Parser *p, Tokenizer *lexer, const char *filename);
