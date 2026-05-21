@@ -1,5 +1,5 @@
-#include "test_runner.h"
 #include "parser/parser.h"
+#include "test_runner.h"
 #include <stdlib.h>
 #include <unistd.h>
 
@@ -28,7 +28,6 @@ static AstNode *parse_primary(Parser *p)
         int strl = tok.len - 2;
 
         write(STDOUT_FILENO, str, strl);
-        parser_advance(p);
         return ast_new_string(tok);
     }
 
