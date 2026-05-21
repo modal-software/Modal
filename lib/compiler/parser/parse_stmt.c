@@ -3,18 +3,22 @@
 #include <stdlib.h>
 #include <unistd.h>
 
-// macro fn sum(num: i8) -> i8
+// def sum(num: i8) -> i8
 char *run_macro_blocK(Parser *p, LexerState *l);
 
 AstNode *parse_group(Parser *p)
 {
-    if (p->previous.kind != LPAREN)
+    if (!p)
     {
-        parser_error_at(p, &p->previous, "expected '(' to start group");
         return NULL;
     }
 
     Token open_tok = p->previous;
+    if (open_tok.kind != LPAREN)
+    {
+        parser_error_at(p, &p->previous, "expected '(' to start group");
+        return NULL;
+    }
 
     AstNode **stmts = NULL;
     size_t count = 0, cap = 4;
@@ -107,16 +111,16 @@ AstNode *parse_block(Parser *p)
     return node;
 }
 
-AstNode *parse_string(Parser *p)
-{
-    Token tok = p->current;
-    const char *str = tok.start + 1;
-    int strl = tok.len - 2;
-
-    write(STDOUT_FILENO, str, strl);
-    parser_advance(p);
-    return ast_new_string(tok);
-}
+// AstNode *parse_string(Parser *p)
+// {
+//     Token tok = p->current;
+//     const char *str = tok.start + 1;
+//     int strl = tok.len - 2;
+//
+//     write(STDOUT_FILENO, str, strl);
+//     parser_advance(p);
+//     return ast_new_string(tok);
+// }
 
 AstNode *parse_write(Parser *p)
 {
@@ -195,10 +199,9 @@ AstNode *parse_statement(Parser *p)
         return parse_assert(p);
     case WRITE:
         return parse_write(p);
-    // case LPAREN:
-    //     return parse_group(p);
+    case LPAREN:
     case STRING:
-        return parse_string(p);
+        return parse_expression(p);
     case TEST:
         return parse_test(p);
     case LBRACE:

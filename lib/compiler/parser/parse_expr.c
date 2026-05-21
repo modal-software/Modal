@@ -1,6 +1,7 @@
 #include "../test_runner.h"
 #include "parser.h"
 #include <stdlib.h>
+#include <unistd.h>
 
 static AstNode *parse_primary(Parser *p)
 {
@@ -20,9 +21,15 @@ static AstNode *parse_primary(Parser *p)
         return parse_group(p);
     }
 
-    if (p->current.kind == STRING)
+    if (parser_match(p, STRING))
     {
-        return parse_string(p);
+        Token tok = p->previous;
+        const char *str = tok.start + 1;
+        int strl = tok.len - 2;
+
+        write(STDOUT_FILENO, str, strl);
+        parser_advance(p);
+        return ast_new_string(tok);
     }
 
     parser_error_at(p, &p->current, "expected expression (number, identifier, or '(')");
