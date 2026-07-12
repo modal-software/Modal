@@ -8,8 +8,7 @@ int main(int argc, char **argv)
 {
     if (argc < 2)
     {
-        fprintf(stderr, "%s: fatal: no input files\n", argv[0]);
-        printf("[Process exited %d]\n", EXIT_FAILURE);
+        fprintf(stderr, "%s: fatal: no input files\n[Process exited %d]\n", argv[0], EXIT_FAILURE);
         return 1;
     }
 
