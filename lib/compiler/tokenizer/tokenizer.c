@@ -48,7 +48,7 @@ static TokenKind get_keyword(const char *s, int len)
     return TOK_IDENTIFIER;
 }
 
-#define peek(t) ((t)->buffer[t->pos])
+#define peek(t) ((t)->buffer[(t)->pos])
 #define peek_next(t) ((t)->buffer[(t)->pos] ? (t)->buffer[(t)->pos + 1] : '\0')
 
 static char advance(Tokenizer *t)
