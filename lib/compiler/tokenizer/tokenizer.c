@@ -3,7 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 
-const char *kind_to_string(TokenKind *kind)
+static const char *kind_to_string(const TokenKind *kind)
 {
     switch (*kind)
     {
