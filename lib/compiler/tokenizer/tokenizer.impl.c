@@ -11,6 +11,9 @@ static Token token_new(TokenKind kind, const char *start, int len, int line, int
         .col = col,
     };
 }
+const TokenImpl token = (TokenImpl){
+    .new = token_new,
+};
 
 static char tokenizer_advance(Tokenizer *t)
 {
@@ -28,5 +31,18 @@ static char tokenizer_advance(Tokenizer *t)
     return c;
 }
 
-const TokenImpl token = (TokenImpl){.new = token_new};
-const TokenizerImpl tokenizer = (TokenizerImpl){.advance = tokenizer_advance};
+static void tokenizer_init(Tokenizer *t, const char *buffer)
+{
+    *t = (Tokenizer){
+        .buffer = buffer,
+        .pos = 0,
+        .line = 1,
+        .col = 1,
+        .state = LEX_STATE_START,
+    };
+}
+
+const TokenizerImpl tokenizer = (TokenizerImpl){
+    .advance = tokenizer_advance,
+    .init = tokenizer_init,
+};

@@ -52,17 +52,6 @@ static TokenKind get_keyword(const char *s, int len)
 #define peek(t) ((t)->buffer[(t)->pos])
 #define peek_next(t) ((t)->buffer[(t)->pos] ? (t)->buffer[(t)->pos + 1] : '\0')
 
-void init(Tokenizer *t, const char *buffer)
-{
-    *t = (Tokenizer){
-        .buffer = buffer,
-        .pos = 0,
-        .line = 1,
-        .col = 1,
-        .state = LEX_STATE_START,
-    };
-}
-
 Token next(Tokenizer *t)
 {
     const char *start = NULL;
