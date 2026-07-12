@@ -7,6 +7,7 @@
 #include <stdarg.h> // va_list (pra error variádico)
 #include <stdbool.h>
 #include <stddef.h> // size_t
+#include <stdint.h>
 
 typedef struct Parser Parser;
 
@@ -68,7 +69,7 @@ void parser_synchronize(Parser *p); // recovery básico após erro
 
 // Funções de parse expostas (pra modularidade — cada uma em seu .c)
 AstNode *parse_expression(Parser *p); // em parse_expr.c
-long long eval_expr(AstNode *expr);   // em parse_expr.c
+uint64_t eval_expr(AstNode *expr);    // em parse_expr.c
 void exec_node(AstNode *node);        // em parse_expr.c
 void exec_program(AstNode *root);     // em parse_expr.c
 AstNode *parse_group(Parser *p);      // em parse_stmt.c
