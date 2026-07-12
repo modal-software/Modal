@@ -88,7 +88,6 @@ typedef struct
     TokenKind kind;
 } Keyword;
 
-Token token_make(TokenKind kind, const char *start, int len, int line, int col);
 void init(Tokenizer *t, const char *buffer);
 Token next(Tokenizer *t);
 

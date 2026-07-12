@@ -1,4 +1,5 @@
 #include "tokenizer.h"
+#include "tokenizer.impl.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <string.h>
@@ -51,33 +52,6 @@ static TokenKind get_keyword(const char *s, int len)
 #define peek(t) ((t)->buffer[(t)->pos])
 #define peek_next(t) ((t)->buffer[(t)->pos] ? (t)->buffer[(t)->pos + 1] : '\0')
 
-static char advance(Tokenizer *t)
-{
-    char c = t->buffer[t->pos++];
-    if (c != '\n')
-    {
-        t->col += 1;
-    }
-
-    if (c == '\n')
-    {
-        t->line++;
-        t->col = 1;
-    }
-    return c;
-}
-
-Token token_make(TokenKind kind, const char *start, int len, int line, int col)
-{
-    return (Token){
-        .kind = kind,
-        .start = start,
-        .len = len,
-        .line = line,
-        .col = col,
-    };
-}
-
 void init(Tokenizer *t, const char *buffer)
 {
     *t = (Tokenizer){
@@ -101,7 +75,7 @@ Token next(Tokenizer *t)
 
         if (!c)
         {
-            return token_make(TOK_EOF, t->buffer + t->pos, 0, t->line, t->col);
+            return token.new(TOK_EOF, t->buffer + t->pos, 0, t->line, t->col);
         }
 
         switch (t->state)
@@ -112,14 +86,14 @@ Token next(Tokenizer *t)
                 start = t->buffer + t->pos;
                 start_line = t->line;
                 start_col = t->col;
-                advance(t);
+                tokenizer.advance(t);
                 t->state = LEX_STATE_STRING_LIT;
                 continue;
             }
 
             if (isspace(c) || c == '\t' || c == '\r')
             {
-                advance(t);
+                tokenizer.advance(t);
                 continue;
             }
 
@@ -129,7 +103,7 @@ Token next(Tokenizer *t)
                 start_line = t->line;
                 start_col = t->col;
                 t->state = LEX_STATE_IDENTIFIER;
-                advance(t);
+                tokenizer.advance(t);
                 continue;
             }
 
@@ -150,17 +124,17 @@ Token next(Tokenizer *t)
 
                     if (curr == '\\' && peek_next(t) == '\n')
                     {
-                        advance(t);
+                        tokenizer.advance(t);
                         len += 2;
                         continue;
                     }
 
-                    advance(t);
+                    tokenizer.advance(t);
                     len++;
                 }
 
                 t->state = LEX_STATE_START;
-                return token_make(TOK_PREPROC, start, len, start_line, start_col);
+                return token.new(TOK_PREPROC, start, len, start_line, start_col);
             }
 
             start = t->buffer + t->pos;
@@ -170,123 +144,123 @@ Token next(Tokenizer *t)
             if (isdigit(c))
             {
                 t->state = LEX_STATE_NUMBER_INT;
-                advance(t);
+                tokenizer.advance(t);
                 continue;
             }
 
             if (c == '-' && peek_next(t) == '-')
             {
                 t->state = LEX_STATE_LINE_COMMENT;
-                advance(t);
+                tokenizer.advance(t);
                 continue;
             }
 
             if (c == '-' && peek_next(t) == '{')
             {
                 t->state = LEX_STATE_BLOCK_COMMENT;
-                advance(t);
+                tokenizer.advance(t);
                 continue;
             }
 
-            advance(t);
+            tokenizer.advance(t);
             switch (c)
             {
             case '(':
-                return token_make(TOK_LPAREN, start, 1, start_line, start_col);
+                return token.new(TOK_LPAREN, start, 1, start_line, start_col);
             case ')':
-                return token_make(TOK_RPAREN, start, 1, start_line, start_col);
+                return token.new(TOK_RPAREN, start, 1, start_line, start_col);
             case '{':
-                return token_make(TOK_LBRACE, start, 1, start_line, start_col);
+                return token.new(TOK_LBRACE, start, 1, start_line, start_col);
             case '}':
-                return token_make(TOK_RBRACE, start, 1, start_line, start_col);
+                return token.new(TOK_RBRACE, start, 1, start_line, start_col);
             case '?':
                 if (peek(t) == '?')
                 {
-                    advance(t);
+                    tokenizer.advance(t);
                     if (peek(t) == '=')
                     {
-                        advance(t);
-                        return token_make(TOK_QQ_EQ, start, 3, start_line, start_col);
+                        tokenizer.advance(t);
+                        return token.new(TOK_QQ_EQ, start, 3, start_line, start_col);
                     }
-                    return token_make(TOK_QQ, start, 2, start_line, start_col);
+                    return token.new(TOK_QQ, start, 2, start_line, start_col);
                 }
                 if (peek(t) == '.')
                 {
-                    advance(t);
-                    return token_make(TOK_Q_DOT, start, 2, start_line, start_col);
+                    tokenizer.advance(t);
+                    return token.new(TOK_Q_DOT, start, 2, start_line, start_col);
                 }
-                return token_make(TOK_QUESTION, start, 1, start_line, start_col);
+                return token.new(TOK_QUESTION, start, 1, start_line, start_col);
             case '.':
                 if (peek(t) == '.' && peek_next(t) == '.')
                 {
-                    advance(t);
-                    advance(t);
-                    return token_make(TOK_ELLIPSIS, start, 3, start_line, start_col);
+                    tokenizer.advance(t);
+                    tokenizer.advance(t);
+                    return token.new(TOK_ELLIPSIS, start, 3, start_line, start_col);
                 }
                 if (peek(t) == '.')
                 {
-                    advance(t);
-                    return token_make(TOK_DOTDOT, start, 2, start_line, start_col);
+                    tokenizer.advance(t);
+                    return token.new(TOK_DOTDOT, start, 2, start_line, start_col);
                 }
                 break;
             case '-':
                 if (peek(t) == '>')
                 {
-                    advance(t);
-                    return token_make(TOK_ARROW, start, 2, start_line, start_col);
+                    tokenizer.advance(t);
+                    return token.new(TOK_ARROW, start, 2, start_line, start_col);
                 }
                 break;
             case ':':
                 if (peek(t) == ':')
                 {
-                    advance(t);
-                    return token_make(TOK_DCOLON, start, 2, start_line, start_col);
+                    tokenizer.advance(t);
+                    return token.new(TOK_DCOLON, start, 2, start_line, start_col);
                 }
                 break;
             case '|':
-                return token_make(TOK_PIPE, start, 1, start_line, start_col);
+                return token.new(TOK_PIPE, start, 1, start_line, start_col);
             }
 
-            return token_make(TOK_OPERATOR, start, 1, start_line, start_col);
+            return token.new(TOK_OPERATOR, start, 1, start_line, start_col);
 
         case LEX_STATE_IDENTIFIER:
             if (isalnum(c) || c == '_')
             {
-                advance(t);
+                tokenizer.advance(t);
                 continue;
             }
             int len = (int)((t->buffer + t->pos) - start);
             t->state = LEX_STATE_START;
-            return token_make(get_keyword(start, len), start, len, start_line, start_col);
+            return token.new(get_keyword(start, len), start, len, start_line, start_col);
 
         case LEX_STATE_NUMBER_INT:
             if (isdigit(c))
             {
-                advance(t);
+                tokenizer.advance(t);
                 continue;
             }
             if (c == '.')
             {
                 t->state = LEX_STATE_NUMBER_FLOAT;
-                advance(t);
+                tokenizer.advance(t);
                 continue;
             }
             {
                 int len = (int)((t->buffer + t->pos) - start);
                 t->state = LEX_STATE_START;
-                return token_make(TOK_NUMBER, start, len, start_line, start_col);
+                return token.new(TOK_NUMBER, start, len, start_line, start_col);
             }
 
         case LEX_STATE_NUMBER_FLOAT:
             if (isdigit(c))
             {
-                advance(t);
+                tokenizer.advance(t);
                 continue;
             }
             {
                 int len = (int)((t->buffer + t->pos) - start);
                 t->state = LEX_STATE_START;
-                return token_make(TOK_NUMBER, start, len, start_line, start_col);
+                return token.new(TOK_NUMBER, start, len, start_line, start_col);
             }
         case LEX_STATE_STRING_LIT:
         {
@@ -331,34 +305,34 @@ Token next(Tokenizer *t)
             int len = (int)((buf + t->pos) - start);
             t->state = LEX_STATE_START;
             // printf("STRING_LIT exit: pos=%d len=%d raw='%.*s'\n", t->pos, len, len, start);
-            return token_make(TOK_STRING, start, len, start_line, start_col);
+            return token.new(TOK_STRING, start, len, start_line, start_col);
         }
 
         case LEX_STATE_LINE_COMMENT:
             if (c == '\n' || c == '\0')
             {
-                advance(t);
+                tokenizer.advance(t);
                 t->state = LEX_STATE_START;
                 continue;
             }
-            advance(t);
+            tokenizer.advance(t);
             continue;
 
         case LEX_STATE_BLOCK_COMMENT:
             if (c == '}' && peek_next(t) == '-')
             {
-                advance(t);
-                advance(t);
+                tokenizer.advance(t);
+                tokenizer.advance(t);
                 t->state = LEX_STATE_START;
                 continue;
             }
-            advance(t);
+            tokenizer.advance(t);
             continue;
 
         default:
-            advance(t);
+            tokenizer.advance(t);
             t->state = LEX_STATE_START;
-            return token_make(TOK_UNKNOWN, start, 1, start_line, start_col);
+            return token.new(TOK_UNKNOWN, start, 1, start_line, start_col);
         }
     }
 }
