@@ -5,18 +5,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-int main(int argc, char **argv)
+static char *file_entry(const char *filename)
 {
-    if (argc < 2)
-    {
-        fprintf(stderr, "%s: fatal: no input files\n[Process exited %d]\n", argv[0], EXIT_FAILURE);
-        return 1;
-    }
-
-    FILE *f = fopen(argv[1], "rb");
+    FILE *f = fopen(filename, "rb");
     if (!f)
     {
-        return 1;
+        return NULL;
     }
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
@@ -25,6 +19,19 @@ int main(int argc, char **argv)
     fread(buffer, 1, size, f);
     buffer[size] = '\0';
     fclose(f);
+
+    return buffer;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc < 2)
+    {
+        fprintf(stderr, "%s: fatal: no input files\n[Process exited %d]\n", argv[0], EXIT_FAILURE);
+        return 1;
+    }
+
+    const char *buffer = file_entry(argv[1]);
 
     Tokenizer lexer;
     tokenizer.init(&lexer, buffer);
