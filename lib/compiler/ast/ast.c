@@ -1,12 +1,11 @@
-// ast.c (adicione ao seu projeto)
-#include "ast.h"
+#include "ast/ast.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 AstNode *ast_new_number(Token tok, long long val)
 {
-    AstNode *node = malloc(sizeof(AstNode)); // aloca nó base
+    AstNode *node = malloc(sizeof(AstNode));
     if (!node)
     {
         return NULL;
@@ -164,7 +163,7 @@ AstNode *ast_new_write(AstNode *n, Fmt fmt)
     return node;
 }
 
-void ast_free(AstNode *node)
+void ast_free(struct AstNode *node)
 {
     if (!node)
     {

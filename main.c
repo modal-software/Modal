@@ -1,22 +1,16 @@
-#include "lib/compiler/ast/ast.h"
-#include "lib/compiler/parser/parser.h"
-#include "lib/compiler/tokenizer/tokenizer.h"
+#include "compiler/ast/ast.h"
+#include "compiler/parser/parser.h"
+#include "compiler/tokenizer/tokenizer.h"
+#include "compiler/tokenizer/tokenizer.impl.h"
 #include <stdio.h>
 #include <stdlib.h>
 
-int main(int argc, char **argv)
+static char *file_entry(const char *filename)
 {
-    if (argc < 2)
-    {
-        fprintf(stderr, "%s: fatal: no input files\n", argv[0]);
-        printf("[Process exited %d]\n", EXIT_FAILURE);
-        return 1;
-    }
-
-    FILE *f = fopen(argv[1], "rb");
+    FILE *f = fopen(filename, "rb");
     if (!f)
     {
-        return 1;
+        return NULL;
     }
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
@@ -26,8 +20,21 @@ int main(int argc, char **argv)
     buffer[size] = '\0';
     fclose(f);
 
+    return buffer;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc < 2)
+    {
+        fprintf(stderr, "%s: fatal: no input files\n[Process exited %d]\n", argv[0], EXIT_FAILURE);
+        return 1;
+    }
+
+    const char *buffer = file_entry(argv[1]);
+
     Tokenizer lexer;
-    init(&lexer, buffer);
+    tokenizer.init(&lexer, buffer);
 
     Parser parser;
     parser_init(&parser, &lexer, argv[1]);

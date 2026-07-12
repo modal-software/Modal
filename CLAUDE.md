@@ -28,13 +28,13 @@ Source (.modal) → Tokenizer → Parser → AST → [Test Runner / Writer]
 - **Entry point:** `main.c` — reads file, initializes tokenizer+parser, calls `parse_program()`, frees AST
 - **Tokenizer** (`lib/compiler/tokenizer/`) — state-machine lexer producing tokens (keywords, operators, literals)
 - **Parser** (`lib/compiler/parser/`) — recursive descent, split across:
-  - `parser.c` — core parser: advance, match, consume, error recovery (`parser_synchronize`)
-  - `parse_expr.c` — expressions with precedence climbing: primary → factor → term → expression
-  - `parse_stmt.c` — statements: print, test, assert, blocks `{}`, groups `()`
-  - `parse_decl.c` — declaration parsing (stub/deprecated)
+    - `parser.c` — core parser: advance, match, consume, error recovery (`parser_synchronize`)
+    - `parse_expr.c` — expressions with precedence climbing: primary → factor → term → expression
+    - `parse_stmt.c` — statements: print, test, assert, blocks `{}`, groups `()`
+    - `parse_decl.c` — declaration parsing (stub/deprecated)
 - **AST** (`lib/compiler/ast/`) — node types defined in `ast.h`, factory functions in `ast.c`, error reporting in `error.c`
 - **Test runner** (`lib/compiler/test_runner.c`) — walks AST for `test "name" { assert ... }` blocks, evaluates assertions
-- **Writer** (`lib/compiler/writer.c`) — output stub, not yet implemented
+- **Writer** (`expr`) — first stable implementation, this func are primitive so will not have any type of '\' chars and etc. For that i will create output wrapper.
 - **Utils** (`lib/utils/`) — arena allocator (incomplete), CLI color constants
 
 No code generation backend exists yet. The compiler currently parses and executes print/test statements directly from the AST.

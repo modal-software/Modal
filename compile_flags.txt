@@ -1,0 +1,4 @@
+-std=c17
+-I.
+-Ilib/compiler
+-Ilib

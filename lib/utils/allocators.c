@@ -1,13 +1,14 @@
-#include "allocators.h"
-#include "../../ast/error.h"
+#include "utils/allocators.h"
+#include "compiler/ast/error.h"
 #include <stdlib.h>
 #include <string.h>
 
 char *g_curr_filename = "unknown";
 static ArenaBlock *curr_block = NULL;
 
-#define BIT_SIZE 7
 #define alloc ptr + sizeof(size_t);
+
+static const int BIT_SIZE = 7;
 
 void *arena_alloc_raw(size_t size)
 {
@@ -66,9 +67,10 @@ void *xrealloc(void *ptr, size_t newsz)
     {
         return xmalloc(newsz);
     }
-    size_t *header = (size_t *)((char *)ptr - sizeof(size_t));
-    size_t oldsz = *header;
 
+    size_t *header = (size_t *)((char *)ptr - sizeof(size_t));
+
+    size_t oldsz = *header;
     if (newsz <= oldsz)
     {
         return ptr;

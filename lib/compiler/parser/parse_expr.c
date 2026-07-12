@@ -1,8 +1,10 @@
-#include "../test_runner.h"
-#include "parser.h"
+#include "parser/parser.h"
+#include "test_runner.h"
+#include <stdint.h>
 #include <stdlib.h>
+#include <unistd.h>
 
-static AstNode *parse_primary(Parser *p)
+static inline AstNode *parse_primary(Parser *p)
 {
     if (parser_match(p, NUMBER))
     {
@@ -20,71 +22,19 @@ static AstNode *parse_primary(Parser *p)
         return parse_group(p);
     }
 
-    if (p->current.kind == STRING)
+    if (parser_match(p, STRING))
     {
-        return parse_string(p);
+        Token tok = p->previous;
+        const char *str = tok.start + 1;
+        int strl = tok.len - 2;
+
+        write(STDOUT_FILENO, str, strl);
+        return ast_new_string(tok);
     }
 
     parser_error_at(p, &p->current, "expected expression (number, identifier, or '(')");
     return NULL;
 }
-
-// static AstNode *parse_factor(Parser *p)
-// {
-//     AstNode *left = parse_primary(p);
-//     if (!left)
-//     {
-//         return NULL;
-//     }
-//
-//     while (p->current.kind == OPERATOR)
-//     {
-//         char op = *p->current.start;
-//         if (op != '*' && op != '/')
-//         {
-//             break;
-//         }
-//         Token op_tok = p->current;
-//         parser_advance(p);
-//         AstNode *right = parse_primary(p);
-//         if (!right)
-//         {
-//             ast_free(left);
-//             return NULL;
-//         }
-//         left = ast_new_binop(op_tok, left, right);
-//     }
-//     return left;
-// }
-//
-// static AstNode *parse_term(Parser *p)
-// {
-//
-//     AstNode *left = parse_factor(p);
-//     if (!left)
-//     {
-//         return NULL;
-//     }
-//
-//     while (p->current.kind == OPERATOR)
-//     {
-//         char op = *p->current.start;
-//         if (op != '+' && op != '-')
-//         {
-//             break;
-//         }
-//         Token op_tok = p->current;
-//         parser_advance(p);
-//         AstNode *right = parse_factor(p);
-//         if (!right)
-//         {
-//             ast_free(left);
-//             return NULL;
-//         }
-//         left = ast_new_binop(op_tok, left, right);
-//     }
-//     return left;
-// }
 
 AstNode *parse_expression(Parser *p)
 {
@@ -92,7 +42,7 @@ AstNode *parse_expression(Parser *p)
     return parse_primary(p);
 }
 
-long long eval_expr(AstNode *expr)
+uint64_t eval_expr(AstNode *expr)
 {
     if (!expr)
     {
@@ -106,8 +56,8 @@ long long eval_expr(AstNode *expr)
 
     case AST_BIN_OP:
     {
-        long long left = eval_expr(expr->data.binop.left);
-        long long right = eval_expr(expr->data.binop.right);
+        uint64_t left = eval_expr(expr->data.binop.left);
+        uint64_t right = eval_expr(expr->data.binop.right);
         const char op = *expr->token.start;
 
         switch (op)
