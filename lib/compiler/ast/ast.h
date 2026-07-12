@@ -132,6 +132,6 @@ AstNode *ast_new_write(AstNode *n, Fmt fmt);
 AstNode *ast_new_assert(AstNode *expr);
 AstNode *ast_new_number(Token tok, long long val);
 AstNode *ast_new_string(Token tok);
-void ast_free(AstNode *node);
+void ast_free(struct AstNode *node);
 
 #endif
