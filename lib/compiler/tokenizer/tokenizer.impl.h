@@ -11,7 +11,7 @@ extern const TokenImpl token;
 typedef struct
 {
     char (*advance)(Tokenizer *t);
-    void (*init)();
+    void (*init)(Tokenizer *t, const char *buffer);
 } TokenizerImpl;
 extern const TokenizerImpl tokenizer;
 
