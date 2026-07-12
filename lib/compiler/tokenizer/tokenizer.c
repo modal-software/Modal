@@ -80,11 +80,13 @@ Token token_make(TokenKind kind, const char *start, int len, int line, int col)
 
 void init(Tokenizer *t, const char *buffer)
 {
-    t->buffer = buffer;
-    t->pos = 0;
-    t->line = 1;
-    t->col = 1;
-    t->state = LEX_STATE_START;
+    *t = (Tokenizer){
+        .buffer = buffer,
+        .pos = 0,
+        .line = 1,
+        .col = 1,
+        .state = LEX_STATE_START,
+    };
 }
 
 Token next(Tokenizer *t)
