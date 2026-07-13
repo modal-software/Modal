@@ -31,7 +31,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    const char *buffer = file_entry(argv[1]);
+    char *buffer = file_entry(argv[1]);
 
     Tokenizer lexer;
     tokenizer.init(&lexer, buffer);
