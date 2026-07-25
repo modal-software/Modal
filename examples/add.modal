@@ -1,1 +1,5 @@
+-{ 
+`WRITE` function
+function that calls **stdout** syscall then writes (n) bytes 
+}-
 write("print com parenteses multiplos argumentos")
