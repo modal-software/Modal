@@ -1,4 +1,4 @@
 -std=c17
 -I.
--Ilib/compiler
--Ilib
+-Isrc/compiler
+-Isrc
