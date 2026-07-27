@@ -88,9 +88,6 @@ typedef struct
     TokenKind kind;
 } Keyword;
 
-void init(Tokenizer *t, const char *buffer);
-Token next(Tokenizer *t);
-
 // Legacy aliases for compatibility - can be removed once parser is updated
 #define Kind TokenKind
 #define LPAREN TOK_LPAREN

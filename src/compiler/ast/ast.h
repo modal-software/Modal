@@ -7,7 +7,7 @@
 // unused
 typedef enum
 {
-    T_VOID,
+    T_NIL,
     T_BOOL,
 
     // Unsigned integers
@@ -30,7 +30,7 @@ typedef struct Type
 {
     TypeKind kind;
     char *name;
-    struct Type *inner;
+    struct Type *child;
 } Type;
 
 typedef enum
@@ -47,15 +47,13 @@ typedef enum
     AST_STRING_LIT,
 } AstNodeKind;
 
-typedef struct AstNode AstNode;
-
 typedef enum
 {
     FMT_GROUPED,
     FMT_LITERAL
 } Fmt;
 
-struct AstNode
+typedef struct AstNode
 {
     AstNodeKind kind;
     Token token;
@@ -75,20 +73,20 @@ struct AstNode
 
         struct
         { // AST_BIN_OP
-            AstNode *left;
-            AstNode *right;
+            struct AstNode *left;
+            struct AstNode *right;
             Kind op; // +, -, *, / etc.
         } binop;
 
         struct
         { // AST_UNARY_OP
-            AstNode *expr;
+            struct AstNode *expr;
             Kind op; // -, ! etc.
         } unary;
 
         struct
-        {                    // AST_PAREN_GROUP / AST_BLOCK
-            AstNode **stmts; // array dinâmico (ou lista)
+        {                           // AST_PAREN_GROUP / AST_BLOCK
+            struct AstNode **stmts; // array dinâmico (ou lista)
             size_t count;
         } block_or_group;
 
@@ -96,12 +94,12 @@ struct AstNode
         {
             const char *name;
             size_t len;
-            AstNode *block;
+            struct AstNode *block;
         } test;
 
         struct
         {
-            AstNode *group;
+            struct AstNode *group;
             Fmt fmt;
         } write;
 
@@ -113,7 +111,7 @@ struct AstNode
 
         // AST_TEST_STMT, AST_ASSERT_STMT podem herdar fields de block + nome
     } data;
-};
+} AstNode;
 
 // Iterate over children of a BLOCK or PAREN_GROUP node.
 // Usage: AST_EACH(block_node, child) { /* use child */ }
@@ -124,14 +122,15 @@ struct AstNode
 
 AstNode *ast_new_number_lit(Token tok, long long val);
 AstNode *ast_new_ident(Token tok);
-AstNode *ast_new_binop(Token op_tok, AstNode *left, AstNode *right);
-AstNode *ast_new_group(Token open_brace, AstNode **stmts, size_t count);
-AstNode *ast_new_block(Token open_brace, AstNode **stmts, size_t count);
-AstNode *ast_new_test(Token token, AstNode *block);
+AstNode *ast_new_binop(Token tok, AstNode *left, AstNode *right);
+AstNode *ast_new_group(Token open_tok, AstNode **stmts, size_t count);
+AstNode *ast_new_block(Token open_tok, AstNode **stmts, size_t count);
+AstNode *ast_new_test(Token tok, AstNode *block);
 AstNode *ast_new_write(AstNode *n, Fmt fmt);
 AstNode *ast_new_assert(AstNode *expr);
 AstNode *ast_new_number(Token tok, long long val);
 AstNode *ast_new_string(Token tok);
 void ast_free(struct AstNode *node);
+void *print(AstNode *tree);
 
 #endif

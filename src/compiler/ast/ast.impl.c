@@ -1,8 +1,14 @@
+#include "ast/ast.impl.h"
 #include "ast/ast.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+void printer(AstNode *tree)
+{
+    printf("%c", tree->kind);
+}
 
 AstNode *ast_new_number(Token tok, long long val)
 {
@@ -28,15 +34,14 @@ AstNode *ast_new_ident(Token tok)
     return node;
 }
 
-AstNode *ast_new_binop(Token op_tok, AstNode *left, AstNode *right)
+AstNode *ast_new_binop(Token tok, AstNode *left, AstNode *right)
 {
     AstNode *node = malloc(sizeof(AstNode));
     if (!node)
     {
         return NULL;
     }
-    *node = (AstNode){
-        .kind = AST_BIN_OP, .token = op_tok, .data = {.binop = {left, right, op_tok.kind}}};
+    *node = (AstNode){.kind = AST_BIN_OP, .token = tok, .data = {.binop = {left, right, tok.kind}}};
     return node;
 }
 
@@ -110,18 +115,19 @@ AstNode *ast_new_string(Token tok)
     AstNode *node = malloc(sizeof(AstNode));
     if (!node)
     {
-        (void)node;
         return NULL;
     }
 
-    *node = (AstNode){.kind = AST_STRING_LIT,
-                      .token = tok,
-                      .data = {.string = {.value = tok.start, .len = tok.len}}};
+    tok.start++;
+    size_t len = tok.len - 2;
+
+    *node = (AstNode){
+        .kind = AST_STRING_LIT, .token = tok, .data = {.string = {.value = tok.start, .len = len}}};
 
     return node;
 }
 
-AstNode *ast_new_test(Token token, AstNode *block)
+AstNode *ast_new_test(Token tok, AstNode *block)
 {
     AstNode *node = malloc(sizeof(AstNode));
     if (!node)
@@ -129,8 +135,7 @@ AstNode *ast_new_test(Token token, AstNode *block)
         return NULL;
     }
 
-    const char *name_without_quotes = token.start + 1;
-    size_t len = token.len - 2;
+    ast_new_string(tok);
 
     *node = (AstNode){.kind = AST_TEST_STMT,
                       .token = token,
@@ -204,3 +209,5 @@ void ast_free(struct AstNode *node)
     }
     free(node);
 }
+
+static const AstImpl ast = (AstImpl){.print = printer};

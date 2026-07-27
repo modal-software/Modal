@@ -4,31 +4,6 @@
 #include <stdio.h>
 #include <string.h>
 
-static const char *kind_to_string(const TokenKind *kind)
-{
-    switch (*kind)
-    {
-    case TOK_EOF:
-        return "end of file";
-    case TOK_LPAREN:
-        return "(";
-    case TOK_RPAREN:
-        return ")";
-    case TOK_LBRACE:
-        return "{";
-    case TOK_RBRACE:
-        return "}";
-    case TOK_NUMBER:
-        return "number";
-    case TOK_IDENTIFIER:
-        return "identifier";
-    case TOK_OPERATOR:
-        return "operator";
-    default:
-        return "unknown token";
-    }
-}
-
 static const Keyword keywords[] = {
     {"test", 4, TOK_TEST},   {"assert", 6, TOK_ASSERT},     {"sizeof", 6, TOK_SIZEOF},
     {"defer", 5, TOK_DEFER}, {"autofree", 8, TOK_AUTOFREE}, {"fun", 3, TOK_FUNCTION},
@@ -47,6 +22,10 @@ static TokenKind get_keyword(const char *s, int len)
         }
     }
     return TOK_IDENTIFIER;
+}
+
+static const char *string_lit(const char *s)
+{
 }
 
 #define peek(t) ((t)->buffer[(t)->pos])
