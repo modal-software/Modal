@@ -24,9 +24,9 @@ static TokenKind get_keyword(const char *s, int len)
     return TOK_IDENTIFIER;
 }
 
-static const char *string_lit(const char *s)
-{
-}
+// static const char *string_lit(const char *s)
+// {
+// }
 
 #define peek(t) ((t)->buffer[(t)->pos])
 #define peek_next(t) ((t)->buffer[(t)->pos] ? (t)->buffer[(t)->pos + 1] : '\0')
@@ -75,35 +75,35 @@ Token next(Tokenizer *t)
                 continue;
             }
 
-            if (c == '#')
-            {
-                start = t->buffer + t->pos;
-                start_line = t->line;
-                start_col = t->col;
-                int len = 0;
-
-                for (;;)
-                {
-                    char curr = peek(t);
-                    if (curr == '\0' || curr == '\n')
-                    {
-                        break;
-                    }
-
-                    if (curr == '\\' && peek_next(t) == '\n')
-                    {
-                        tokenizer.advance(t);
-                        len += 2;
-                        continue;
-                    }
-
-                    tokenizer.advance(t);
-                    len++;
-                }
-
-                t->state = LEX_STATE_START;
-                return token.new(TOK_PREPROC, start, len, start_line, start_col);
-            }
+            // if (c == '#')
+            // {
+            //     start = t->buffer + t->pos;
+            //     start_line = t->line;
+            //     start_col = t->col;
+            //     int len = 0;
+            //
+            //     for (;;)
+            //     {
+            //         char curr = peek(t);
+            //         if (curr == '\0' || curr == '\n')
+            //         {
+            //             break;
+            //         }
+            //
+            //         if (curr == '\\' && peek_next(t) == '\n')
+            //         {
+            //             tokenizer.advance(t);
+            //             len += 2;
+            //             continue;
+            //         }
+            //
+            //         tokenizer.advance(t);
+            //         len++;
+            //     }
+            //
+            //     t->state = LEX_STATE_START;
+            //     return token.new(TOK_PREPROC, start, len, start_line, start_col);
+            // }
 
             start = t->buffer + t->pos;
             start_line = t->line;
@@ -234,7 +234,7 @@ Token next(Tokenizer *t)
         {
             const char *buf = t->buffer;
             int pos = t->pos;
-            // printf("STRING_LIT entry: pos=%d char='%c'\n", pos, buf[pos]);
+            printf("STRING_LIT entry: \npos=%d \nchar='%c'\n\n", pos, buf[pos]);
 
             while (buf[pos] != '\0' && buf[pos] != '"')
             {
@@ -272,7 +272,10 @@ Token next(Tokenizer *t)
 
             int len = (int)((buf + t->pos) - start);
             t->state = LEX_STATE_START;
-            // printf("STRING_LIT exit: pos=%d len=%d raw='%.*s'\n", t->pos, len, len, start);
+            printf("STRING_LIT exit: \n\t-> pos=%d \n\t-> len=%d \n\t-> delimiter_char='%c' "
+                   "\n\t-> raw=%.*s\n\n",
+                   t->pos, len, buf[t->pos], len, start);
+
             return token.new(TOK_STRING, start, len, start_line, start_col);
         }
 

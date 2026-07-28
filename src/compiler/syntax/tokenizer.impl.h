@@ -1,7 +1,7 @@
 #ifndef TOKENIZER_IMPL_H
 #define TOKENIZER_IMPL_H
 
-#include "tokenizer/tokenizer.h"
+#include "tokenizer.h"
 typedef struct
 {
     Token (*new)(TokenKind kind, const char *start, int len, int line, int col);

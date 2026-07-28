@@ -126,4 +126,6 @@ typedef struct
 #define ARROW TOK_ARROW
 #define PREPROC TOK_PREPROC
 
+Token next(Tokenizer *t);
+
 #endif

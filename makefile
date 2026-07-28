@@ -3,7 +3,7 @@ CFLAGS = -Wall -Wextra -g -std=c17 -I ./ -I src/compiler -I src
 TARGET = jma
 LIBS = -lm -lpthread -ldl
 
-SRCS = ./src/compiler/tokenizer/tokenizer.impl.c ./src/compiler/tokenizer/tokenizer.c ./src/compiler/parser/parser.c ./src/compiler/ast/ast.c ./src/compiler/ast/error.c ./src/compiler/parser/parse_decl.c ./src/compiler/parser/parse_expr.c ./src/compiler/parser/parse_stmt.c ./src/compiler/test_runner.c ./main.c  # adicione todos .c
+SRCS = ./src/compiler/syntax/tokenizer.impl.c ./src/compiler/syntax/tokenizer.c ./src/compiler/syntax/parser/parser.c ./src/compiler/ast/ast.c ./src/compiler/ast/error.c ./src/compiler/syntax/parser/parse_decl.c ./src/compiler/syntax/parser/parse_expr.c ./src/compiler/syntax/parser/parse_stmt.c ./src/compiler/test_runner.c ./main.c  # adicione todos .c
 OBJS = $(SRCS:.c=.o)
 	
 # Paths

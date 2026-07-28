@@ -1,4 +1,5 @@
 #include "parser/parser.h"
+#include "tokenizer/tokenizer.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -68,7 +69,7 @@ AstNode *parse_program(Parser *p)
                 AstNode **new_stmts = realloc(stmts, cap * sizeof(AstNode *));
                 if (!new_stmts)
                 {
-                    free(stmts);
+                    free((void *)stmts);
                     return NULL;
                 }
                 stmts = new_stmts;
@@ -77,5 +78,5 @@ AstNode *parse_program(Parser *p)
         }
     }
 
-    return ast_new_block(p->current, stmts, count);
+    return *stmts;
 }

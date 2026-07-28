@@ -1,7 +1,7 @@
 #include "compiler/ast/ast.h"
-#include "compiler/parser/parser.h"
-#include "compiler/tokenizer/tokenizer.h"
-#include "compiler/tokenizer/tokenizer.impl.h"
+#include "compiler/syntax/parser/parser.h"
+#include "compiler/syntax/tokenizer.h"
+#include "compiler/syntax/tokenizer.impl.h"
 #include <stdio.h>
 #include <stdlib.h>
 

@@ -1,5 +1,5 @@
-#include "tokenizer/tokenizer.h"
-#include "tokenizer/tokenizer.impl.h"
+#include "syntax/tokenizer.h"
+#include "syntax/tokenizer.impl.h"
 
 static Token token_new(TokenKind kind, const char *start, int len, int line, int col)
 {
@@ -32,11 +32,7 @@ static char tokenizer_advance(Tokenizer *t)
 static void tokenizer_init(Tokenizer *t, const char *buffer)
 {
     *t = (Tokenizer){
-        .buffer = buffer,
-        .pos = 0,
-        .line = 1,
-        .col = 1,
-        .state = LEX_STATE_START,
+        buffer, .pos = 0, .line = 1, .col = 1, .state = LEX_STATE_START,
     };
 }
 

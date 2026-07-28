@@ -1,8 +1,8 @@
 #ifndef PARSER_H
 #define PARSER_H
 
-#include "ast/ast.h"             // AstNode, AstNodeKind
-#include "tokenizer/tokenizer.h" // Token, TokenKind, Tokenizer
+#include "ast/ast.h"          // AstNode, AstNodeKind
+#include "syntax/tokenizer.h" // Token, TokenKind, Tokenizer
 
 #include <stdarg.h> // va_list (pra error variádico)
 #include <stdbool.h>
