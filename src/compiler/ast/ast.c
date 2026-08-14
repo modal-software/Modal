@@ -4,7 +4,41 @@
 #include <stdlib.h>
 #include <string.h>
 
-AstNode *ast_new_number(Token tok, long long val)
+static void printer(AstNode *tree)
+{
+    switch (tree->kind)
+    {
+    case AST_WRITE_STMT:
+    {
+        printf("\n\nAST_WRITE_STMT:\n     \tdata:\n\t     "
+               "--\tnode: "
+               "write\n"
+               "\t     -- reference: %p\n",
+               &tree->data.write);
+        break;
+    }
+    case AST_PAREN_GROUP:
+    {
+        printf("\n\nAST_PAREN_GROUP:\n     \tdata:\n\t     --\tnode: "
+               "group\n\t     --\tlen: "
+               "%zu\n\t",
+               tree->data.block_or_group.count);
+        break;
+    }
+    case AST_STRING_LIT:
+    {
+        printf("\n\nAST_STRING_LIT:\n     \tdata:\n\t     --\tnode: "
+               "string\n\t     --\tlen: "
+               "%zu\n\t     --\tvalue: %s\n\t     --\traw: %s",
+               tree->data.string.len, tree->data.string.value, tree->data.string.raw);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+static AstNode *ast_new_number(Token tok, long long val)
 {
     AstNode *node = malloc(sizeof(AstNode));
     if (!node)
@@ -16,7 +50,7 @@ AstNode *ast_new_number(Token tok, long long val)
     return node;
 }
 
-AstNode *ast_new_ident(Token tok)
+static AstNode *ast_new_ident(Token tok)
 {
     AstNode *node = malloc(sizeof(AstNode));
     if (!node)
@@ -28,19 +62,18 @@ AstNode *ast_new_ident(Token tok)
     return node;
 }
 
-AstNode *ast_new_binop(Token op_tok, AstNode *left, AstNode *right)
+static AstNode *ast_new_binop(Token tok, AstNode *left, AstNode *right)
 {
     AstNode *node = malloc(sizeof(AstNode));
     if (!node)
     {
         return NULL;
     }
-    *node = (AstNode){
-        .kind = AST_BIN_OP, .token = op_tok, .data = {.binop = {left, right, op_tok.kind}}};
+    *node = (AstNode){.kind = AST_BIN_OP, .token = tok, .data = {.binop = {left, right, tok.kind}}};
     return node;
 }
 
-AstNode *ast_new_group(Token open_tok, AstNode **stmts, size_t count)
+static AstNode *ast_new_group(Token open_tok, AstNode **stmts, size_t count)
 {
     AstNode *node = malloc(sizeof(AstNode));
     if (!node)
@@ -61,7 +94,7 @@ AstNode *ast_new_group(Token open_tok, AstNode **stmts, size_t count)
     return node;
 }
 
-AstNode *ast_new_block(Token open_tok, AstNode **stmts, size_t count)
+static AstNode *ast_new_block(Token open_tok, AstNode **stmts, size_t count)
 {
     AstNode *node = malloc(sizeof(AstNode));
     if (!node)
@@ -82,7 +115,7 @@ AstNode *ast_new_block(Token open_tok, AstNode **stmts, size_t count)
     return node;
 }
 
-AstNode *ast_new_break_label(Token token)
+static AstNode *ast_new_break_label(Token token)
 {
     if (token.kind == TOK_COLON)
     {
@@ -92,7 +125,7 @@ AstNode *ast_new_break_label(Token token)
     return NULL;
 }
 
-AstNode *ast_new_assert(AstNode *expr)
+static AstNode *ast_new_assert(AstNode *expr)
 {
     AstNode *node = malloc(sizeof(AstNode));
     if (!node)
@@ -105,23 +138,7 @@ AstNode *ast_new_assert(AstNode *expr)
     return node;
 }
 
-AstNode *ast_new_string(Token tok)
-{
-    AstNode *node = malloc(sizeof(AstNode));
-    if (!node)
-    {
-        (void)node;
-        return NULL;
-    }
-
-    *node = (AstNode){.kind = AST_STRING_LIT,
-                      .token = tok,
-                      .data = {.string = {.value = tok.start, .len = tok.len}}};
-
-    return node;
-}
-
-AstNode *ast_new_test(Token token, AstNode *block)
+static AstNode *ast_new_string(Token tok)
 {
     AstNode *node = malloc(sizeof(AstNode));
     if (!node)
@@ -129,21 +146,57 @@ AstNode *ast_new_test(Token token, AstNode *block)
         return NULL;
     }
 
-    const char *name_without_quotes = token.start + 1;
-    size_t len = token.len - 2;
+    char *str_raw = *(char **)&tok.start;
+    char *str = (char *)malloc(tok.len + sizeof(char *));
 
-    *node = (AstNode){.kind = AST_TEST_STMT,
-                      .token = token,
-                      .data = {.test = {
-                                   .name = name_without_quotes,
-                                   .len = len,
-                                   .block = block,
-                               }}};
+    memcpy(str, tok.start += 1, tok.len);
+    str_raw[tok.len + 2] = '\0';
+    // str[tok.len + 1] = '\0';
+    *node = (AstNode){
+        .kind = AST_STRING_LIT,
+        .token = tok,
+        .data =
+            {
+                .string =
+                    {
+                        .value = str,
+                        .raw = str_raw,
+                        .len = tok.len,
+                    },
+            },
+    };
 
     return node;
 }
 
-AstNode *ast_new_write(AstNode *n, Fmt fmt)
+static AstNode *ast_new_test(Token tok, AstNode *block)
+{
+    AstNode *node = malloc(sizeof(AstNode));
+    if (!node)
+    {
+        return NULL;
+    }
+
+    AstNode *str = ast_new_string(tok);
+
+    *node = (AstNode){
+        .kind = AST_TEST_STMT,
+        .token = tok,
+        .data =
+            {
+                .test =
+                    {
+                        .name = str->data.string.value,
+                        .len = str->data.string.len,
+                        .block = block,
+                    },
+            },
+    };
+
+    return node;
+}
+
+static AstNode *ast_new_write(AstNode *n, Fmt fmt)
 {
     AstNode *node = malloc(sizeof(AstNode));
     if (!node)
@@ -166,7 +219,7 @@ AstNode *ast_new_write(AstNode *n, Fmt fmt)
     return node;
 }
 
-void ast_free(struct AstNode *node)
+static void ast_free(struct AstNode *node)
 {
     if (!node)
     {
@@ -204,3 +257,20 @@ void ast_free(struct AstNode *node)
     }
     free(node);
 }
+
+const AstImpl ast = (AstImpl){
+    .print = printer,
+    .free = ast_free,
+    .new =
+        {
+            .string = ast_new_string,
+            .write = ast_new_write,
+            .test = ast_new_test,
+            .assert = ast_new_assert,
+            .binop = ast_new_binop,
+            .number = ast_new_number,
+            .ident = ast_new_ident,
+            .block = ast_new_block,
+            .group = ast_new_group,
+        },
+};

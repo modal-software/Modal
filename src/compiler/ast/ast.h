@@ -107,6 +107,7 @@ typedef struct AstNode
         {
             size_t len;
             const char *value;
+            const char *raw;
         } string;
 
         // AST_TEST_STMT, AST_ASSERT_STMT podem herdar fields de block + nome
@@ -120,17 +121,26 @@ typedef struct AstNode
                         ((child) = (block)->data.block_or_group.stmts[_i], 1);                     \
          _i++)
 
-AstNode *ast_new_number_lit(Token tok, long long val);
-AstNode *ast_new_ident(Token tok);
-AstNode *ast_new_binop(Token tok, AstNode *left, AstNode *right);
-AstNode *ast_new_group(Token open_tok, AstNode **stmts, size_t count);
-AstNode *ast_new_block(Token open_tok, AstNode **stmts, size_t count);
-AstNode *ast_new_test(Token tok, AstNode *block);
-AstNode *ast_new_write(AstNode *n, Fmt fmt);
-AstNode *ast_new_assert(AstNode *expr);
-AstNode *ast_new_number(Token tok, long long val);
-AstNode *ast_new_string(Token tok);
-void ast_free(struct AstNode *node);
-void *print(AstNode *tree);
+typedef struct
+{
+    AstNode *(*string)(Token tok);
+    AstNode *(*ident)(Token tok);
+    AstNode *(*binop)(Token op_tok, AstNode *left, AstNode *right);
+    AstNode *(*group)(Token open_brace, AstNode **stmts, size_t count);
+    AstNode *(*block)(Token open_brace, AstNode **stmts, size_t count);
+    AstNode *(*test)(Token token, AstNode *block);
+    AstNode *(*write)(AstNode *n, Fmt fmt);
+    AstNode *(*assert)(AstNode *expr);
+    AstNode *(*number)(Token tok, long long val);
+} AstConstructor;
+
+typedef struct
+{
+    AstConstructor new;
+    void (*print)(AstNode *tree);
+    void (*free)(struct AstNode *node);
+} AstImpl;
+
+extern const AstImpl ast;
 
 #endif
