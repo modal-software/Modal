@@ -59,19 +59,28 @@ AstNode *parse_write(Parser *p)
     AstNode *args = {0};
     Fmt fmt = FMT_LITERAL;
 
-    if (p->current.kind == LPAREN)
+    switch (p->current.kind)
+    {
+    case LPAREN:
     {
         fmt = FMT_GROUPED;
         args = parse_expression(p);
+
+        AstNode **stmts = args->data.block_or_group.stmts;
+
+        for (int i = 0; i < args->data.block_or_group.count; i++)
+        {
+            write(STDOUT_FILENO, stmts[i]->data.string.value, stmts[i]->data.string.len);
+        }
     }
 
-    // if (p->current.kind == STRING)
-    // {
-    //     args = parse_expression(p);
-    // }
+    default: {
+        args = parse_expression(p);
+        write(STDOUT_FILENO, args->data.string.value, args->data.string.len);
+	     }
+    }
 
     AstNode *stmt = ast.new.write(args, fmt);
-    write(STDOUT_FILENO, args->data.string.value, args->data.string.len);
     return stmt;
 }
 
