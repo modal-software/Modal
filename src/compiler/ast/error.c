@@ -1,4 +1,4 @@
-#include "parser/parser.h"
+#include "syntax/parser/parser.h"
 #include <stdarg.h>
 #include <stdio.h>
 

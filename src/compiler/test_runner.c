@@ -1,5 +1,5 @@
 #include "test_runner.h"
-#include "parser/parser.h"
+#include "syntax/parser/parser.h"
 #include <stdio.h>
 
 static TestResults results = {0, 0, 0};

@@ -125,6 +125,7 @@ AstNode *parse_group(Parser *p)
             parser_synchronize(p);
             continue;
         }
+        // printf("stmt: %s\n", stmt->token.start);
 
         if (count >= cap)
         {

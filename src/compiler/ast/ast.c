@@ -88,6 +88,14 @@ static AstNode *ast_new_group(Token open_tok, AstNode **stmts, size_t count)
         free(node);
         return NULL;
     }
+
+    printf("stmts: {\n");
+    for (int i = 0; i < count; i++)
+    {
+        printf("\t(%i) %s\n", i, stmts[i]->token.start);
+    }
+
+    printf("}[%zu]", count);
     memcpy(children, stmts, count * sizeof(AstNode *));
 
     *node = (AstNode){

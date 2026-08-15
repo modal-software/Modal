@@ -52,17 +52,6 @@ AstNode *parse_block(Parser *p)
     return node;
 }
 
-// AstNode *parse_string(Parser *p)
-// {
-//     Token tok = p->current;
-//     const char *str = tok.start + 1;
-//     int strl = tok.len - 2;
-//
-//     write(STDOUT_FILENO, str, strl);
-//     parser_advance(p);
-//     return ast_new_string(tok);
-// }
-
 AstNode *parse_write(Parser *p)
 {
     parser_consume(p, TOK_WRITE, "missing 'write' statement");
@@ -76,10 +65,10 @@ AstNode *parse_write(Parser *p)
         args = parse_expression(p);
     }
 
-    if (p->current.kind == STRING)
-    {
-        args = parse_expression(p);
-    }
+    // if (p->current.kind == STRING)
+    // {
+    //     args = parse_expression(p);
+    // }
 
     AstNode *stmt = ast.new.write(args, fmt);
     write(STDOUT_FILENO, args->data.string.value, args->data.string.len);
@@ -139,7 +128,7 @@ AstNode *parse_statement(Parser *p)
     {
     case ASSERT:
         return parse_assert(p);
-    case RPAREN:
+    case LPAREN:
     case STRING:
         return parse_expression(p);
     case WRITE:
