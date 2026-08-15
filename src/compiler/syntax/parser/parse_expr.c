@@ -1,6 +1,8 @@
-#include "parser/parser.h"
+#include "compiler/cx.h"
+#include "syntax/parser/parser.h"
 #include "test_runner.h"
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 
@@ -9,27 +11,30 @@ static inline AstNode *parse_primary(Parser *p)
     if (parser_match(p, NUMBER))
     {
         long long val = strtoll(p->previous.start, NULL, 10);
-        return ast_new_number(p->previous, val);
+        return ast.new.number(p->previous, val);
     }
 
     if (parser_match(p, IDENTIFIER))
     {
-        return ast_new_ident(p->previous);
+        return ast.new.ident(p->previous);
     }
 
     if (parser_match(p, LPAREN))
     {
-        return parse_group(p);
+        AstNode *expr = parse_group(p);
+        ast.print(expr);
+        return expr;
     }
 
     if (parser_match(p, STRING))
     {
         Token tok = p->previous;
-        const char *str = tok.start + 1;
-        int strl = tok.len - 2;
+        tok.len -= 2;
 
-        write(STDOUT_FILENO, str, strl);
-        return ast_new_string(tok);
+        AstNode *expr = ast.new.string(tok);
+
+        ast.print(expr);
+        return expr;
     }
 
     parser_error_at(p, &p->current, "expected expression (number, identifier, or '(')");
@@ -86,6 +91,66 @@ uint64_t eval_expr(AstNode *expr)
     default:
         return 0;
     }
+}
+
+AstNode *parse_group(Parser *p)
+{
+    if (!p)
+    {
+        return NULL;
+    }
+
+    Token open_tok = p->previous;
+    if (open_tok.kind != LPAREN)
+    {
+        parser_error_at(p, &p->previous, "expected '(' to start group");
+        return NULL;
+    }
+
+    AstNode **stmts = NULL;
+    size_t count = 0;
+    size_t cap = 4;
+
+    stmts = (AstNode **)malloc(cap * sizeof(AstNode *));
+    if (!stmts)
+    {
+        free(*stmts);
+        return NULL;
+    }
+
+    while (p->current.kind != RPAREN && p->current.kind != TOK_EOF)
+    {
+        AstNode *stmt = parse_statement(p);
+        if (p->had_error || !stmt)
+        {
+            parser_synchronize(p);
+            continue;
+        }
+
+        if (count >= cap)
+        {
+            cap *= 2;
+            AstNode **new_stmts = (AstNode **)realloc(*stmts, cap * sizeof(AstNode *));
+            if (!new_stmts)
+            {
+                free(*stmts);
+                return NULL;
+            }
+            stmts = new_stmts;
+        }
+        stmts[count++] = stmt;
+    }
+
+    if (p->previous.kind != RPAREN)
+    {
+
+        parser_error_at(p, &p->current, "expected ')' at end of group");
+        free(*stmts);
+        return NULL;
+    }
+    parser_advance(p);
+
+    return ast.new.group(open_tok, stmts, count);
 }
 
 void exec_node(AstNode *node)

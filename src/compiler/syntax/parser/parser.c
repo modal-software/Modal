@@ -1,5 +1,5 @@
-#include "parser/parser.h"
-#include "tokenizer/tokenizer.h"
+#include "syntax/parser/parser.h"
+#include "syntax/tokenizer.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,6 +54,7 @@ AstNode *parse_program(Parser *p)
 
     while (p->current.kind != TOK_EOF)
     {
+
         AstNode *stmt = parse_statement(p);
         if (p->had_error)
         {
@@ -62,21 +63,36 @@ AstNode *parse_program(Parser *p)
         }
 
         if (stmt)
-        { // Only add non-null statements
-            if (count >= cap)
+        {
+            if (count < cap)
             {
-                cap *= 2;
-                AstNode **new_stmts = realloc(stmts, cap * sizeof(AstNode *));
-                if (!new_stmts)
-                {
-                    free((void *)stmts);
-                    return NULL;
-                }
-                stmts = new_stmts;
+                return NULL;
             }
-            stmts[count++] = stmt;
+
+            cap *= 2;
+            AstNode **new_stmts = realloc(stmts, cap * sizeof(AstNode *));
+            if (!new_stmts)
+            {
+                free((void *)stmts);
+                return NULL;
+            }
+            stmts = new_stmts;
         }
+        stmts[count++] = stmt;
     }
 
     return *stmts;
 }
+
+// if (count >= cap)
+// {
+//     cap *= 2;
+//     AstNode **new_stmts = realloc(stmts, cap * sizeof(AstNode *));
+//     if (!new_stmts)
+//     {
+//         free((void *)stmts);
+//         return NULL;
+//     }
+//     stmts = new_stmts;
+// }
+// stmts[count++] = stmt;

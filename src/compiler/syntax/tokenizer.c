@@ -28,9 +28,6 @@ static TokenKind get_keyword(const char *s, int len)
 // {
 // }
 
-#define peek(t) ((t)->buffer[(t)->pos])
-#define peek_next(t) ((t)->buffer[(t)->pos] ? (t)->buffer[(t)->pos + 1] : '\0')
-
 Token next(Tokenizer *t)
 {
     const char *start = NULL;
@@ -39,6 +36,7 @@ Token next(Tokenizer *t)
 
     for (;;)
     {
+
         char c = peek(t);
 
         if (!c)
@@ -234,7 +232,7 @@ Token next(Tokenizer *t)
         {
             const char *buf = t->buffer;
             int pos = t->pos;
-            printf("STRING_LIT entry: \npos=%d \nchar='%c'\n\n", pos, buf[pos]);
+            // printf("STRING_LIT entry: \npos=%d \nchar='%c'\n\n", pos, buf[pos]);
 
             while (buf[pos] != '\0' && buf[pos] != '"')
             {
@@ -272,9 +270,9 @@ Token next(Tokenizer *t)
 
             int len = (int)((buf + t->pos) - start);
             t->state = LEX_STATE_START;
-            printf("STRING_LIT exit: \n\t-> pos=%d \n\t-> len=%d \n\t-> delimiter_char='%c' "
-                   "\n\t-> raw=%.*s\n\n",
-                   t->pos, len, buf[t->pos], len, start);
+            // printf("STRING_LIT exit: \n\t-> pos=%d \n\t-> len=%d \n\t-> delimiter_char='%c' "
+            //        "\n\t-> raw=%.*s\n\n",
+            //        t->pos, len, buf[t->pos], len, start);
 
             return token.new(TOK_STRING, start, len, start_line, start_col);
         }

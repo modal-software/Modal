@@ -1,69 +1,10 @@
-#include "parser/parser.h"
+#include "syntax/parser/parser.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 
 // def sum(num: i8) -> i8
 char *run_macro_blocK(Parser *p, LexerState *l);
-
-AstNode *parse_group(Parser *p)
-{
-    if (!p)
-    {
-        return NULL;
-    }
-
-    Token open_tok = p->previous;
-    if (open_tok.kind != LPAREN)
-    {
-        parser_error_at(p, &p->previous, "expected '(' to start group");
-        return NULL;
-    }
-
-    AstNode **stmts = NULL;
-    size_t count = 0, cap = 4;
-
-    stmts = malloc(cap * sizeof(AstNode *));
-    if (!stmts)
-    {
-        free(stmts);
-        return NULL;
-    }
-
-    while (p->current.kind != RPAREN && p->current.kind != TOK_EOF)
-    {
-        AstNode *stmt = parse_statement(p);
-        if (p->had_error || !stmt)
-        {
-            parser_synchronize(p);
-            continue;
-        }
-
-        if (count >= cap)
-        {
-            cap *= 2;
-            AstNode **new_stmts = realloc(stmts, cap * sizeof(AstNode *));
-            if (!new_stmts)
-            {
-                free(stmts);
-                return NULL;
-            }
-            stmts = new_stmts;
-        }
-        stmts[count++] = stmt;
-    }
-
-    if (p->current.kind != RPAREN)
-    {
-
-        parser_error_at(p, &p->current, "expected ')' at end of group");
-        free(stmts);
-        return NULL;
-    }
-
-    parser_advance(p);
-    return ast_new_group(open_tok, stmts, count);
-}
 
 AstNode *parse_block(Parser *p)
 {
@@ -107,7 +48,7 @@ AstNode *parse_block(Parser *p)
     }
 
     parser_consume(p, RBRACE, "expected '}' at end of block");
-    AstNode *node = ast_new_block(open_tok, stmts, count);
+    AstNode *node = ast.new.block(open_tok, stmts, count);
     return node;
 }
 
@@ -126,22 +67,28 @@ AstNode *parse_write(Parser *p)
 {
     parser_consume(p, TOK_WRITE, "missing 'write' statement");
 
-    AstNode *arg = {0};
-    Fmt fmt = 0;
+    AstNode *args = {0};
+    Fmt fmt = FMT_LITERAL;
 
     if (p->current.kind == LPAREN)
     {
-        arg = parse_expression(p);
         fmt = FMT_GROUPED;
+        parser_advance(p);
+        // args = parse_expression(p);
     }
 
-    if (p->current.kind == STRING)
-    {
-        arg = parse_expression(p);
-        fmt = FMT_LITERAL;
-    }
+    args = parse_expression(p);
 
-    return ast_new_write(arg, fmt);
+    AstNode *stmt = ast.new.write(args, fmt);
+    // char a = 0;
+    // for (int i = 1; i < args->data.string.len - 1; i++)
+    // {
+    //     a = p->previous.start[i];
+    //     putchar(a);
+    // }
+    // write(STDOUT_FILENO, args->data.string.value, args->data.string.len);
+    ast.print(stmt);
+    return stmt;
 }
 
 AstNode *parse_test(Parser *p)
@@ -176,7 +123,7 @@ AstNode *parse_test(Parser *p)
         return NULL;
     }
 
-    return ast_new_test(test_name, block);
+    return ast.new.test(test_name, block);
 }
 
 AstNode *parse_assert(Parser *p)
@@ -188,7 +135,7 @@ AstNode *parse_assert(Parser *p)
         return NULL;
     }
 
-    return ast_new_assert(expr);
+    return ast.new.assert(expr);
 }
 
 AstNode *parse_statement(Parser *p)
@@ -197,11 +144,11 @@ AstNode *parse_statement(Parser *p)
     {
     case ASSERT:
         return parse_assert(p);
-    case WRITE:
-        return parse_write(p);
-    case LPAREN:
+    case RPAREN:
     case STRING:
         return parse_expression(p);
+    case WRITE:
+        return parse_write(p);
     case TEST:
         return parse_test(p);
     case LBRACE:

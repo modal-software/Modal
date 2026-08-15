@@ -127,5 +127,7 @@ typedef struct
 #define PREPROC TOK_PREPROC
 
 Token next(Tokenizer *t);
+#define peek(t) ((t)->buffer[(t)->pos])
+#define peek_next(t) ((t)->buffer[(t)->pos] ? (t)->buffer[(t)->pos + 1] : '\0')
 
 #endif

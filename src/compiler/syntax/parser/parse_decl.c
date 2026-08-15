@@ -1,5 +1,5 @@
 #include "ast/ast.h"
-#include "parser/parser.h"
+#include "syntax/parser/parser.h"
 
 // This function is deprecated - use parse_statement instead
 // Kept for compatibility but should be removed
@@ -20,5 +20,5 @@ AstNode *parse_test_decl(Parser *p)
         return NULL;
     }
 
-    return ast_new_test(test_name, body);
+    return ast.new.test(test_name, body);
 }
