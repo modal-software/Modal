@@ -92,9 +92,9 @@ typedef struct AstNode
 
         struct
         {
-            const char *name;
-            size_t len;
             struct AstNode *block;
+            size_t len;
+            const char *name;
         } test;
 
         struct
@@ -106,6 +106,7 @@ typedef struct AstNode
         struct
         {
             size_t len;
+            size_t span;
             const char *value;
             const char *raw;
         } string;

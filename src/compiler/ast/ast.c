@@ -29,8 +29,9 @@ static void printer(AstNode *tree)
     {
         printf("\n\nAST_STRING_LIT:\n     \tdata:\n\t     --\tnode: "
                "string\n\t     --\tlen: "
-               "%zu\n\t     --\tvalue: %s\n\t     --\traw: %s",
-               tree->data.string.len, tree->data.string.value, tree->data.string.raw);
+               "%zu\n\t     --\tvalue: %s\n\t     --\traw: %s\n\t     -- span: %zu\n",
+               tree->data.string.len, tree->data.string.value, tree->data.string.raw,
+               tree->data.string.span);
         break;
     }
     default:
@@ -146,12 +147,21 @@ static AstNode *ast_new_string(Token tok)
         return NULL;
     }
 
-    char *str_raw = *(char **)&tok.start;
     char *str = (char *)malloc(tok.len + sizeof(char *));
+    if (!str)
+    {
+        free(node);
+        free(str);
+        return NULL;
+    }
+    tok.len -= 2;
+    memcpy(str, tok.start + 1, tok.len);
 
-    memcpy(str, tok.start += 1, tok.len);
+    size_t span = tok.len + 2;
+
+    char *str_raw = (char *)tok.start;
     str_raw[tok.len + 2] = '\0';
-    // str[tok.len + 1] = '\0';
+
     *node = (AstNode){
         .kind = AST_STRING_LIT,
         .token = tok,
@@ -162,10 +172,10 @@ static AstNode *ast_new_string(Token tok)
                         .value = str,
                         .raw = str_raw,
                         .len = tok.len,
+                        span,
                     },
             },
     };
-
     return node;
 }
 

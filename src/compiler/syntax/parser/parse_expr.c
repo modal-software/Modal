@@ -22,18 +22,17 @@ static inline AstNode *parse_primary(Parser *p)
     if (parser_match(p, LPAREN))
     {
         AstNode *expr = parse_group(p);
-        ast.print(expr);
+        // ast.print(expr);
         return expr;
     }
 
     if (parser_match(p, STRING))
     {
         Token tok = p->previous;
-        tok.len -= 2;
 
         AstNode *expr = ast.new.string(tok);
 
-        ast.print(expr);
+        // ast.print(expr);
         return expr;
     }
 
@@ -141,7 +140,7 @@ AstNode *parse_group(Parser *p)
         stmts[count++] = stmt;
     }
 
-    if (p->previous.kind != RPAREN)
+    if (p->current.kind != RPAREN)
     {
 
         parser_error_at(p, &p->current, "expected ')' at end of group");

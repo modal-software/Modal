@@ -73,21 +73,16 @@ AstNode *parse_write(Parser *p)
     if (p->current.kind == LPAREN)
     {
         fmt = FMT_GROUPED;
-        parser_advance(p);
-        // args = parse_expression(p);
+        args = parse_expression(p);
     }
 
-    args = parse_expression(p);
+    if (p->current.kind == STRING)
+    {
+        args = parse_expression(p);
+    }
 
     AstNode *stmt = ast.new.write(args, fmt);
-    // char a = 0;
-    // for (int i = 1; i < args->data.string.len - 1; i++)
-    // {
-    //     a = p->previous.start[i];
-    //     putchar(a);
-    // }
-    // write(STDOUT_FILENO, args->data.string.value, args->data.string.len);
-    ast.print(stmt);
+    write(STDOUT_FILENO, args->data.string.value, args->data.string.len);
     return stmt;
 }
 
