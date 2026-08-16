@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -g -std=c17 -I ./ -I src/compiler -I src
+CFLAGS = -Wall -O3 -Wextra -g -std=c17 -I ./ -I src/compiler -I src
 TARGET = jma
 LIBS = -lm -lpthread -ldl
 
