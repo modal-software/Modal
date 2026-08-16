@@ -59,29 +59,31 @@ AstNode *parse_write(Parser *p)
     AstNode *args = {0};
     Fmt fmt = FMT_LITERAL;
 
-    switch (p->current.kind)
+    if (p->current.kind != LPAREN)
     {
-    case LPAREN:
-    {
-        fmt = FMT_GROUPED;
-        args = parse_expression(p);
-
-        AstNode **stmts = args->data.block_or_group.stmts;
-
-        for (int i = 0; i < args->data.block_or_group.count; i++)
-        {
-            write(STDOUT_FILENO, stmts[i]->data.string.value, stmts[i]->data.string.len);
-        }
-    }
-
-    default: {
         args = parse_expression(p);
         write(STDOUT_FILENO, args->data.string.value, args->data.string.len);
-	     }
+
+        return ast.new.write(args, fmt);
     }
 
-    AstNode *stmt = ast.new.write(args, fmt);
-    return stmt;
+    fmt = FMT_GROUPED;
+    args = parse_expression(p);
+
+    AstNode **stmts = args->data.block_or_group.stmts;
+    size_t stmts_count = args->data.block_or_group.count;
+
+    if (stmts_count == 0)
+    {
+        parser_error_at(p, &p->previous, "write function must have arguments");
+    }
+
+    for (size_t i = 0; i < args->data.block_or_group.count; i++)
+    {
+        write(STDOUT_FILENO, stmts[i]->data.string.value, stmts[i]->data.string.len);
+    }
+
+    return ast.new.write(args, fmt);
 }
 
 AstNode *parse_test(Parser *p)
