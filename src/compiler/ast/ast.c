@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static void printer(AstNode *tree)
 {
@@ -19,19 +20,38 @@ static void printer(AstNode *tree)
     }
     case AST_PAREN_GROUP:
     {
+        AstNode **stmts = tree->data.block_or_group.stmts;
+        size_t stmts_count = tree->data.block_or_group.count;
+
+        if (stmts_count == 0)
+        {
+            break;
+        }
+
         printf("\n\nAST_PAREN_GROUP:\n     \tdata:\n\t     --\tnode: "
-               "group\n\t     --\tlen: "
-               "%zu\n\t",
+               "group\n\t     --\tstmts_count: "
+               "%zu\n\t     -- stmts: [ ",
                tree->data.block_or_group.count);
+
+        for (size_t i = 0; i < stmts_count; i++)
+        {
+            if (i > 0)
+            {
+                printf(", ");
+            }
+            write(STDOUT_FILENO, stmts[i]->data.string.raw, stmts[i]->data.string.span);
+        }
+        printf(" ]");
+
         break;
     }
     case AST_STRING_LIT:
     {
         printf("\n\nAST_STRING_LIT:\n     \tdata:\n\t     --\tnode: "
                "string\n\t     --\tlen: "
-               "%zu\n\t     --\tvalue: %s\n\t     --\traw: %s\n\t     -- span: %zu\n",
-               tree->data.string.len, tree->data.string.value, tree->data.string.raw,
-               tree->data.string.span);
+               "%zu\n\t     --\tvalue: %.*s\n\t     --\traw: %.*s\n\t     -- span: %zu\n",
+               tree->data.string.len, (int)tree->data.string.len, tree->data.string.value,
+               (int)tree->data.string.span, tree->data.string.raw, tree->data.string.span);
         break;
     }
     default:
@@ -117,15 +137,15 @@ static AstNode *ast_new_block(Token open_tok, AstNode **stmts, size_t count)
     return node;
 }
 
-static AstNode *ast_new_break_label(Token token)
-{
-    if (token.kind == TOK_COLON)
-    {
-        return NULL;
-    }
-
-    return NULL;
-}
+// static AstNode *ast_new_break_label(Token token)
+// {
+//     if (token.kind == TOK_COLON)
+//     {
+//         return NULL;
+//     }
+//
+//     return NULL;
+// }
 
 static AstNode *ast_new_assert(AstNode *expr)
 {
@@ -148,20 +168,15 @@ static AstNode *ast_new_string(Token tok)
         return NULL;
     }
 
-    char *str = (char *)malloc(tok.len + sizeof(char *));
-    if (!str)
-    {
-        free(node);
-        free(str);
-        return NULL;
-    }
+    char *result = 0;
+    char *str = "abc";
+
+    const char *str_raw = (char *)tok.start;
+
+    const size_t span = tok.len;
     tok.len -= 2;
-    memcpy(str, tok.start + 1, tok.len);
 
-    size_t span = tok.len + 2;
-
-    char *str_raw = (char *)tok.start;
-    str_raw[tok.len + 2] = '\0';
+    tok.start += 1;
 
     *node = (AstNode){
         .kind = AST_STRING_LIT,
@@ -170,7 +185,8 @@ static AstNode *ast_new_string(Token tok)
             {
                 .string =
                     {
-                        .value = str,
+                        ._id = "1",
+                        .value = tok.start,
                         .raw = str_raw,
                         .len = tok.len,
                         span,

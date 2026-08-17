@@ -22,7 +22,7 @@ static inline AstNode *parse_primary(Parser *p)
     if (parser_match(p, LPAREN))
     {
         AstNode *expr = parse_group(p);
-        // ast.print(expr);
+        ast.print(expr);
         return expr;
     }
 
@@ -32,7 +32,7 @@ static inline AstNode *parse_primary(Parser *p)
 
         AstNode *expr = ast.new.string(tok);
 
-        // ast.print(expr);
+        ast.print(expr);
         return expr;
     }
 

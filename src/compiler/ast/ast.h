@@ -109,9 +109,9 @@ typedef struct AstNode
             size_t span;
             const char *value;
             const char *raw;
+            char *_id;
         } string;
 
-        // AST_TEST_STMT, AST_ASSERT_STMT podem herdar fields de block + nome
     } data;
 } AstNode;
 

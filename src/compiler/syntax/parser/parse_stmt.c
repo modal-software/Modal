@@ -62,7 +62,7 @@ AstNode *parse_write(Parser *p)
     if (p->current.kind != LPAREN)
     {
         args = parse_expression(p);
-        write(STDOUT_FILENO, args->data.string.value, args->data.string.len);
+        // write(STDOUT_FILENO, args->data.string.value, args->data.string.len);
 
         return ast.new.write(args, fmt);
     }
@@ -78,10 +78,10 @@ AstNode *parse_write(Parser *p)
         parser_error_at(p, &p->previous, "write function must have arguments");
     }
 
-    for (size_t i = 0; i < args->data.block_or_group.count; i++)
-    {
-        write(STDOUT_FILENO, stmts[i]->data.string.value, stmts[i]->data.string.len);
-    }
+    // for (size_t i = 0; i < args->data.block_or_group.count; i++)
+    // {
+    //     write(STDOUT_FILENO, stmts[i]->data.string.value, stmts[i]->data.string.len);
+    // }
 
     return ast.new.write(args, fmt);
 }
