@@ -54,6 +54,20 @@ static void printer(AstNode *tree)
                (int)tree->data.string.span, tree->data.string.raw, tree->data.string.span);
         break;
     }
+    case AST_ASSIGN_STMT:
+    {
+        printf("\n\nAST_EXPR:\n     \tdata:\n\t     --\tnode: "
+               "ASSIGN_STMT\n\t     --\tlhs_len: "
+               "%zu\n\t     --\tlhs_value: %.*s\n",
+               tree->data.expr.lhs->data.ident.len, (int)tree->data.expr.lhs->data.ident.len,
+               tree->data.expr.lhs->data.ident.name);
+
+        printf("\t     --\trhs_len: "
+               "%zu\n\t     --\trhs_value: %.*s\n",
+               tree->data.expr.rhs->data.ident.len, (int)tree->data.expr.rhs->data.ident.len,
+               tree->data.expr.rhs->data.ident.name);
+        break;
+    }
     default:
         break;
     }
@@ -78,8 +92,20 @@ static AstNode *ast_new_ident(Token tok)
     {
         return NULL;
     }
+
     *node = (AstNode){
-        .kind = AST_IDENT, .token = tok, .data = {.ident = {.name = tok.start, .len = tok.len}}};
+        .kind = AST_IDENT,
+        .token = tok,
+        .data =
+            {
+                .ident =
+                    {
+                        .name = tok.start,
+                        .len = tok.len,
+                    },
+            },
+    };
+
     return node;
 }
 
@@ -90,7 +116,19 @@ static AstNode *ast_new_binop(Token tok, AstNode *left, AstNode *right)
     {
         return NULL;
     }
-    *node = (AstNode){.kind = AST_BIN_OP, .token = tok, .data = {.binop = {left, right, tok.kind}}};
+    *node = (AstNode){
+        .kind = AST_BIN_OP,
+        .token = tok,
+        .data =
+            {
+                .binop =
+                    {
+                        left,
+                        right,
+                        tok.kind,
+                    },
+            },
+    };
     return node;
 }
 
@@ -137,16 +175,6 @@ static AstNode *ast_new_block(Token open_tok, AstNode **stmts, size_t count)
     return node;
 }
 
-// static AstNode *ast_new_break_label(Token token)
-// {
-//     if (token.kind == TOK_COLON)
-//     {
-//         return NULL;
-//     }
-//
-//     return NULL;
-// }
-
 static AstNode *ast_new_assert(AstNode *expr)
 {
     AstNode *node = malloc(sizeof(AstNode));
@@ -160,7 +188,7 @@ static AstNode *ast_new_assert(AstNode *expr)
     return node;
 }
 
-static AstNode *ast_new_string(Token tok)
+static AstNode *ast_new_expr(Token tok, AstNode *lhs, AstNode *rhs)
 {
     AstNode *node = malloc(sizeof(AstNode));
     if (!node)
@@ -168,8 +196,29 @@ static AstNode *ast_new_string(Token tok)
         return NULL;
     }
 
-    char *result = 0;
-    char *str = "abc";
+    *node = (AstNode){
+        .kind = AST_ASSIGN_STMT,
+        .token = tok,
+        .data =
+            {
+                .expr =
+                    {
+                        lhs,
+                        rhs,
+                    },
+            },
+    };
+
+    return node;
+}
+
+static AstNode *ast_new_string(Token tok)
+{
+    AstNode *node = malloc(sizeof(AstNode));
+    if (!node)
+    {
+        return NULL;
+    }
 
     const char *str_raw = (char *)tok.start;
 
@@ -276,6 +325,8 @@ static void ast_free(struct AstNode *node)
     case AST_ASSERT_STMT:
         ast_free(node->data.unary.expr);
         break;
+    case AST_ASSIGN_STMT:
+    case AST_IDENT:
     case AST_STRING_LIT:
         ast_free(node);
         break;
@@ -299,5 +350,6 @@ const AstImpl ast = (AstImpl){
             .ident = ast_new_ident,
             .block = ast_new_block,
             .group = ast_new_group,
+            .expr = ast_new_expr,
         },
 };

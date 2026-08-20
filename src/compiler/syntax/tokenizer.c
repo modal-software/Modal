@@ -10,9 +10,10 @@ static const Keyword keywords[] = {
     {"alias", 5, TOK_ALIAS}, {"use", 3, TOK_USE},           {"comptime", 8, TOK_COMPTIME},
     {"union", 5, TOK_UNION}, {"asm", 3, TOK_ASM},           {"volatile", 8, TOK_VOLATILE},
     {"async", 5, TOK_ASYNC}, {"await", 5, TOK_AWAIT},       {"and", 3, TOK_AND},
-    {"or", 2, TOK_OR},       {"write", 5, TOK_WRITE}};
+    {"or", 2, TOK_OR},       {"write", 5, TOK_WRITE},       {"const", 5, TOK_CONST},
+};
 
-static TokenKind get_keyword(const char *s, int len)
+static TokenKind check_identifier(const char *s, int len)
 {
     for (size_t i = 0; i < sizeof(keywords) / sizeof(keywords[0]); i++)
     {
@@ -24,20 +25,18 @@ static TokenKind get_keyword(const char *s, int len)
     return TOK_IDENTIFIER;
 }
 
-// static const char *string_lit(const char *s)
-// {
-// }
-
 Token next(Tokenizer *t)
 {
     const char *start = NULL;
     int start_line = 0;
     int start_col = 0;
+    // printf("s: %s\n", t->buffer);
 
     for (;;)
     {
 
         char c = peek(t);
+        // printf("c: %c i: %i\n", c, t->state);
 
         if (!c)
         {
@@ -72,36 +71,6 @@ Token next(Tokenizer *t)
                 tokenizer.advance(t);
                 continue;
             }
-
-            // if (c == '#')
-            // {
-            //     start = t->buffer + t->pos;
-            //     start_line = t->line;
-            //     start_col = t->col;
-            //     int len = 0;
-            //
-            //     for (;;)
-            //     {
-            //         char curr = peek(t);
-            //         if (curr == '\0' || curr == '\n')
-            //         {
-            //             break;
-            //         }
-            //
-            //         if (curr == '\\' && peek_next(t) == '\n')
-            //         {
-            //             tokenizer.advance(t);
-            //             len += 2;
-            //             continue;
-            //         }
-            //
-            //         tokenizer.advance(t);
-            //         len++;
-            //     }
-            //
-            //     t->state = LEX_STATE_START;
-            //     return token.new(TOK_PREPROC, start, len, start_line, start_col);
-            // }
 
             start = t->buffer + t->pos;
             start_line = t->line;
@@ -176,11 +145,24 @@ Token next(Tokenizer *t)
                     return token.new(TOK_ARROW, start, 2, start_line, start_col);
                 }
                 break;
+            case '=':
+                if (peek(t) == '=')
+                {
+                    tokenizer.advance(t);
+                    return token.new(TOK_CMP, start, 2, start_line, start_col);
+                }
+                return token.new(TOK_EQ, start, 2, start_line, start_col);
+                break;
             case ':':
                 if (peek(t) == ':')
                 {
                     tokenizer.advance(t);
                     return token.new(TOK_DCOLON, start, 2, start_line, start_col);
+                }
+                if (peek(t) == '=')
+                {
+                    tokenizer.advance(t);
+                    return token.new(TOK_DEFINE, start, 2, start_line, start_col);
                 }
                 break;
             case '|':
@@ -190,14 +172,17 @@ Token next(Tokenizer *t)
             return token.new(TOK_OPERATOR, start, 1, start_line, start_col);
 
         case LEX_STATE_IDENTIFIER:
-            if (isalnum(c) || c == '_')
+            if (isalnum(c) || c == '_' || isalpha(c))
             {
                 tokenizer.advance(t);
                 continue;
             }
             int len = (int)((t->buffer + t->pos) - start);
+
+            const TokenKind keyword = check_identifier(start, len);
+
             t->state = LEX_STATE_START;
-            return token.new(get_keyword(start, len), start, len, start_line, start_col);
+            return token.new(keyword, start, len, start_line, start_col);
 
         case LEX_STATE_NUMBER_INT:
             if (isdigit(c))

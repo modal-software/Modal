@@ -21,6 +21,8 @@ typedef enum
     TOK_NUMBER,
     TOK_STRING,
     TOK_PREPROC,
+    // DECLARATION
+    TOK_CONST,
     // Keywords
     TOK_FUNCTION,
     TOK_TEST,
@@ -41,6 +43,9 @@ typedef enum
     TOK_WRITE,
     // Multi-char operators
     TOK_Q_DOT,
+    TOK_EQ,
+    TOK_CMP,
+    TOK_DEFINE,
     TOK_QQ_EQ,
     TOK_QQ,
     TOK_QUESTION,
@@ -56,6 +61,7 @@ typedef enum
 {
     LEX_STATE_START,
     LEX_STATE_IDENTIFIER,
+    LEX_STATE_GENDECL,
     LEX_STATE_NUMBER_INT,
     LEX_STATE_NUMBER_FLOAT,
     LEX_STATE_STRING_LIT,

@@ -45,6 +45,7 @@ typedef enum
     AST_ASSERT_STMT,
     AST_WRITE_STMT,
     AST_STRING_LIT,
+    AST_ASSIGN_STMT,
 } AstNodeKind;
 
 typedef enum
@@ -83,6 +84,20 @@ typedef struct AstNode
             struct AstNode *expr;
             Kind op; // -, ! etc.
         } unary;
+
+        struct
+        {
+            Kind op;
+            size_t op_len;
+
+            struct AstNode *lhs;
+            struct AstNode *rhs;
+        } expr;
+
+        struct
+        {
+            const char *name;
+        } var;
 
         struct
         {                           // AST_PAREN_GROUP / AST_BLOCK
@@ -133,6 +148,7 @@ typedef struct
     AstNode *(*write)(AstNode *n, Fmt fmt);
     AstNode *(*assert)(AstNode *expr);
     AstNode *(*number)(Token tok, long long val);
+    AstNode *(*expr)(Token tok, AstNode *lhs, AstNode *rhs);
 } AstConstructor;
 
 typedef struct

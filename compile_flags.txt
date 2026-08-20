@@ -1,4 +1,4 @@
 -std=c17
 -I.
--Isrc/compiler
+-Isrc/v1/compiler
 -Isrc

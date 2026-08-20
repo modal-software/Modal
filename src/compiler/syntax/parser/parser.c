@@ -64,19 +64,17 @@ AstNode *parse_program(Parser *p)
 
         if (stmt)
         {
-            if (count < cap)
+            if (count >= cap)
             {
-                return NULL;
+                cap *= 2;
+                AstNode **new_stmts = realloc(stmts, cap * sizeof(AstNode *));
+                if (!new_stmts)
+                {
+                    free((void *)stmts);
+                    return NULL;
+                }
+                stmts = new_stmts;
             }
-
-            cap *= 2;
-            AstNode **new_stmts = realloc(stmts, cap * sizeof(AstNode *));
-            if (!new_stmts)
-            {
-                free((void *)stmts);
-                return NULL;
-            }
-            stmts = new_stmts;
         }
         stmts[count++] = stmt;
     }

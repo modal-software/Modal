@@ -140,6 +140,9 @@ AstNode *parse_statement(Parser *p)
     case ASSERT:
         return parse_assert(p);
     case LPAREN:
+    case IDENTIFIER:
+    case TOK_CONST:
+    case TOK_DEFINE:
     case STRING:
         return parse_expression(p);
     case WRITE:
@@ -152,6 +155,7 @@ AstNode *parse_statement(Parser *p)
     default:
     {
         parser_error_at(p, &p->current, "unexpected statement");
+
         return NULL;
     }
     }

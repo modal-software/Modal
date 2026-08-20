@@ -16,7 +16,7 @@ Checks: >
 
 WarningsAsErrors: ""
 
-HeaderFilterRegex: "src/.*"
+HeaderFilterRegex: "src/v1/.*"
 
 CheckOptions:
     - key: readability-identifier-naming.FunctionCase
