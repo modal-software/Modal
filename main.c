@@ -1,8 +1,9 @@
-#include "compiler/ast/ast.h"
-#include "compiler/cx.h"
-#include "compiler/syntax/parser/parser.h"
-#include "compiler/syntax/tokenizer.h"
-#include "compiler/syntax/tokenizer.impl.h"
+#include "v1/compiler/ast/ast.h"
+#include "v1/compiler/cx.h"
+#include "v1/compiler/syntax/parser/parser.h"
+// #include "v1/compiler/syntax/tokenizer.h"
+#include "v1/compiler/syntax/tokenizer.impl.h"
+#include "v2/compiler/syntax/scanner.h"
 #include <stdio.h>
 #include <stdlib.h>
 

@@ -2,7 +2,8 @@
 #ifndef AST_H
 #define AST_H
 
-#include "syntax/tokenizer.h"
+#include "v1/compiler/syntax/tokenizer.h"
+#include "v1/utils/mvec.h"
 
 // unused
 typedef enum
@@ -129,6 +130,15 @@ typedef struct AstNode
 
     } data;
 } AstNode;
+
+MVEC_IMPL(ast, AstNode)
+static const _mvec_constructor_ast astvec = {
+    .init = mvec_init_ast,
+    .push = mvec_push_ast,
+    .free = mvec_free_ast,
+    .pop = mvec_pop_ast,
+    .release = mvec_release_ast,
+};
 
 // Iterate over children of a BLOCK or PAREN_GROUP node.
 // Usage: AST_EACH(block_node, child) { /* use child */ }

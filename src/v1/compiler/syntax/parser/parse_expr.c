@@ -1,6 +1,6 @@
-#include "compiler/cx.h"
 #include "syntax/parser/parser.h"
 #include "test_runner.h"
+#include "v1/compiler/cx.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,8 +53,9 @@ static inline AstNode *parse_primary(Parser *p)
         if (parser_match(p, TOK_EQ))
         {
             printf("%s", ident);
+            return ast.new.ident(p->previous);
         }
-        // return ast.new.ident(p->previous);
+        return ast.new.ident(p->previous);
     }
 
     if (parser_match(p, LPAREN))

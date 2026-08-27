@@ -49,6 +49,7 @@ typedef struct
 
     void (*free)(Pool *pool, void **ptr);
     void (*drop)(Pool *pool);
+    void (*reset)(Pool *self);
 } PAllocatorConstrutor;
 
 static Pool *pool_init(size_t amount)
@@ -58,16 +59,15 @@ static Pool *pool_init(size_t amount)
     {
         return NULL;
     }
+    size_t raw = (amount * sizeof(Chunk)) + (CHUNK_SZ - 1);
+    pool->cx.obj = malloc(raw);
 
-    pool->cx.obj = malloc((amount * sizeof(Chunk)) + 63);
-    pool->slot = (Chunk *)align_backward(pool->cx.obj, CHUNK_SZ);
-    printf("obj: %p\nslot: %p\n", pool->cx.obj, pool->slot);
-    if (!pool->slot)
+    if (pool->cx.obj == NULL)
     {
-        free(pool->cx.obj);
         free(pool);
         return NULL;
     }
+    pool->slot = (Chunk *)align_backward(pool->cx.obj, CHUNK_SZ);
 
     for (size_t i = 0; i < amount - 1; i++)
     {
@@ -75,7 +75,6 @@ static Pool *pool_init(size_t amount)
     }
 
     pool->slot[amount - 1].next = NULL;
-
     pool->head = pool->slot;
 
     if (TRACING == 1)
@@ -89,7 +88,7 @@ static Pool *pool_init(size_t amount)
 
 static void *pool_alloc(Pool *self)
 {
-    if (!self || !self->head)
+    if (self == NULL || self->head == NULL)
     {
         fprintf(stderr, "fatal: pool ran out of memory\n[Process exited %d]\n", EXIT_FAILURE);
         return NULL;
@@ -105,23 +104,25 @@ static void *pool_alloc(Pool *self)
     return chunk->buffer;
 }
 
+static void pool_reset(Pool *self)
+{
+    if (self == NULL)
+    {
+        return;
+    }
+
+    self->head = self->slot;
+}
+
 static void pool_free(Pool *self, void **ptr)
 {
-    if (self == NULL || ptr == NULL)
+    if (self == NULL || ptr == NULL || *ptr == NULL)
     {
         fprintf(stderr, "fatal: no object available to free\n[Process exited %d]\n", EXIT_FAILURE);
         return;
     }
 
     Chunk *chunk = (Chunk *)*ptr;
-
-    // printf("before freeing\n\n");
-    // printf("slot->buffer: %u (%p)\n", *self->slot->buffer, self->slot->buffer);
-    // printf("head->buffer: %u (%p)\n", *self->head->buffer, self->head->buffer);
-    // printf("chunk->buffer: %u (%p)\n", *chunk->buffer, chunk->buffer);
-    // printf("next->buffer: %u (%p)\n\n", *chunk->next->buffer,
-    //        chunk->next->buffer);
-    // printf("next->next->buffer: %u\n\n", *chunk->next->next->buffer);
 
     chunk->next = self->head;
     self->head = chunk;
@@ -150,7 +151,8 @@ static void pool_drop(Pool *self)
 }
 
 #define FOO_DEFAULTS                                                                               \
-    .allocator = pool_init, .alloc = pool_alloc, .free = pool_free, .drop = pool_drop,
+    .allocator = pool_init, .alloc = pool_alloc, .free = pool_free, .drop = pool_drop,             \
+    .reset = pool_reset,
 
 const PAllocatorConstrutor pool = {FOO_DEFAULTS};
 

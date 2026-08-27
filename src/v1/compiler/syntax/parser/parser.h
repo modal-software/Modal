@@ -1,8 +1,8 @@
 #ifndef PARSER_H
 #define PARSER_H
 
-#include "ast/ast.h"          // AstNode, AstNodeKind
-#include "syntax/tokenizer.h" // Token, TokenKind, Tokenizer
+#include "ast/ast.h"                      // AstNode, AstNodeKind
+#include "v1/compiler/syntax/tokenizer.h" // Token, TokenKind, Tokenizer
 
 #include <stdarg.h> // va_list (pra error variádico)
 #include <stdbool.h>
@@ -78,7 +78,7 @@ AstNode *parse_assert(Parser *p);     // em parse_stmt.c
 AstNode *parse_statement(Parser *p);  // em parse_stmt.c
 AstNode *parse_block(Parser *p);      // em parse_stmt.c
 AstNode *parse_assert(Parser *p);     // em parse_stmt.c
-AstNode *parse_group(Parser *p);     // em parse_stmt.c
+AstNode *parse_group(Parser *p);      // em parse_stmt.c
 // Futuro:
 AstNode *parse_test_decl(Parser *p);
 // AstNode  *parse_declaration(Parser *p);        // fn, struct, var...

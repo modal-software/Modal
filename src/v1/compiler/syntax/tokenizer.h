@@ -2,7 +2,7 @@
 #define LEXER_H
 
 #include <stddef.h>
-#define MODAL_VERSION "0.0.1"
+#define MODAL_VERSION "0.0.3"
 
 // Token kinds - what the token represents
 typedef enum
