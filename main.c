@@ -1,7 +1,9 @@
-#include "compiler/ast/ast.h"
-#include "compiler/parser/parser.h"
-#include "compiler/tokenizer/tokenizer.h"
-#include "compiler/tokenizer/tokenizer.impl.h"
+#include "v1/compiler/ast/ast.h"
+#include "v1/compiler/cx.h"
+#include "v1/compiler/syntax/parser/parser.h"
+// #include "v1/compiler/syntax/tokenizer.h"
+#include "v1/compiler/syntax/tokenizer.impl.h"
+#include "v2/compiler/syntax/scanner.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -28,13 +30,15 @@ int main(int argc, char **argv)
     if (argc < 2)
     {
         fprintf(stderr, "%s: fatal: no input files\n[Process exited %d]\n", argv[0], EXIT_FAILURE);
+        cx.ok = 0;
         return 1;
     }
 
-    const char *buffer = file_entry(argv[1]);
+    char *buffer = file_entry(argv[1]);
 
     Tokenizer lexer;
     tokenizer.init(&lexer, buffer);
+    cx.lexer = lexer;
 
     Parser parser;
     parser_init(&parser, &lexer, argv[1]);
@@ -43,14 +47,15 @@ int main(int argc, char **argv)
 
     if (parser.had_error)
     {
-        ast_free(root);
+        ast.free(root);
         free(buffer);
+        cx.ok = 0;
         return 1;
     }
 
     exec_program(root);
 
-    ast_free(root);
+    ast.free(root);
     free(buffer);
     return 0;
 }
