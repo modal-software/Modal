@@ -7,7 +7,19 @@
 #include <string.h>
 #include <unistd.h>
 
-static void var_decl(AstNode *expr);
+uint32_t hash(char *str)
+{
+    uint32_t hash = 5381L;
+    int8_t c;
+    while ((c = *str++))
+    {
+        hash = ((hash << 5) + hash) + c; /* hash * 33 + c */
+    }
+    // TODO: fix this magic number later
+    return hash % 1024;
+}
+
+// static void var_decl(AstNode *expr);
 static inline AstNode *parse_primary(Parser *p)
 {
     if (parser_match(p, NUMBER))
@@ -28,33 +40,35 @@ static inline AstNode *parse_primary(Parser *p)
     {
         Token tok = p->previous;
 
-        char buffer[tok.len + 1];
-        snprintf(buffer, sizeof(buffer), "%.*s", tok.len, tok.start);
-
-        const char *ident = buffer;
+        // char buffer[tok.len + 1];
+        // snprintf(buffer, sizeof(buffer), "%.*s", tok.len, tok.start);
+        //
+        // const char *ident = pool->alloc_sz(cx.pool, tok.len + 1);
+        // ident = buffer;
 
         if (parser_match(p, TOK_DEFINE))
         {
-            Token t = p->current;
-
-            AstNode *lhs = ast.new.ident(t);
-            lhs[0].data.ident.name = ident;
-            lhs[0].data.ident.len = sizeof(ident);
-
-            AstNode *rhs = ast.new.ident(t);
-            AstNode *expr = ast.new.expr(t, lhs, rhs);
-            ast.print(expr);
-
-            var_decl(expr);
-
-            return expr;
+            //     Token t = p->current;
+            //
+            //     AstNode *lhs = ast.new.ident(t);
+            //     lhs->data.ident.name = tok.start;
+            //     lhs->data.ident.len = tok.len;
+            //
+            //     AstNode *rhs = ast.new.ident(t);
+            //     AstNode *define = ast.new.define(t, lhs, rhs);
+            //     printf("%s %s", tok.start, ident);
+            //     // ast.print(expr);
+            //
+            //     // var_decl(expr);
+            //
+            //     return define;
         }
 
-        if (parser_match(p, TOK_EQ))
-        {
-            printf("%s", ident);
-            return ast.new.ident(p->previous);
-        }
+        // if (parser_match(p, TOK_EQ))
+        // {
+        //     printf("%s", ident);
+        //     return ast.new.ident(p->previous);
+        // }
         return ast.new.ident(p->previous);
     }
 
@@ -79,11 +93,11 @@ static inline AstNode *parse_primary(Parser *p)
     return NULL;
 }
 
-static void var_decl(AstNode *expr)
-{
-    int n = 0;
-    // printf
-}
+// static void var_decl(AstNode *expr)
+// {
+//     int n = 0;
+//     // printf
+// }
 
 AstNode *parse_expression(Parser *p)
 {
@@ -152,13 +166,19 @@ AstNode *parse_group(Parser *p)
     }
 
     AstNode **stmts = NULL;
+    LFPool *lfpool = {0};
     size_t count = 0;
     size_t cap = 4;
 
-    stmts = (AstNode **)malloc(cap * sizeof(AstNode *));
+    if (!pool->allocator(&lfpool, cap * sizeof(AstNode *)))
+    {
+        return NULL;
+    };
+
+    stmts = (AstNode **)pool->alloc(lfpool);
     if (!stmts)
     {
-        free(*stmts);
+        pool->drop(lfpool);
         return NULL;
     }
 
@@ -175,10 +195,10 @@ AstNode *parse_group(Parser *p)
         if (count >= cap)
         {
             cap *= 2;
-            AstNode **new_stmts = (AstNode **)realloc(*stmts, cap * sizeof(AstNode *));
+            AstNode **new_stmts = (AstNode **)pool->alloc_sz(lfpool, cap * sizeof(AstNode *));
             if (!new_stmts)
             {
-                free(*stmts);
+                pool->drop(lfpool);
                 return NULL;
             }
             stmts = new_stmts;
@@ -220,7 +240,7 @@ void exec_node(AstNode *node)
 
 void exec_program(AstNode *root)
 {
-    if (!root || root->kind != AST_BLOCK || root->kind != AST_PAREN_GROUP)
+    if (!root || (root->kind != AST_BLOCK && root->kind != AST_PAREN_GROUP))
     {
         return;
     }
