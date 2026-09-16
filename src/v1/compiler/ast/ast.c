@@ -1,4 +1,5 @@
 #include "ast/ast.h"
+#include "cx.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,7 +55,7 @@ static void printer(AstNode *tree)
                (int)tree->data.string.span, tree->data.string.raw, tree->data.string.span);
         break;
     }
-    case AST_ASSIGN_STMT:
+    case AST_EXPR:
     {
         printf("\n\nAST_EXPR:\n     \tdata:\n\t     --\tnode: "
                "ASSIGN_STMT\n\t     --\tlhs_len: "
@@ -188,27 +189,39 @@ static AstNode *ast_new_assert(AstNode *expr)
     return node;
 }
 
-static AstNode *ast_new_expr(Token tok, AstNode *lhs, AstNode *rhs)
+static AstNode *ast_new_expr(Token tok, AstNode *lhs, AstNode *rhs, TokenKind op)
 {
     AstNode *node = malloc(sizeof(AstNode));
     if (!node)
     {
         return NULL;
     }
+    memset(node, 0, sizeof(*node));
 
     *node = (AstNode){
-        .kind = AST_ASSIGN_STMT,
+        .kind = AST_EXPR,
         .token = tok,
         .data =
             {
                 .expr =
                     {
-                        lhs,
-                        rhs,
+                        .lhs = lhs,
+                        .op = op,
+                        .rhs = rhs,
                     },
             },
     };
 
+    return node;
+}
+
+static AstNode *ast_new_define(Token tok, AstNode *lhs, AstNode *rhs)
+{
+    AstNode *node = ast_new_expr(tok, lhs, rhs, TOK_DEFINE);
+    if (!node)
+    {
+        return NULL;
+    }
     return node;
 }
 
@@ -325,7 +338,9 @@ static void ast_free(struct AstNode *node)
     case AST_ASSERT_STMT:
         ast_free(node->data.unary.expr);
         break;
-    case AST_ASSIGN_STMT:
+    case AST_EXPR:
+        pool->drop(cx.pool);
+        break;
     case AST_IDENT:
     case AST_STRING_LIT:
         ast_free(node);
@@ -334,6 +349,7 @@ static void ast_free(struct AstNode *node)
         break;
     }
     free(node);
+    pool->drop(cx.pool);
 }
 
 const AstImpl ast = (AstImpl){
@@ -344,12 +360,13 @@ const AstImpl ast = (AstImpl){
             .string = ast_new_string,
             .write = ast_new_write,
             .test = ast_new_test,
-            .assert = ast_new_assert,
+            .assertFn = ast_new_assert,
             .binop = ast_new_binop,
             .number = ast_new_number,
             .ident = ast_new_ident,
             .block = ast_new_block,
             .group = ast_new_group,
             .expr = ast_new_expr,
+            .define = ast_new_define,
         },
 };
