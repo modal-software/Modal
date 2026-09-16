@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Wall -O3 -Wextra -g -std=c17 -I ./ -I src/v1/compiler -I src
+CFLAGS = -Wall -O3 -Wextra -g -std=c17 -MMD -MP -I ./ -I src/v1/compiler -I src
 TARGET = jma
 LIBS = -lm -lpthread -ldl
 
@@ -15,13 +15,14 @@ PREFIX ?= /usr/local
 BINDIR = ${PREFIX}/bin
 
 modal: $(OBJS)
-	$(CC) $(OBJS) -o $(OUT_DIR)/modal
+	$(CC) $(OBJS) -o ./modal
+
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 run: modal
-	clear; $(OUT_DIR)/modal ./examples/add.modal
+	clear; ./modal ./examples/add.modal
 
 test_parser3: src/v2/tests/ll1_parsing_3.c
 	$(CC) -Wall -Wextra -O2 -std=c17 -pthread src/v2/tests/ll1_parsing_3.c -o src/v2/tests/test_parser3
@@ -61,4 +62,6 @@ bundle:
 	mkdir -p $(OUT_DIR)	
 
 clean:
-	rm -f *.o modal
+	rm -f $(OBJS) $(OBJS:.o=.d) modal
+
+-include $(OBJS:.o=.d)
