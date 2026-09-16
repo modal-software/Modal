@@ -130,7 +130,7 @@ AstNode *parse_assert(Parser *p)
         return NULL;
     }
 
-    return ast.new.assert(expr);
+    return ast.new.assertFn(expr);
 }
 
 AstNode *parse_statement(Parser *p)

@@ -156,7 +156,7 @@ typedef struct
     AstNode *(*block)(Token open_brace, AstNode **stmts, size_t count);
     AstNode *(*test)(Token token, AstNode *block);
     AstNode *(*write)(AstNode *n, Fmt fmt);
-    AstNode *(*assert)(AstNode *expr);
+    AstNode *(*assertFn)(AstNode *expr);
     AstNode *(*number)(Token tok, long long val);
     AstNode *(*expr)(Token tok, AstNode *lhs, AstNode *rhs);
 } AstConstructor;
