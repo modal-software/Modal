@@ -1,9 +1,11 @@
+#define PALLOC_IMPLEMENTATION
 #include "v1/compiler/ast/ast.h"
 #include "v1/compiler/cx.h"
 #include "v1/compiler/syntax/parser/parser.h"
-// #include "v1/compiler/syntax/tokenizer.h"
+#include "v1/compiler/syntax/tokenizer.h"
 #include "v1/compiler/syntax/tokenizer.impl.h"
-#include "v2/compiler/syntax/scanner.h"
+#include "v1/utils/palloc.h"
+// #include "v2/compiler/syntax/scanner.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -38,6 +40,13 @@ int main(int argc, char **argv)
 
     Tokenizer lexer;
     tokenizer.init(&lexer, buffer);
+    LFPool *pool_instance = {0};
+    if (!pool->allocator(&pool_instance, 8))
+    {
+        fprintf(stderr, "fatal: pool allocation failed\n");
+        return 1;
+    }
+    cx.pool = pool_instance;
     cx.lexer = lexer;
 
     Parser parser;
