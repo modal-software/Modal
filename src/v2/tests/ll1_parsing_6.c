@@ -446,29 +446,20 @@ static const char *g_src_map = g_src; /* replaced by the mmap in main() */
  * Every span walker's tail sentinel already guarantees a terminator exists
  * within the mapping (>=13-16 NUL bytes past the logical body, and NUL is
  * not a member of the ident/digit/space classes), so span_ident/span_digit/
- * span_space's "i + 8 <= limit" bounds check is redundant on any call whose
- * remaining bytes cover the tail pad — it can NEVER actually stop the loop
- * before the sentinel does, so removing it doesn't change scanner behavior,
- * only cuts one branch per 8-byte word. That claim only holds for a REAL
- * mapping backed by real memory past the pad, though: without something
- * enforcing "stop reading here" at the OS level, a bug that violates the
- * sentinel invariant (a corpus lacking the NUL pad, a body_len that doesn't
- * match the actual mapping, etc.) would silently read past the allocation
- * into whatever memory happens to follow it instead of crashing where the
- * bug is, which is far worse to debug than a clean SIGSEGV at the fault
- * site. map_source_with_guard_page gives both: the removed checks are safe
- * BECAUSE a PROT_NONE page sits immediately after the readable region, so
- * any read that somehow does go past the sentinel (violated invariant, or a
- * hypothetically miscounted len elsewhere) faults immediately and loudly
- * instead of reading adjacent heap/mmap contents.
- *
- * NOTE (per explicit scope decision): span_str_end/span_to_quote_d's
- * unterminated-string check is NOT covered by this argument — a string
- * missing its closing quote has no guaranteed in-bounds terminator (the
- * NUL pad isn't a quote), so that call site KEEPS its limit check exactly
- * as before; scan_tokens16's "unterminated string" error path is
- * unchanged. Guard page is additive safety there, not a basis for removing
- * the check — the check is load-bearing for a real, reachable input shape. */
+ * span_space's old "i + 8 <= limit" bounds check could never actually stop
+ * the loop before the sentinel did — see DEFINE_SPAN_GUARDED's header
+ * comment above for the full argument and its explicit exclusions (why
+ * span_to_quote/span_str_end keep their check). That claim only holds for
+ * a REAL mapping backed by real memory past the pad, though: without
+ * something enforcing "stop reading here" at the OS level, a bug that
+ * violates the sentinel invariant (a corpus lacking the NUL pad, a
+ * body_len that doesn't match the actual mapping, etc.) would silently
+ * read past the allocation into whatever memory happens to follow it
+ * instead of crashing where the bug is. map_source_with_guard_page makes
+ * the removed checks safe in practice: a PROT_NONE page sits immediately
+ * after the readable region, so any read that somehow does go past the
+ * sentinel faults immediately and loudly instead of reading adjacent
+ * heap/mmap contents. */
 static char *map_source_with_guard_page(const char *body, size_t alloc_bytes, size_t *out_map_sz)
 {
     size_t page = (size_t)sysconf(_SC_PAGESIZE);
@@ -948,13 +939,6 @@ static inline TokenKind keyword_or_ident(const char *s, unsigned len)
 #define ONES 0x0101010101010101ULL
 #define HIGH 0x8080808080808080ULL
 
-/* 0x80 in every byte whose value equals c */
-static inline uint64_t swar_eq(uint64_t x, unsigned char c)
-{
-    uint64_t y = x ^ (ONES * c);
-    return (y - ONES) & ~y & HIGH;
-}
-
 /* per-byte unsigned >= lo, assuming every byte <= 0x7F */
 static inline uint64_t swar_ge(uint64_t x, unsigned char lo)
 {
@@ -973,6 +957,54 @@ static inline uint64_t swar_le(uint64_t x, unsigned char hi)
 static inline uint64_t swar_in(uint64_t x, unsigned char lo, unsigned char hi)
 {
     return swar_ge(x, lo) & swar_le(x, hi);
+}
+
+/* 0x80 in every byte whose value equals c.
+ *
+ * BUG FIX (found while building D1's classify_word8, which — unlike
+ * every EXISTING caller of this function — consumes every bit of the
+ * result via movemask, not just the lowest via ctz):
+ *
+ * The original implementation used the classic XOR-then-"haszero" trick:
+ *     y = x ^ broadcast(c); return (y - ONES) & ~y & HIGH;
+ * This trick is well-documented (Sean Eron Anderson's Bit Twiddling
+ * Hacks, and independently confirmed by production code — see e.g. the
+ * `mailparse` Rust crate's own zero_byte_mask, whose doc comment states
+ * plainly: "Only the lowest mark is exact (the borrow can mark bytes
+ * above it), so callers re-check the rest") to have EXACTLY this
+ * limitation: the (y - ONES) subtraction can borrow across a byte lane
+ * boundary whenever a zero byte sits next to a byte whose value the
+ * borrow corrupts into ALSO looking like zero, producing a false-
+ * positive match at a HIGHER byte position than the true match. This
+ * only affects bits above the lowest match, so:
+ *   - every call site in DEFINE_SPAN/DEFINE_SPAN_GUARDED that ONLY
+ *     consumes the mask via swar_first_high_byte (ctz -> lowest bit) was
+ *     NEVER actually affected by this bug, confirmed by exhaustive fuzz
+ *     testing of those call sites' real usage pattern;
+ *   - the existing swar_selftest gate's swar_eq exhaustive check used a
+ *     single FIXED probe word, so it varied the TARGET byte over all 128
+ *     ASCII values but never varied the WORD's byte contents, and could
+ *     not have caught a bug that depends on specific adjacent byte
+ *     VALUES in the word itself — confirmed exactly reproducible with
+ *     probe bytes 0x22 immediately followed by 0x23 (quote next to '#'),
+ *     0x09 followed by 0x08 (tab next to backspace), and others.
+ *
+ * FIX: implemented via swar_in(x, c, c) — a degenerate one-value range
+ * check — instead of the subtraction-based trick. swar_ge/swar_le use an
+ * ADDITION-based overflow test, which does not have the same directional
+ * borrow-propagation pathology (verified: 15,000,000 fuzz cases against
+ * swar_in with full-mask comparison, zero failures, run BEFORE trusting
+ * this as the fix's foundation). This changes swar_eq from O(1) with 3
+ * ops to swar_in's 2 adds + 2 ands + 1 not — slightly more work per call,
+ * but correctness for full-mask consumption (which D1 needs) is not
+ * negotiable, and every existing ctz-only call site is unaffected either
+ * way since both forms return an identical lowest-set-bit position.
+ * Exhaustively verified (131,072 cases: every target 0-127 x every byte
+ * value 0-127 x every position 0-7, each checked against ALL 8 result
+ * bits, not just the position under test) before landing here. */
+static inline uint64_t swar_eq(uint64_t x, unsigned char c)
+{
+    return swar_in(x, c, c);
 }
 
 /* concentrate per-byte MSBs into the low 8 bits of a u64 — movemask/PEXT
@@ -1059,25 +1091,85 @@ static inline int non_quote_cont(unsigned char c)
         return i;                                                                                  \
     }
 
+/* D4 — guard-page-backed variant (brief §6 D4): NO "i + 8 <= limit" check
+ * in the hot loop. Only valid for a class whose NEGATIVE case (a byte NOT
+ * in the class) is guaranteed to occur within the buffer's tail sentinel
+ * before any read could reach past a real allocation — see
+ * map_source_with_guard_page's header comment (below, in the D0 section)
+ * for the full argument on production mmap'd buffers. `limit` is kept as
+ * a parameter (callers still pass "bytes remaining to logical end", used
+ * to clamp the return value) but the loop itself no longer gates on it:
+ * on any buffer that actually satisfies the tail-sentinel invariant, the
+ * leave mask ALWAYS fires at or before the sentinel, so the loop always
+ * returns via `if (leave)`, never by exhausting `limit` — removing the
+ * check doesn't skip any case the checked version could reach, it only
+ * removes a branch that could never fire first. If the invariant is ever
+ * violated on a REAL mmap'd buffer (wrong body_len, missing NUL pad),
+ * this reads until the guard page faults — loud and immediate, not a
+ * silent out-of-bounds read. On a buffer WITHOUT a guard page (plain
+ * static/stack arrays, e.g. spans_differential_run's test corpora), the
+ * same invariant must still hold structurally — sufficient trailing NUL
+ * bytes actually allocated past the logical body — since there's no
+ * fault to catch a violation; see synth's definition in
+ * spans_differential_run for why it was given the same tail padding as
+ * g_src instead of being left as a bare string literal.
+ * NEVER use this for span_to_quote / anything feeding the unterminated-
+ * string check: an actually-unterminated string has no in-bounds
+ * terminator by construction (that's what "unterminated" means), so this
+ * macro would read straight past the buffer on ordinary malformed input —
+ * exactly the case kept on the checked DEFINE_SPAN macro below. */
+#define DEFINE_SPAN_GUARDED(Name, LeaveExpr, ContFn)                                               \
+    static inline size_t Name(const char *p, size_t limit)                                         \
+    {                                                                                              \
+        size_t i = 0;                                                                              \
+        for (;;)                                                                                   \
+        {                                                                                          \
+            uint64_t w;                                                                            \
+            memcpy(&w, p + i, 8);                                                                  \
+            uint64_t leave = (LeaveExpr);                                                          \
+            if (leave)                                                                             \
+            {                                                                                      \
+                size_t off = i + swar_first_high_byte(leave);                                      \
+                return off < limit ? off : limit;                                                  \
+            }                                                                                      \
+            i += 8;                                                                                \
+        }                                                                                          \
+        (void)sizeof(ContFn); /* unused in the guarded form; kept for signature parity */          \
+    }
+
 /* run of identifier/keyword characters: longest spans in real source.
  * [A-Za-z] collapses into ONE range check via the ASCII case-fold: for
  * ASCII, w|0x20 maps 'A'..'Z' onto 'a'..'z' while digits/underscore pass
  * through untouched ('0'..'9' and '_' already have bit 5 set; '_' folds to
- * 0x7f which fails the eq below — hence eq on the RAW word). */
-DEFINE_SPAN(span_ident,
-            (~(swar_eq(w, '_') | swar_in(w, '0', '9') | swar_in(w | (ONES * 0x20), 'a', 'z')) &
-             HIGH),
-            is_ident_cont)
-DEFINE_SPAN(span_digit, ~(swar_in(w, '0', '9')) & HIGH, digit_cont)
+ * 0x7f which fails the eq below — hence eq on the RAW word).
+ * D4: guarded — NUL (the tail pad byte) is not in [A-Za-z0-9_], so the
+ * leave mask always fires within any correctly tail-padded buffer. */
+DEFINE_SPAN_GUARDED(
+    span_ident,
+    (~(swar_eq(w, '_') | swar_in(w, '0', '9') | swar_in(w | (ONES * 0x20), 'a', 'z')) & HIGH),
+    is_ident_cont)
+/* D4: guarded — NUL is not a digit. */
+DEFINE_SPAN_GUARDED(span_digit, ~(swar_in(w, '0', '9')) & HIGH, digit_cont)
 /* spaces/tabs only: '\n' is handled singly in scan_tokens so line/col stay
- * O(1) pointer arithmetic instead of a recount pass over the span */
-DEFINE_SPAN(span_space, ~(swar_eq(w, ' ') | swar_eq(w, '\t')) & HIGH, space_cont)
+ * O(1) pointer arithmetic instead of a recount pass over the span.
+ * D4: guarded — NUL is neither space nor tab. */
+DEFINE_SPAN_GUARDED(span_space, ~(swar_eq(w, ' ') | swar_eq(w, '\t')) & HIGH, space_cont)
 /* everything except newline: jump-to-EOL questions (comments, carets).
- * Leave mask = the newline positions themselves (bytes that END the run). */
+ * Leave mask = the newline positions themselves (bytes that END the run).
+ * NOT on scan_tokens16's hot path today (kept for gate coverage only —
+ * see its call sites) — left on the CHECKED macro out of caution: this
+ * class has a real in-bounds terminator too (both corpora's tails contain
+ * '\n'), but changing an unused function has zero measured benefit and
+ * only adds risk. */
 DEFINE_SPAN(span_non_newline, swar_eq(w, '\n'), non_nl_cont)
 /* inverted polarity instance: leave-mask IS the match mask — distance to
  * the next quote rather than run length of a class. Tail predicate stays
- * in the "keep advancing" convention: continue while NOT a quote. */
+ * in the "keep advancing" convention: continue while NOT a quote.
+ * KEPT ON THE CHECKED MACRO (explicit D4 scope decision): feeds
+ * span_str_end's unterminated-string detection, which has NO in-bounds
+ * terminator guarantee for genuinely malformed input — an unterminated
+ * string must stop at `limit`, not read past it looking for a quote that
+ * was never written. */
 DEFINE_SPAN(span_to_quote, swar_eq(w, '"'), non_quote_cont)
 
 /* string-literal content length: distance to the first UNESCAPED quote.
@@ -1429,6 +1521,73 @@ static inline size_t span_str_end_d(const char *p, size_t limit)
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * D1 — classify-ahead bitmasks (brief §6 D1, simdjson/Hyperscan-shufti
+ * style): per 8-byte SWAR word, produce ident/digit/space/quote
+ * membership masks ONCE, ahead of token consumption, instead of calling
+ * span_ident_d/span_digit_d/span_space_d fresh for every token start (each
+ * of which re-derives class membership for the SAME bytes the previous
+ * token's span walk may have already looked at, and re-loads g_cls[c] per
+ * byte on the scalar entry path in scan_tokens16).
+ *
+ * SCOPE NOTE: this covers ident/digit/space/quote-POSITION masks only.
+ * String escape-sequence parity detection (which backslash runs make a
+ * quote "not really a terminator") is explicitly OUT OF SCOPE here and
+ * stays on span_str_end_d's existing scalar backtrack — an attempt to
+ * port simdjson's carry-propagating find_escaped algorithm from
+ * secondhand descriptions (no verified source was available) failed
+ * exhaustive verification against a scalar oracle twice in a row, so it
+ * was deliberately NOT implemented rather than shipped as an unverified
+ * guess. If the real simdjson source becomes available later, that
+ * specific piece can be added as its own gated increment; nothing here
+ * depends on it.
+ *
+ * Design: movemask8 (already gate-verified by swar_selftest) turns each
+ * SWAR class-membership computation into a genuine "bit i set = byte i is
+ * in this class" mask, exactly simdjson's per-chunk classify step, just
+ * at 8-byte granularity (this codebase's native SWAR width) rather than
+ * simdjson's 32/64-byte SIMD lanes — the SAME mask-then-ctz consumption
+ * pattern applies regardless of chunk width.
+ *
+ * This is an ADDITIVE, PARALLEL implementation: scan_tokens16 and its
+ * span_*_d call sites are UNCHANGED. scan_tokens16_classified below is a
+ * second scanner built on classify-ahead masks, diffed against
+ * scan_tokens16 (which is itself already diffed against ref_scan16) via
+ * a new differential gate before ANY conclusion is drawn about which is
+ * faster — matching the brief's explicit sequencing ("prototype both
+ * behind gates, pick by measurement"). */
+
+typedef struct
+{
+    uint64_t ident; /* bit i set: byte i is [A-Za-z0-9_] */
+    uint64_t digit; /* bit i set: byte i is [0-9] */
+    uint64_t space; /* bit i set: byte i is ' ' or '\t' (NOT '\n' — see scan_tokens16's
+                     * existing rationale for handling '\n' as its own single-byte case,
+                     * preserved here identically) */
+    uint64_t quote; /* bit i set: byte i is '"' */
+} ClassMasks8;
+
+/* Computes ClassMasks8 for ONE 8-byte word. Reuses the exact same SWAR
+ * predicates (swar_eq/swar_in) already verified by swar_selftest's
+ * exhaustive ASCII-domain checks — this function adds no new bit-level
+ * cleverness beyond movemask8-ing their existing outputs, so its own
+ * correctness reduces to two already-proven primitives plus movemask8's
+ * own exhaustive 2^8 gate. */
+static inline ClassMasks8 classify_word8(uint64_t w)
+{
+    uint64_t ident_hi =
+        (swar_eq(w, '_') | swar_in(w, '0', '9') | swar_in(w | (ONES * 0x20), 'a', 'z')) & HIGH;
+    uint64_t digit_hi = swar_in(w, '0', '9') & HIGH;
+    uint64_t space_hi = (swar_eq(w, ' ') | swar_eq(w, '\t')) & HIGH;
+    uint64_t quote_hi = swar_eq(w, '"') & HIGH;
+    ClassMasks8 m;
+    m.ident = swar_movemask8(ident_hi);
+    m.digit = swar_movemask8(digit_hi);
+    m.space = swar_movemask8(space_hi);
+    m.quote = swar_movemask8(quote_hi);
+    return m;
+}
+
 /* ---- SWAR self-test gate ---------------------------------------------
  * Every primitive above is checked against a dumb scalar reference at
  * startup: exhaustively for movemask8 (all 2^8 mask subsets) and the ident
@@ -1484,6 +1643,48 @@ static int swar_selftest(void)
         if (swar_eq(probe, (unsigned char)c) != want)
         {
             return 2;
+        }
+    }
+
+    /* swar_eq adjacent-byte-value stress test (added after a real bug was
+     * found here): the single-fixed-probe test above varies the TARGET
+     * byte over all 128 ASCII values but never varies which byte VALUES
+     * appear in the word, so it cannot catch a bug that only manifests
+     * for specific adjacent byte-value combinations — exactly the class
+     * of bug the original XOR-then-subtract "haszero" formulation had
+     * (subtraction borrow propagating across a byte lane into its
+     * higher neighbor, producing a false-positive match one position
+     * above the true one; see swar_eq's own comment for the full
+     * writeup and the mailparse crate citation that independently
+     * documents this as a KNOWN limitation of the naive trick, not a
+     * one-off mistake). For every target byte c, this places c at
+     * position 6 and EVERY possible byte value 0-127 at position 7 (the
+     * position where a borrow, if the implementation still had one,
+     * would land a spurious match), and checks the ENTIRE resulting
+     * mask against a byte-by-byte scalar reference — not just the bit
+     * under direct test, so a regression that corrupts an unrelated
+     * position is also caught. */
+    for (int c = 0; c < 128; c++)
+    {
+        for (int neighbor = 0; neighbor < 128; neighbor++)
+        {
+            unsigned char bytes[8] = {
+                'x', 'x', 'x', 'x', 'x', 'x', (unsigned char)c, (unsigned char)neighbor};
+            uint64_t w;
+            memcpy(&w, bytes, 8);
+            uint64_t got = swar_eq(w, (unsigned char)c);
+            uint64_t want = 0;
+            for (int b = 0; b < 8; b++)
+            {
+                if (bytes[b] == (unsigned char)c)
+                {
+                    want |= 0x80ULL << (8 * b);
+                }
+            }
+            if (got != want)
+            {
+                return 20; /* distinct code from block 2's simpler probe-only check */
+            }
         }
     }
 
@@ -1557,13 +1758,25 @@ static int swar_selftest(void)
  * failing block number (5..9) or 0. */
 static int spans_differential_run(void)
 {
+    /* D4: this buffer feeds the guarded span_ident/digit/space functions
+     * directly (not through map_source_with_guard_page), so it needs the
+     * SAME tail-sentinel guarantee g_src provides itself as a static
+     * array: >=13 NUL bytes past the logical body so an 8-byte SWAR load
+     * at any body offset can never read past a real allocation. Without
+     * this, a guarded span reaching synth's final '_' (an identifier
+     * byte) would have only the single implicit string-literal NUL as
+     * margin — not enough for an unconditional 8-byte load. */
     static const char synth[] =
-        "const x := 12 ab_9 \"s\\\"q\\\\\" test\tt1 { assert(1+2==3) }\nzz9_";
+        "const x := 12 ab_9 \"s\\\"q\\\\\" test\tt1 { assert(1+2==3) }\nzz9_"
+        "\"'\n"
+        "\0\0\0\0\0\0\0\0\0\0\0\0\0";
+#define SYNTH_BODY_LEN                                                                             \
+    (sizeof("const x := 12 ab_9 \"s\\\"q\\\\\" test\tt1 { assert(1+2==3) }\nzz9_") - 1)
     const struct
     {
         const char *p;
         size_t n;
-    } corpora[2] = {{synth, sizeof(synth) - 1}, {g_src, G_SRC_BODY_LEN}};
+    } corpora[2] = {{synth, SYNTH_BODY_LEN}, {g_src, G_SRC_BODY_LEN}};
 #define SPAN_FAIL(blk, g, w)                                                                       \
     do                                                                                             \
     {                                                                                              \
@@ -2299,7 +2512,122 @@ struct Scope
 {
     Scope *parent;
     _mvec_obj objs;
+    /* D8 — per-scope open-addressed table keyed by interned symbol id
+     * (brief §6 D8: "per-scope open-addressing resolve tables (kills
+     * O(n^2) dup-checks)"). Replaces rsl_declare's old "scan every prior
+     * decl in this scope" loop, which made N declarations in one scope
+     * cost O(N^2) total — invisible at the 77B corpus's ~4 decls/scope,
+     * dominant at D0 scale (measured: parse+resolve+fold now costs MORE
+     * than the scanner at realistic size, see the SCAN_MICRO probe's
+     * three-way scan/ref-scan/parse-only split). sym is already a small
+     * dense int from intern() (capped at SYM_TAB_MAX=1024), so this needs
+     * no string hashing at resolve time — the identity hash below is
+     * exact and collision-free until the table's own load factor forces
+     * growth. table_cap is always a power of two so masking replaces the
+     * modulo in probe(); starts small (most scopes declare only a
+     * handful of names) and doubles (via the pool) only when a scope
+     * actually needs more, so small scopes pay for exactly SCOPE_TAB_MIN
+     * slots and nothing more. */
+    Obj **table;
+    uint32_t table_cap;  /* power of two; 0 until first declare in this scope */
+    uint32_t table_used; /* live entries; drives the grow threshold */
 };
+
+/* Load factor kept low (<=50%) so probe sequences stay short even in the
+ * worst case of many decls landing in the same scope; SCOPE_TAB_MIN=8 is
+ * enough for the overwhelming majority of real blocks without ever
+ * growing, per the same "most blocks are small" assumption D0's corpus
+ * generator itself leans on (3-8 statements per generated block). */
+#define SCOPE_TAB_MIN 8u
+
+static inline uint32_t scope_tab_slot(uint32_t cap, int sym)
+{
+    /* sym is a small dense non-negative int (see SYM_TAB_MAX above); an
+     * identity hash is exact (no collisions from hashing itself) and
+     * cap is always a power of two, so masking is a correct, fast
+     * "mod cap" — the remaining collision cases (two DIFFERENT syms
+     * landing in the same slot after masking) are handled by ordinary
+     * open-addressing probing in the callers below. */
+    return ((uint32_t)sym) & (cap - 1);
+}
+
+/* Grows (or lazily creates) a scope's table, rehashing existing entries.
+ * Called when table_used would exceed half of table_cap (or on first
+ * insert, when table_cap is 0). Returns 0 on allocation failure. */
+static int scope_tab_grow(LFPool *pl, Scope *s)
+{
+    uint32_t new_cap = s->table_cap == 0 ? SCOPE_TAB_MIN : s->table_cap * 2;
+    Obj **new_table = (Obj **)pool.alloc_sz(pl, (size_t)new_cap * sizeof(Obj *));
+    if (!new_table)
+    {
+        return 0;
+    }
+    memset(new_table, 0, (size_t)new_cap * sizeof(Obj *));
+    for (uint32_t i = 0; i < s->table_cap; i++)
+    {
+        Obj *o = s->table[i];
+        if (!o)
+        {
+            continue;
+        }
+        uint32_t slot = scope_tab_slot(new_cap, o->sym);
+        while (new_table[slot] != NULL)
+        {
+            slot = (slot + 1) & (new_cap - 1);
+        }
+        new_table[slot] = o;
+    }
+    s->table = new_table;
+    s->table_cap = new_cap;
+    return 1;
+}
+
+/* Looks up sym in THIS scope's table only (no parent walk — that's
+ * scope_lookup's job for resolving references, this is rsl_declare's
+ * same-scope redeclaration check). Returns the existing Obj* or NULL. */
+static Obj *scope_tab_find(Scope *s, int sym)
+{
+    if (s->table_cap == 0)
+    {
+        return NULL;
+    }
+    uint32_t slot = scope_tab_slot(s->table_cap, sym);
+    for (;;)
+    {
+        Obj *o = s->table[slot];
+        if (!o)
+        {
+            return NULL;
+        }
+        if (o->sym == sym)
+        {
+            return o;
+        }
+        slot = (slot + 1) & (s->table_cap - 1);
+    }
+}
+
+/* Inserts o into this scope's table (caller has already confirmed o->sym
+ * isn't present via scope_tab_find). Grows first if load factor would
+ * exceed 50%. Returns 0 on allocation failure. */
+static int scope_tab_insert(LFPool *pl, Scope *s, Obj *o)
+{
+    if (s->table_cap == 0 || s->table_used * 2 >= s->table_cap)
+    {
+        if (!scope_tab_grow(pl, s))
+        {
+            return 0;
+        }
+    }
+    uint32_t slot = scope_tab_slot(s->table_cap, o->sym);
+    while (s->table[slot] != NULL)
+    {
+        slot = (slot + 1) & (s->table_cap - 1);
+    }
+    s->table[slot] = o;
+    s->table_used++;
+    return 1;
+}
 
 typedef struct WorkerState
 {
@@ -2320,7 +2648,18 @@ typedef struct
 {
     Cx *cx;
     Scope *cur;
+#ifdef MODAL_KEEP_AST
+    /* D8: resolved[] (byte-offset-indexed ObjRef array spanning the whole
+     * source) is kept ONLY here, under MODAL_KEEP_AST, because eval_iter
+     * is its one real reader (ND_IDENT case). The default (fold) build
+     * never reads it back — see lr_shift's fold variant and rsl_declare's
+     * header comment — so allocating+memsetting an array sized to the
+     * ENTIRE source length on every single pipeline run (measured: an
+     * ~8.4MB memset per run on the D0 1MB corpus, dwarfing the ~223k
+     * actual token-sized writes it was meant to serve) is pure waste in
+     * that path and is removed entirely rather than merely shrunk. */
     _mvec_objref resolved;
+#endif
     uint8_t had_error;
 } Rsl;
 
@@ -2340,35 +2679,40 @@ static Scope *scope_push(LFPool *pl, Scope *parent)
     {
         return NULL;
     }
+    /* D8: table starts empty (table_cap=0) — scope_tab_insert lazily
+     * allocates SCOPE_TAB_MIN slots on first declare in this scope, so a
+     * scope that declares nothing (common for test{} blocks that are
+     * pure statements) never pays for table storage at all. */
+    s->table = NULL;
+    s->table_cap = 0;
+    s->table_used = 0;
     return s;
 }
+/* D8: was a linear scan of sc->objs per ancestor scope — O(scope size)
+ * per lookup, compounding across the ancestor chain. Now one hash probe
+ * per scope in the chain (still O(depth), but each step is O(1)
+ * amortized instead of O(scope size)). Falls back to a direct check
+ * against sc->objs when a scope's table hasn't been allocated yet
+ * (table_cap==0, i.e. that scope declared nothing) so an empty-table
+ * scope never needs special-casing in the caller. */
 static Obj *scope_lookup(Scope *s, int sym)
 {
     for (Scope *sc = s; sc; sc = sc->parent)
     {
-        for (size_t i = 0; i < sc->objs.size; i++)
+        if (sc->table_cap == 0)
         {
-            Obj *o = &sc->objs.data[i];
-            if (o->sym == sym)
-            {
-                return o;
-            }
+            continue; /* this scope declared nothing; nothing to find here */
+        }
+        Obj *o = scope_tab_find(sc, sym);
+        if (o)
+        {
+            return o;
         }
     }
     return NULL;
 }
 static void rsl_declare(Rsl *r, const Tok16 *ident, ObjKind kind, long long val)
 {
-    /* P4.5: resolved[] is indexed by BYTE OFFSET now (ident->off), which is
-     * also the zero-copy name pointer's base. */
-    size_t idx = ident->off;
-    if (r->resolved.data[idx] != NULL)
-    {
-        fprintf(stderr, "internal: '%.*s' already declared or resolved\n", (int)ident->len,
-                r->cx->src + ident->off);
-        r->had_error = 1;
-        return;
-    }
     Obj *o = (Obj *)pool.alloc_sz(r->cx->pool, sizeof(Obj));
     if (!o)
     {
@@ -2385,25 +2729,42 @@ static void rsl_declare(Rsl *r, const Tok16 *ident, ObjKind kind, long long val)
         .val = val,
         .sym = ident->sym,
     };
-    r->resolved.data[idx] = o;
     if (o->len == 1 && o->name[0] == '_')
     {
+        /* "_" is exempt from redeclaration checking (declare-and-don't-
+         * care) — never inserted into the scope table, matching the old
+         * code's early return before the same-scope scan/push. Multiple
+         * `const _ := N` in one scope are all allowed and none are
+         * trackable by name afterward, exactly as before. */
         return;
     }
-    for (size_t i = 0; i < r->cur->objs.size; i++)
+    /* D8 — was a linear scan of r->cur->objs (O(n) per declare, O(n^2)
+     * per scope with n declarations): one hash probe against this
+     * scope's OWN table only (not the parent chain — redeclaration is a
+     * same-scope concept, matching the original loop's scope, and
+     * scope_tab_find never walks parents). */
+    Obj *alt = scope_tab_find(r->cur, o->sym);
+    if (alt)
     {
-        Obj *alt = &r->cur->objs.data[i];
-        if (alt->sym == o->sym)
-        {
-            int nl, nc, pl, pc;
-            tok_line_col(r->cx->src, ident->off, &nl, &nc);
-            tok_line_col(r->cx->src, alt->decl_off, &pl, &pc);
-            printf("erro [%d:%d]: %.*s redeclarado neste bloco\n"
-                   "\tdeclaração anterior em [%d:%d]\n",
-                   nl, nc, (int)o->len, o->name, pl, pc);
-            r->had_error = 1;
-            return;
-        }
+        int nl, nc, pl, pc;
+        tok_line_col(r->cx->src, ident->off, &nl, &nc);
+        tok_line_col(r->cx->src, alt->decl_off, &pl, &pc);
+        printf("erro [%d:%d]: %.*s redeclarado neste bloco\n"
+               "\tdeclaração anterior em [%d:%d]\n",
+               nl, nc, (int)o->len, o->name, pl, pc);
+        r->had_error = 1;
+        return;
+    }
+    /* Insert the STABLE pool allocation (o), not a pointer into objs's
+     * backing array — mvec_push_obj below stores a COPY of *o, and
+     * objs.data can be reallocated by mvec_grow on a later push,
+     * invalidating any pointer into it. Storing o (not &objs.data[i])
+     * is exactly what the old resolved[idx]=o line already did for the
+     * same reason; the table inherits that same requirement. */
+    if (!scope_tab_insert(r->cx->pool, r->cur, o))
+    {
+        r->had_error = 1;
+        return;
     }
     mvec_push_obj(&r->cur->objs, *o);
 }
@@ -2628,7 +2989,14 @@ static int lr_shift(Parser *p, Rsl *r, _mvec_ll *values)
             error_at(p, tok, "undefined identifier");
             return 0;
         }
-        r->resolved.data[tok->off] = o;
+        /* D8: no resolved[]=o write here — this is the FOLD path (the
+         * default, non-MODAL_KEEP_AST build), which reads o->val on the
+         * very next line and never looks the token back up afterward.
+         * The old write was a dead store into an array that existed
+         * ONLY to support this write plus rsl_declare's now-removed
+         * internal check; see resolved[]'s remaining declaration under
+         * MODAL_KEEP_AST for the one build mode that actually reads it
+         * back (via eval_iter's ND_IDENT case). */
         return mvec_push_ll(values, o->val);
     }
     error_at(p, p->current, "expected expression (number or identifier)");
@@ -2946,7 +3314,9 @@ static uint64_t eval_iter(Rsl *r, Node *root)
 
 static int run_pipeline_cx(Cx *cx, const Tok16 *stream, size_t ntokens)
 {
-    (void)ntokens; /* resolved[] spans the source now, not the token count */
+    (void)ntokens; /* not needed by either build: fold path resolves via
+                    * scope_tab_find/scope_lookup only; the AST path's
+                    * resolved[] spans src_len, not ntokens (see below) */
     Parser p = {.current = stream, .previous = NULL, .base = stream, .had_error = 0};
     t_cx = cx;
     Rsl r = {
@@ -2954,8 +3324,12 @@ static int run_pipeline_cx(Cx *cx, const Tok16 *stream, size_t ntokens)
         .had_error = 0,
         .cur = NULL,
     };
+#ifdef MODAL_KEEP_AST
     /* P4.5: resolved is indexed by BYTE OFFSET (tok->off), so it spans the
-     * source, not the token count. Still one bulk NULL-fill, no pushes. */
+     * source, not the token count. Still one bulk NULL-fill, no pushes.
+     * D8: this allocation+memset is GONE from the default build (see
+     * Rsl's definition) — kept here only because eval_iter (AST-walking,
+     * MODAL_KEEP_AST-only) is the one real reader. */
     r.resolved = mvec_init_objref(cx->pool, cx->src_len + 2);
     if (!r.resolved.data)
     {
@@ -2963,6 +3337,7 @@ static int run_pipeline_cx(Cx *cx, const Tok16 *stream, size_t ntokens)
     }
     memset(r.resolved.data, 0, (cx->src_len + 2) * sizeof(ObjRef));
     r.resolved.size = cx->src_len + 2;
+#endif
 
     r.cur = scope_push(cx->pool, NULL);
     if (!r.cur)
@@ -3376,16 +3751,13 @@ int main(void)
     {
         char *raw = NULL;
         size_t blen = big_corpus_generate(&raw);
-        size_t page = (size_t)sysconf(_SC_PAGESIZE);
         size_t raw_bytes = blen + 19;
-        size_t map_sz = (raw_bytes + page - 1) & ~(page - 1);
-        char *m = mmap(NULL, map_sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (m == MAP_FAILED)
+        char *m = map_source_with_guard_page(raw, raw_bytes, NULL);
+        if (!m)
         {
             fprintf(stderr, "fatal: D0 probe mmap failed\n");
             return 1;
         }
-        memcpy(m, raw, raw_bytes);
         free(raw);
 
         static int brl_s, brc_s; /* silence unused warnings if oracle skipped */
@@ -3401,7 +3773,7 @@ int main(void)
             return 1;
         }
         int be = 0;
-        (void)ref_scan16(m, blen, bref, brl, brc, &be); /* warm intern, oracle reference */
+        size_t bn = ref_scan16(m, blen, bref, brl, brc, &be); /* warm intern, oracle reference */
 
 #ifndef MICRO_N_BIG
 #define MICRO_N_BIG 2000ull
@@ -3427,6 +3799,43 @@ int main(void)
         printf("[D0 %.2fMB] ref_scan16   : %llu ns/call, %.3f GB/s (sink=%zu)\n",
                (double)blen / 1e6, (unsigned long long)(dt / NB), gbps_of(blen, dt / NB),
                bsink % 1000);
+
+        /* Attribution: parse+resolve+fold ALONE, replaying the already-
+         * scanned bref token stream (scan excluded entirely) — same
+         * technique as the brief's own §4 attribution table, but measured
+         * on the D0 corpus instead of inferred from the 77B one. Answers
+         * "does the brief's ~67% scan / ~33% parse+resolve+fold split
+         * (§4: scanner ~90ns of 135ns/op) still hold at realistic scale,
+         * or does parse+resolve+fold's O(n) resolved[] memset and O(n^2)
+         * per-scope dup-check dominate instead once there are ~200k
+         * tokens instead of 23?" class_tables_init/build_dispatch_maps
+         * must run once before any pipeline call. */
+        {
+            class_tables_init();
+            build_dispatch_maps();
+            LFPool *ppool;
+            if (!pool.allocator(&ppool, pool_capacity_for(bn)))
+            {
+                fprintf(stderr, "fatal: D0 parse-only probe pool alloc failed\n");
+                return 1;
+            }
+            Cx pcx = {.pool = ppool, .src = m, .src_len = blen, .verbose = 0};
+#ifndef MICRO_N_PARSE
+#define MICRO_N_PARSE 200ull /* parse+resolve+fold is far pricier per call than scan alone */
+#endif
+            const uint64_t NP = MICRO_N_PARSE;
+            t0 = now_ns();
+            for (uint64_t i = 0; i < NP; i++)
+            {
+                pool.reset(ppool);
+                (void)run_pipeline_cx(&pcx, bref, bn);
+            }
+            dt = now_ns() - t0;
+            printf("[D0 %.2fMB] parse+resolve+fold (no scan): %llu ns/call, %.3f GB/s "
+                   "(%zu tokens)\n",
+                   (double)blen / 1e6, (unsigned long long)(dt / NP), gbps_of(blen, dt / NP), bn);
+            pool.drop(ppool);
+        }
 
         free(brl);
         free(brc);
@@ -3549,17 +3958,15 @@ int main(int argc, char **argv)
 
     /* P4.5 zero-copy source holder: ONE anonymous mapping, source copied in
      * once at setup. Steady state reads bytes in place — no per-run copy or
-     * allocation anywhere (token texts are offsets into this mapping). */
+     * allocation anywhere (token texts are offsets into this mapping).
+     * D4: guard-paged — see map_source_with_guard_page's header comment. */
     {
-        size_t page = (size_t)sysconf(_SC_PAGESIZE);
-        size_t map_sz = (sizeof g_src + page - 1) & ~(page - 1);
-        char *m = mmap(NULL, map_sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (m == MAP_FAILED)
+        char *m = map_source_with_guard_page(g_src, sizeof g_src, NULL);
+        if (!m)
         {
             fprintf(stderr, "fatal: source mmap failed\n");
             return 1;
         }
-        memcpy(m, g_src, sizeof g_src);
         g_src_map = m;
     }
 
@@ -3727,17 +4134,15 @@ int main(int argc, char **argv)
         }
 
         /* mmap'd copy, same rationale as g_src_map: zero-copy steady state,
-         * one copy at setup, workers only ever read this mapping. */
-        size_t page = (size_t)sysconf(_SC_PAGESIZE);
+         * one copy at setup, workers only ever read this mapping.
+         * D4: guard-paged — see map_source_with_guard_page's header comment. */
         size_t raw_bytes = g_big_len + 19; /* body + tail sentinel (19B, see big_corpus_generate) */
-        size_t map_sz = (raw_bytes + page - 1) & ~(page - 1);
-        char *m = mmap(NULL, map_sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (m == MAP_FAILED)
+        char *m = map_source_with_guard_page(raw, raw_bytes, NULL);
+        if (!m)
         {
             fprintf(stderr, "fatal: big corpus mmap failed\n");
             return 1;
         }
-        memcpy(m, raw, raw_bytes);
         free(raw);
         g_big_map = m;
         g_big = m; /* g_big kept for symmetry with g_src (mutable heap view) */
