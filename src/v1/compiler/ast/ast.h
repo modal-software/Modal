@@ -42,11 +42,12 @@ typedef enum
     AST_UNARY_OP,
     AST_PAREN_GROUP,
     AST_BLOCK,
+    AST_EXPR,
     AST_TEST_STMT,
     AST_ASSERT_STMT,
     AST_WRITE_STMT,
     AST_STRING_LIT,
-    AST_ASSIGN_STMT,
+    AST_DEFINE_EXPR,
 } AstNodeKind;
 
 typedef enum
@@ -88,9 +89,9 @@ typedef struct AstNode
 
         struct
         {
-            Kind op;
             size_t op_len;
 
+            Kind op;
             struct AstNode *lhs;
             struct AstNode *rhs;
         } expr;
@@ -132,13 +133,6 @@ typedef struct AstNode
 } AstNode;
 
 MVEC_IMPL(ast, AstNode)
-static const _mvec_constructor_ast astvec = {
-    .init = mvec_init_ast,
-    .push = mvec_push_ast,
-    .free = mvec_free_ast,
-    .pop = mvec_pop_ast,
-    .release = mvec_release_ast,
-};
 
 // Iterate over children of a BLOCK or PAREN_GROUP node.
 // Usage: AST_EACH(block_node, child) { /* use child */ }
@@ -156,9 +150,10 @@ typedef struct
     AstNode *(*block)(Token open_brace, AstNode **stmts, size_t count);
     AstNode *(*test)(Token token, AstNode *block);
     AstNode *(*write)(AstNode *n, Fmt fmt);
-    AstNode *(*assert)(AstNode *expr);
+    AstNode *(*assertFn)(AstNode *expr);
     AstNode *(*number)(Token tok, long long val);
-    AstNode *(*expr)(Token tok, AstNode *lhs, AstNode *rhs);
+    AstNode *(*expr)(Token tok, AstNode *lhs, AstNode *rhs, TokenKind op);
+    AstNode *(*define)(Token tok, AstNode *lhs, AstNode *rhs);
 } AstConstructor;
 
 typedef struct
