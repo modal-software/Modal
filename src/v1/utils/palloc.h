@@ -6,154 +6,130 @@
 #include <stdio.h>
 #include <stdlib.h>
 #define CHUNK_SZ 64
-#define TRACING 0
+#define RUNS_DEFAULT 1000000000ull
+#define BATCH_ROUNDS_DEFAULT 4096ull
 
 typedef union Chunk Chunk;
-
 union Chunk
 {
-    Chunk *next;
+    Chunk *next; /* unused; kept for layout compat */
     uint8_t buffer[CHUNK_SZ];
 };
 
-typedef struct _pool_context
+typedef struct
 {
-    uint32_t capacity;
-    void *obj;
-} PoolCX;
+    void *slab_obj;
+    Chunk *cursor;
+    Chunk *head;
+    size_t capacity;
+} LFPool;
 
 static inline void *align_backward(void *ptr, size_t align)
 {
-    if (TRACING == 1)
-    {
-        printf("ptr: %p\n", ptr);
-        printf("align: %zu\n", align);
-    }
     return (void *)((uintptr_t)ptr & ~(align - 1));
 }
 
-typedef struct
+static inline void *align_forward(void *ptr, size_t align)
 {
-    // Head start of pool
-    Chunk *head;
-    Chunk *slot;
-
-    // Object-context ref;
-    PoolCX cx;
-} Pool;
+    uintptr_t p = (uintptr_t)ptr;
+    return (void *)((p + (align - 1)) & ~(uintptr_t)(align - 1));
+}
 
 typedef struct
 {
-    Pool *(*allocator)(size_t amount);
-    void *(*alloc)(Pool *pool);
+    int (*allocator)(LFPool **out, size_t capacity);
+    void *(*alloc)(LFPool *pool);
+    void *(*alloc_sz)(LFPool *pool, size_t sz);
+    void (*reset)(LFPool *pool);
+    void (*drop)(LFPool *p);
+} LFPoolInterface;
 
-    void (*free)(Pool *pool, void **ptr);
-    void (*drop)(Pool *pool);
-    void (*reset)(Pool *self);
-} PAllocatorConstrutor;
-
-static Pool *pool_init(size_t amount)
+static inline int lfp_init(LFPool **out, size_t capacity)
 {
-    Pool *pool = (Pool *)malloc(sizeof(Pool));
-    if (pool == NULL)
+    LFPool *p = (LFPool *)malloc(sizeof(LFPool));
+    if (!p)
     {
-        return NULL;
+        return 0;
     }
-    size_t raw = (amount * sizeof(Chunk)) + (CHUNK_SZ - 1);
-    pool->cx.obj = malloc(raw);
-
-    if (pool->cx.obj == NULL)
+    size_t raw = (capacity * sizeof(Chunk)) + (CHUNK_SZ - 1);
+    void *slab = malloc(raw);
+    if (!slab)
     {
-        free(pool);
-        return NULL;
+        return 0;
     }
-    pool->slot = (Chunk *)align_backward(pool->cx.obj, CHUNK_SZ);
-
-    for (size_t i = 0; i < amount - 1; i++)
-    {
-        pool->slot[i].next = &pool->slot[i + 1];
-    }
-
-    pool->slot[amount - 1].next = NULL;
-    pool->head = pool->slot;
-
-    if (TRACING == 1)
-    {
-        printf("Pool created! %zu chunks de %d bytes cada (total ~%.1f KB)\n", amount, CHUNK_SZ,
-               (amount * sizeof(Chunk)) / 1024.0);
-    }
-
-    return pool;
+    p->slab_obj = slab;
+    /* Align FORWARD: glibc can return 32-byte-aligned slabs for this size
+     * class, and aligning backward would put the cursor before the block,
+     * corrupting the previous chunk's header. The +63 over-allocation makes
+     * room so all `capacity` chunks still fit above the aligned base. */
+    p->cursor = (Chunk *)align_forward(slab, CHUNK_SZ);
+    p->capacity = capacity;
+    p->head = p->cursor;
+    *out = p;
+    return 1;
 }
-
-static void *pool_alloc(Pool *self)
+static inline void lfp_reset(LFPool *p)
 {
-    if (self == NULL || self->head == NULL)
-    {
-        fprintf(stderr, "fatal: pool ran out of memory\n[Process exited %d]\n", EXIT_FAILURE);
-        return NULL;
-    }
-
-    Chunk *chunk = self->head;
-    self->head = chunk->next;
-
-    if (TRACING == 1)
-    {
-        printf("allocated {\n  addr: %p\n}\n", (void *)chunk);
-    }
-    return chunk->buffer;
-}
-
-static void pool_reset(Pool *self)
-{
-    if (self == NULL)
+    if (!p)
     {
         return;
     }
-
-    self->head = self->slot;
+    p->head = p->cursor;
 }
 
-static void pool_free(Pool *self, void **ptr)
+static inline void lfp_drop(LFPool *self)
 {
-    if (self == NULL || ptr == NULL || *ptr == NULL)
+    if (!self)
     {
-        fprintf(stderr, "fatal: no object available to free\n[Process exited %d]\n", EXIT_FAILURE);
         return;
     }
-
-    Chunk *chunk = (Chunk *)*ptr;
-
-    chunk->next = self->head;
-    self->head = chunk;
-
-    *ptr = NULL;
-    if (TRACING == 1)
+    if (self->slab_obj)
     {
-        printf("freed amount: %p\n", ptr);
+        free(self->slab_obj);
+        self->slab_obj = NULL;
     }
-}
-
-static void pool_drop(Pool *self)
-{
-    if (!self || self == NULL)
-    {
-        fprintf(stderr, "fatal: no pool to drop\n[Process exited %d]\n", EXIT_FAILURE);
-        return;
-    }
-
-    free(self->cx.obj);
+    self->cursor = NULL;
+    self->head = NULL;
+    self->capacity = 0;
     free(self);
-    if (TRACING == 1)
-    {
-        printf("Pool destroyed!\n");
-    }
 }
 
-#define FOO_DEFAULTS                                                                               \
-    .allocator = pool_init, .alloc = pool_alloc, .free = pool_free, .drop = pool_drop,             \
-    .reset = pool_reset,
+static inline void *lfp_alloc_sz(LFPool *self, size_t sz)
+{
+    if (!self || !self->cursor)
+    {
+        return NULL;
+    }
+    size_t need = (sz + (CHUNK_SZ - 1)) / CHUNK_SZ;
+    if (need == 0)
+    {
+        need = 1;
+    }
+    Chunk *old = self->head;
 
-const PAllocatorConstrutor pool = {FOO_DEFAULTS};
+    size_t used = (size_t)(old - self->cursor);
+    if (used + need > self->capacity)
+    {
+        fprintf(stderr, "fatal: pool ran out of memory\n");
+        return NULL;
+    }
+    self->head = old + need;
+    return old->buffer;
+}
+
+static inline void *lfp_alloc(LFPool *self)
+{
+    return lfp_alloc_sz(self, CHUNK_SZ);
+}
+
+#define POOL_DEFAULTS                                                                              \
+    .allocator = lfp_init, .alloc = lfp_alloc, .alloc_sz = lfp_alloc_sz, .drop = lfp_drop,         \
+    .reset = lfp_reset
+
+#ifdef PALLOC_IMPLEMENTATION
+const LFPoolInterface *pool = &(LFPoolInterface){POOL_DEFAULTS};
+#else
+extern const LFPoolInterface *pool;
+#endif
 
 #endif // PALLOCATOR_H
