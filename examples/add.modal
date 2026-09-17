@@ -1,1 +1,4 @@
 asdasd := aa
+write("aa")
+
+test "aaa" {}

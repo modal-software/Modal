@@ -15,11 +15,11 @@ uint32_t hash(char *str)
     {
         hash = ((hash << 5) + hash) + c; /* hash * 33 + c */
     }
-    // TODO: fix this magic number later
+    // TODO: fix this magic number later (1024)
     return hash % 1024;
 }
 
-// static void var_decl(AstNode *expr);
+static void declare(AstNode *expr);
 static inline AstNode *parse_primary(Parser *p)
 {
     if (parser_match(p, NUMBER))
@@ -40,35 +40,32 @@ static inline AstNode *parse_primary(Parser *p)
     {
         Token tok = p->previous;
 
-        // char buffer[tok.len + 1];
-        // snprintf(buffer, sizeof(buffer), "%.*s", tok.len, tok.start);
-        //
-        // const char *ident = pool->alloc_sz(cx.pool, tok.len + 1);
-        // ident = buffer;
+        char buffer[tok.len + 1];
+        snprintf(buffer, sizeof(buffer), "%.*s", tok.len, tok.start);
+
+        const char *ident = buffer;
 
         if (parser_match(p, TOK_DEFINE))
         {
-            //     Token t = p->current;
-            //
-            //     AstNode *lhs = ast.new.ident(t);
-            //     lhs->data.ident.name = tok.start;
-            //     lhs->data.ident.len = tok.len;
-            //
-            //     AstNode *rhs = ast.new.ident(t);
-            //     AstNode *define = ast.new.define(t, lhs, rhs);
-            //     printf("%s %s", tok.start, ident);
-            //     // ast.print(expr);
-            //
-            //     // var_decl(expr);
-            //
-            //     return define;
+            Token t = p->current;
+
+            AstNode *lhs = ast.new.ident(t);
+            lhs->data.ident.name = ident;
+            lhs->data.ident.len = tok.len;
+
+            AstNode *rhs = ast.new.ident(t);
+            AstNode *define = ast.new.define(t, lhs, rhs);
+
+            declare(define);
+
+            return define;
         }
 
-        // if (parser_match(p, TOK_EQ))
-        // {
-        //     printf("%s", ident);
-        //     return ast.new.ident(p->previous);
-        // }
+        if (parser_match(p, TOK_EQ))
+        {
+            printf("%s", ident);
+            return ast.new.ident(p->previous);
+        }
         return ast.new.ident(p->previous);
     }
 
@@ -93,11 +90,25 @@ static inline AstNode *parse_primary(Parser *p)
     return NULL;
 }
 
-// static void var_decl(AstNode *expr)
-// {
-//     int n = 0;
-//     // printf
-// }
+static void declare(AstNode *expr)
+{
+    assert(expr);
+
+    switch (expr->kind)
+    {
+    case AST_DEFINE_EXPR:
+    {
+        printf("%s %s", expr->data.expr.lhs->data.ident.name, expr->data.expr.rhs->data.ident.name);
+    }
+    // Validate DECLARATION (PREFIX_HASH)
+    // I.e V_1
+    // I.e F_123
+    // if (sym.id)
+    // printf
+    default:
+        break;
+    }
+}
 
 AstNode *parse_expression(Parser *p)
 {

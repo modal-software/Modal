@@ -53,6 +53,7 @@ int main(int argc, char **argv)
     parser_init(&parser, &lexer, argv[1]);
 
     AstNode *root = parse_program(&parser);
+    printf("%i", root->kind);
 
     if (parser.had_error)
     {

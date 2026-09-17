@@ -58,7 +58,7 @@ static void printer(AstNode *tree)
     case AST_EXPR:
     {
         printf("\n\nAST_EXPR:\n     \tdata:\n\t     --\tnode: "
-               "ASSIGN_STMT\n\t     --\tlhs_len: "
+               "DEFINE\n\t     --\tlhs_len: "
                "%zu\n\t     --\tlhs_value: %.*s\n",
                tree->data.expr.lhs->data.ident.len, (int)tree->data.expr.lhs->data.ident.len,
                tree->data.expr.lhs->data.ident.name);
@@ -339,17 +339,15 @@ static void ast_free(struct AstNode *node)
         ast_free(node->data.unary.expr);
         break;
     case AST_EXPR:
-        pool->drop(cx.pool);
+        ast_free(node->data.expr.lhs);
+        ast_free(node->data.expr.rhs);
         break;
     case AST_IDENT:
     case AST_STRING_LIT:
-        ast_free(node);
-        break;
     default:
         break;
     }
     free(node);
-    pool->drop(cx.pool);
 }
 
 const AstImpl ast = (AstImpl){
