@@ -1,4 +1,1 @@
-asdasd := aa
-write("aa")
-
-test "aaa" {}
+write("aatest")

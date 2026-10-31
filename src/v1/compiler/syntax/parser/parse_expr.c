@@ -41,7 +41,7 @@ static inline AstNode *parse_primary(Parser *p)
         Token tok = p->previous;
 
         char buffer[tok.len + 1];
-        snprintf(buffer, sizeof(buffer), "%.*s", tok.len, tok.start);
+        sprintf(buffer, "%.*s", tok.len, tok.start);
 
         const char *ident = buffer;
 
