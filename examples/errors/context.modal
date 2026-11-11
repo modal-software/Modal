@@ -1,0 +1,13 @@
+arena: struct { u64 used }
+f(u8: u8): u8 {
+    return u8
+}
+needs(arena: arena) {
+}
+set(arena: arena, other: arena) {
+    arena = other
+}
+main(): u8 {
+    needs()
+    return f(3)
+}

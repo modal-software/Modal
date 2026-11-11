@@ -1,0 +1,21 @@
+-- function literals: `name := (params) T { ... }` inside a body is a function of its own,
+-- named by its binding and checked like any other. A closure is not supported yet.
+print := import("std").io.print
+
+apply(n: u8): u8 {
+    sq := (x: u8) u8 {
+        return x * x
+    }
+    inc := (x, by: u8) u8 {
+        return x + by
+    }
+    return inc(sq(n), 1)
+}
+
+main(): u8 {
+    twice := (x: u64) u64 {
+        return x * 2
+    }
+    print("apply", apply(5), "twice", twice(21))
+    return apply(3)
+}
