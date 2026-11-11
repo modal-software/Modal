@@ -1,18 +1,19 @@
 -- entry point, in the root domain: it sees `example` only through example/mod.modal
 
 -- the three import spellings
-can_import_directly_the_module := import("./example")
-or_can_import_directly_the_file := import("john.modal")
+example := import("./example")
+can_import_directly_the_module := import(example)
+or_can_import_directly_the_file := import("./example/john.modal")
 
 -- selectors, wildcard, destructuring, aliases
-john_class := import("john").john_nested_class
+john_class := import("./example").john.john_nested_class
 io := import("std").io.*
 file_and_print := import("std").io.(file, print)
 
 val (
     new as make_john,
     add_normal as add
-): import("john").john_nested_class
+): import("./example").john.john_nested_class
 
 import("std").io.(
     file as fake_get_filename_function,

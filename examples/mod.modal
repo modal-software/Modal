@@ -6,7 +6,3 @@ nil_return := true
 version := "0.1.0"
 
 john := import("./john")
-
-init := (self) {
-    return self
-}

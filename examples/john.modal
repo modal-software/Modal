@@ -33,7 +33,7 @@ add_normal(self: john_nested_class, n3: u8): u8 {
 u8 add_oneline(self: john_nested_class, n3: u8): self.n1 + self.n2 + n3;
 u8 add_oneline(self: john_nested_class, n3, n4: u8): self.n1 + self.n2 + n3 + n4
 
-multiply(self: john_nested_class): u8 {
+multiply(self: john_nested_class) u8 {
     return self.n1 * self.n2
 }
 
