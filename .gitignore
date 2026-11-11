@@ -3,3 +3,4 @@
 *.d
 *.exe
 .modal-cache/
+src/v2/tools/stencilgen
