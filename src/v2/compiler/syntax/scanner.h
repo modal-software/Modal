@@ -1,7 +1,7 @@
 // scanner.h (v2): flat, zero-copy token stream.
 //
 // Tokens are slices into the source buffer (start + len). The whole file is scanned once into
-// one contiguous array, sized exactly, that ends with a TOK_EOF sentinel, so the parser walks it
+// one contiguous array that ends with a TOK_EOF sentinel, so the parser walks it
 // with a plain pointer and can look ahead with tok[1] at no cost.
 #ifndef MODAL_V2_SCANNER_H
 #define MODAL_V2_SCANNER_H
@@ -9,7 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MODAL_VERSION "0.0.3"
+#define MODAL_VERSION "0.0.4"
 
 typedef enum
 {
@@ -81,6 +81,10 @@ typedef enum
     TOK_AS,
     TOK_VAL,
     TOK_RETURN,
+    // A whole function body, `{ ... }`, as ONE token: `start` is its '{' and `len` covers it
+    // to its '}'. The scanner produces it in place of the body's own tokens, which are made
+    // only when that function is compiled (see scan_body).
+    TOK_BODY,
     TOK__COUNT,
 } TokenKind;
 
@@ -92,7 +96,9 @@ typedef struct
     const char *start;   // into the source buffer, never copied
     uint32_t len : 24;   // a token is at most 16 MB long
     uint32_t kind : 8;   // TokenKind
-    uint32_t match : 31; // for ( [ { and their closers: index of the partner, 0 if unbalanced
+    // For ( [ { and their closers: index of the partner, 0 if unbalanced.
+    // For an identifier: its interned name (NameId), so names compare as integers.
+    uint32_t match : 31;
     uint32_t nl : 1;     // first token on its line: this is how statements end without ';'
 } Token;
 
@@ -112,14 +118,30 @@ typedef struct
     TokenKind kind;
 } Keyword;
 
-// Scans `src` (NUL-terminated) into `out`. The source is scanned twice: once to count the
-// tokens, once to fill an array of exactly that size, so nothing is over-reserved or moved.
+// Scans `src` (NUL-terminated, `len` bytes) into `out` in one pass.
+//
+// Unless `eager`, a function body is not tokenized: it is skipped as raw text and becomes a
+// single TOK_BODY token. The token stream of a file is then only its declarations, and
+// `*max_body` receives an upper bound on the token count of its largest body.
+//
+// The token array is malloc'd (it grows while scanning, which an arena cannot do without
+// leaving old copies behind) and freed by the driver.
 // Returns the number of lexical errors (already reported to stderr).
-int scan_all(const char *filename, const char *src, TokenVec *out);
+int scan_all(const char *filename, const char *src, size_t len, int eager, TokenVec *out,
+             size_t *max_body);
+
+// Tokenizes one deferred body: appends its tokens, '{' through '}' and then an EOF, to the
+// end of `out`, which must have room for them (see `max_body` above).
+// Returns the number of lexical errors in the body.
+int scan_body(const char *filename, const char *src, const Token *body, TokenVec *out);
 
 // Line and column (1-based) of a position in `src`.
 void source_pos(const char *src, const char *at, int *line, int *col);
 
 const char *token_kind_name(TokenKind kind);
+
+// Interns the reserved words, marked with their token kinds, so that the scanner's one lookup
+// of an identifier also tells whether it is a keyword. Called when the name table is created.
+void scan_register_keywords(void);
 
 #endif // MODAL_V2_SCANNER_H

@@ -97,7 +97,7 @@ static void declare_value(Unit *u, Scope *scope, SymId owner, SymKind kind, uint
                           uint32_t tok, NodeId decl)
 {
     const Token *t = TOK(u, tok);
-    SymId previous = scope_find(scope, t->start, (size_t)t->len);
+    SymId previous = scope_find_token(scope, t);
     if (previous)
     {
         redeclared(u, tok, previous, "");
@@ -113,7 +113,7 @@ static void declare_callable(Unit *u, Scope *scope, SymId owner, uint32_t tok, N
     const Token *t = TOK(u, tok);
     uint8_t flags = (uint8_t)((overloadable ? SYM_F_MUT : 0) | face);
 
-    SymId first = scope_find(scope, t->start, (size_t)t->len);
+    SymId first = scope_find_token(scope, t);
     if (!first)
     {
         scope_insert(scope, symbol_new(u, SYM_METHOD, flags, tok, owner, decl));
@@ -178,18 +178,20 @@ static Scope *callable_home(Unit *u, NodeId params, SymId *owner)
         const Token *t = TOK(u, type->tok);
         const char *domain = domain_name(u->domain);
 
+        // A struct wins over the module when they share a name (counter.modal declaring
+        // `counter: struct`): the file exists to hold that type.
+        SymId target = scope_find_token(u->scope, t);
+        if (target && SYM(target)->kind == SYM_STRUCT)
+        {
+            *owner = target;
+            return scope_at(SYM(target)->scope_ref);
+        }
+
         if (is_self_token(t->start, t->len) ||
             (t->len == u->name_len && memcmp(t->start, u->name, (size_t)t->len) == 0) ||
             (strlen(domain) == (size_t)t->len && memcmp(t->start, domain, (size_t)t->len) == 0))
         {
             return u->scope; // `self: <module>` spelled out
-        }
-
-        SymId target = scope_find(u->scope, t->start, (size_t)t->len);
-        if (target && SYM(target)->kind == SYM_STRUCT)
-        {
-            *owner = target;
-            return scope_at(SYM(target)->scope_ref);
         }
     }
 
@@ -286,7 +288,7 @@ static void declare_struct(Unit *u, Scope *scope, SymId owner, NodeId decl)
 {
     uint32_t tok = NODE(u, decl)->tok;
     const Token *t = TOK(u, tok);
-    SymId previous = scope_find(scope, t->start, (size_t)t->len);
+    SymId previous = scope_find_token(scope, t);
     if (previous)
     {
         redeclared(u, tok, previous, "");

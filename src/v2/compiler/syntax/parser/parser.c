@@ -9,6 +9,36 @@ void parser_init(Parser *p, Unit *u)
     };
 }
 
+NodeId parse_body(Parser *p, int *deferred)
+{
+    *deferred = p->current->kind == TOK_BODY;
+    if (*deferred)
+    {
+        parser_advance(p); // the scanner already stepped over it: the body is this one token
+        return tok_idx(p, p->previous);
+    }
+    return parse_block(p);
+}
+
+NodeId parse_function_body(Unit *u, uint32_t body_tok)
+{
+    size_t first = u->tokens.size;
+    int lexical = scan_body(u->path, u->src, TOK(u, body_tok), &u->tokens);
+    if (lexical)
+    {
+        u->errors += lexical;
+        cx.errors += lexical;
+        return 0;
+    }
+
+    Parser p;
+    int errors_before = u->errors;
+    parser_init(&p, u);
+    p.current = &u->tokens.data[first];
+    NodeId body = parse_block(&p);
+    return u->errors == errors_before ? body : 0;
+}
+
 void parser_advance(Parser *p)
 {
     p->previous = p->current;
@@ -132,7 +162,7 @@ void node_list_push(Unit *u, NodeList *list, NodeId id)
 NodeId parse_program(Parser *p)
 {
     Unit *u = p->unit;
-    NodeId root = ast.new.node(u, AST_MODULE, 0, 0, 0, 0);
+    NodeId root = node_new(u, AST_MODULE, 0, 0, 0, 0);
     NodeList decls = {0};
 
     while (p->current->kind != TOK_EOF)

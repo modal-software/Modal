@@ -4,33 +4,56 @@
 
 #include "v2/compiler/ast/ast.h"
 #include "v2/compiler/ast/symbol.h"
+#include "v2/compiler/sema/types.h"
 #include "v2/compiler/syntax/scanner.h"
 #include <stdarg.h>
 #include <stdint.h>
 
-typedef struct ArenaBlock
+// Compiler phases, for `--time` (the same idea as `go tool compile -bench`).
+typedef enum
 {
-    struct ArenaBlock *prev;
-    size_t cap; // usable bytes after this header
-    size_t used;
-} ArenaBlock;
+    PHASE_SCAN,
+    PHASE_PARSE,
+    PHASE_DECLARE,
+    PHASE_LINK,
+    PHASE_CHECK,
+    PHASE_EMIT,
+    PHASE__COUNT,
+} Phase;
+
+// A region is one reserved range of address space that is filled from the start, like a
+// stack. Reserving costs nothing but address space: the system supplies a page only when it is
+// first written, so a small program touches a few pages and a large one never pays for a
+// realloc copy. An array that is the last thing in its region grows in place and never moves.
+// (The technique of Zig's and Jai's allocators, the RAD debugger, and Go's heap arenas.)
+typedef struct
+{
+    char *base;      // NULL until first used
+    size_t used;     // bytes handed out, from base
+    size_t peak;     // the most ever handed out
+    size_t reserved; // size of the reservation
+} Region;
+
+typedef enum
+{
+    REGION_ARENA,  // general allocations: sources, strings, scopes, side tables
+    REGION_TOKENS, // the token arrays of every file, one after another
+    REGION_NODES,  // the node arrays of every file, one after another
+    REGION_SYMS,   // cx.syms
+    REGION_TYPES,  // cx.types
+    REGION_SCOPES, // cx.scopes
+    REGION_NAMES,  // cx.names: the interned names
+    REGION_SYMNAMES, // cx.sym_names: the name of each symbol, parallel to cx.syms
+    REGION__COUNT,
+} RegionId;
 
 typedef struct
 {
-    ArenaBlock *block; // newest block
-    size_t reserved;
-    size_t peak;
-} Arena;
-
-typedef struct
-{
-    ArenaBlock *block;
     size_t used;
 } ArenaMark;
 
-#define ARENA_BLOCK_MIN (4 * 1024)
-
 #define MAX_UNITS 64
+#define MAX_REPORTED 20 // errors printed in full; the rest are only counted
 #define MAX_DOMAINS 32
 
 // A source file. The file is also a module: `example/john.modal` is module `john` in domain
@@ -38,7 +61,8 @@ typedef struct
 struct Unit
 {
     const char *path;  // as shown in diagnostics
-    const char *canon; // canonical path: identity for the module cache
+    const char *canon; // absolute, lexically normalized path: identity for the module cache
+    uint64_t dev, ino; // the file's identity on disk, which also catches a path through a link
     const char *src;
     size_t len;
     const char *name; // module name: file stem, or the folder name for mod.modal
@@ -47,37 +71,72 @@ struct Unit
     NodeVec nodes;
     NodeId root;
     Scope *scope;
+    TypeId *types;   // per node: the type of each expression, filled by the checker
+    SymId *refs;     // per node: the declaration a name or invocation resolved to
+    size_t side_cap; // entries allocated in types and refs
     uint16_t id;
     uint16_t domain;
+    size_t max_body;     // bytes of the largest deferred body: a bound on its tokens and nodes
+    uint32_t nimports;   // import(...) expressions in this file
     uint8_t is_manifest; // this file is a mod.modal
     uint8_t bound;       // the domain's mod.modal binds this module: it is part of the face
     uint8_t broken;      // did not scan, parse or declare cleanly: later phases skip it
+    uint8_t cached;      // --cache: its bodies were checked in an earlier run; skipped now
+    uint64_t src_hash;   // --cache: the whole file
+    uint64_t decl_hash;  // --cache: its declarations only, bodies left out: what others see
     int errors;
 };
 
 typedef struct
 {
-    Arena arena;
+    Region regions[REGION__COUNT];
     Unit units[MAX_UNITS];
     uint16_t nunits;
+    uint16_t linked;                  // units whose imports and manifest have been processed
     const char *domains[MAX_DOMAINS]; // canonical folder paths
+    const char *domain_names[MAX_DOMAINS]; // their last component, computed once
+    uint8_t domain_manifest[MAX_DOMAINS]; // 0: not looked for yet, 1: looked for (loaded or none)
     uint16_t ndomains;
     SymVec syms;    // slot 0 is reserved as "no symbol"
+    TypeVec types;  // the type table (see sema/types.h)
     Scope **scopes; // scope table: a 24-byte Symbol refers to its member scope by index
+    Name *names;         // interned names; slot 0 is "no name"
+    size_t nnames, names_cap;
+    uint64_t *name_table; // open addressing: hash << 32 | NameId, 0 = empty; a power of two
+    size_t name_table_cap;
+    NameId *sym_names; // per symbol: its name (kept out of Symbol so that stays 24 bytes)
+    size_t sym_names_cap;
     uint32_t nscopes;
     uint32_t scopes_cap;
     int errors;
+    uint64_t phase_ns[PHASE__COUNT]; // time spent per phase
+    uint32_t names_resolved;         // names and invocations the body checker led to a declaration
+    uint32_t calls_resolved;
     uint8_t ok;
+    uint8_t eager;  // parse every body up front and keep the whole tree (--eager, --ast)
+    uint8_t timing; // --time: measure the per-function phases too
+    uint8_t cache;  // --cache: skip checking the bodies of files that have not changed
 } context;
 
 extern context cx;
 
-// ---- arena --------------------------------------------------------------------------------
-//
-// Everything the compiler allocates comes from here and is freed at once at the end. The
-// arena grows in blocks, on demand: a small program takes a few KB from the system, not a
-// slab reserved up front. Allocations never move, so pointers into the arena stay valid.
+// ---- regions and the arena ---------------------------------------------------------------
 
+void *region_push(RegionId r, size_t bytes); // `bytes` more at the end; never returns NULL
+void region_set_end(RegionId r, const void *end); // give back everything after `end`
+void *region_end(RegionId r);                     // where the next push will land
+// region_end(), after checking that `bytes` more would fit. Nothing is handed out: the caller
+// writes there and then claims what it wrote with region_set_end.
+void *region_room(RegionId r, size_t bytes);
+// Makes room for `need` items of `elem` bytes in an array of the region holding `size` items
+// in `*cap` slots. The array grows in place when it ends where the region ends, which is the
+// normal case; otherwise it is moved to the end, like realloc. Returns the array.
+void *region_grow_array(RegionId r, void *data, size_t elem, size_t *cap, size_t need);
+size_t regions_used(void);    // bytes handed out, all regions
+size_t regions_touched(void); // pages the system has supplied at peak, in bytes
+
+// Everything the compiler allocates without its own region comes from the arena and is
+// freed at once at the end. Allocations never move, so pointers into it stay valid.
 void *arena_alloc(size_t sz); // 8-byte aligned; never returns NULL: exits on exhaustion
 ArenaMark arena_mark(void);
 void arena_release(ArenaMark mark); // frees everything allocated after the mark
@@ -85,14 +144,43 @@ void arena_release(ArenaMark mark); // frees everything allocated after the mark
 void arena_shrink(void *ptr, size_t old_size, size_t new_size);
 // Doubles an array of `elem`-sized items: returns the new storage, updates *cap.
 void *arena_grow(void *data, size_t elem, size_t *cap);
-size_t arena_used(void);     // bytes handed out
-size_t arena_reserved(void); // bytes taken from the system right now
-size_t arena_peak(void);     // the most ever taken from the system
 void arena_drop(void);
+// A fresh context for another compilation in the same process: every region is emptied but
+// keeps its address space and pages.
+void context_reset(void);
 
 static inline int arena_mark_equal(ArenaMark a, ArenaMark b)
 {
-    return a.block == b.block && a.used == b.used;
+    return a.used == b.used;
+}
+
+// ---- nodes -----------------------------------------------------------------------------------
+
+void node_array_grow(Unit *u); // the rare case, out of line
+
+// Appends a node: inlined into the parser (a call through the `ast` table cannot be).
+static inline NodeId node_new(Unit *u, AstNodeKind kind, uint32_t tok, NodeId a, NodeId b,
+                              NodeId c)
+{
+    if (u->nodes.size == u->nodes.cap)
+    {
+        node_array_grow(u);
+    }
+    u->nodes.data[u->nodes.size] = (AstNode){.kind = (uint8_t)kind, .tok = tok, .a = a, .b = b, .c = c};
+    return (NodeId)u->nodes.size++;
+}
+
+// ---- timing ----------------------------------------------------------------------------------
+
+uint64_t clock_ns(void);
+
+// phase_end(PHASE_X, start) adds the time since `start` to the phase and returns "now", so
+// consecutive phases chain: t = phase_end(A, t); ...; t = phase_end(B, t);
+static inline uint64_t phase_end(Phase phase, uint64_t start)
+{
+    uint64_t now = clock_ns();
+    cx.phase_ns[phase] += now - start;
+    return now;
 }
 
 // ---- diagnostics ---------------------------------------------------------------------------
@@ -106,8 +194,13 @@ void diag_at(Unit *u, uint32_t tok, const char *level, const char *fmt, ...);
 
 // module.c
 Unit *unit_load(const char *path); // read + scan + parse + declare; cached by canonical path
-void modules_link(void);           // load imports, read mod.modal, check visibility
-void contract_print(void);         // derived public signatures of every loaded domain
+void modules_link(void);           // load imports, read mod.modal, check visibility and bodies
+// A function body was just parsed into nodes [from, size): resolve the imports written in it
+// and check its module paths.
+void module_body_nodes(Unit *u, NodeId from);
+// Module-path checks over the nodes [from, to) of a file.
+void module_check_paths(Unit *u, NodeId from, NodeId to);
+void contract_print(void); // derived public signatures of every loaded domain
 const char *domain_name(uint16_t domain);
 
 // What a mod.modal says for a domain; `fallback` when it does not say.
@@ -115,11 +208,34 @@ int domain_config_bool(uint16_t domain, const char *key, int fallback);
 // Could a wildcard import of this file (`import(x).*`) supply `name`?
 int module_wildcard_provides(Unit *u, const char *name, size_t len);
 
+// cache.c: Go's build cache, at the granularity of a file. Check-only runs.
+uint64_t hash_bytes(const void *data, size_t len, uint64_t seed);
+void cache_unit_loaded(Unit *u);   // after declarations: computes the unit's hashes
+void cache_open(const char *entry); // reads the cache of this program, if any
+int cache_lookup(Unit *u);          // 1: unchanged and checked clean before; counters replayed
+void cache_record(Unit *u, uint32_t names, uint32_t calls); // checked clean just now
+void cache_save(void);              // writes the cache back if it changed
+
 // resolve.c
 void sema_declare(Unit *u);
 NodeId sema_callable_params(const Unit *u, NodeId decl);
 
+// backend/registry.c: code generation is streamed, one checked function at a time.
+struct Backend;
+void codegen_start(const struct Backend *backend, void *out_file);
+void codegen_begin(Unit *u);              // declarations are checked: types, prototypes
+void codegen_function(Unit *u, SymId fn); // one function is checked and still in memory
+int codegen_finish(void);                 // returns the number of errors the backend reported
+
 // check.c
-void sema_check(Unit *u); // every name and invocation in a body leads to a declaration
+// What a backend asks about a declaration, beyond the per-node tables.
+TypeId sema_fn_ret(Unit *u, SymId fn);                   // declared return type (T_VOID if none)
+TypeId sema_param_type(Unit *u, SymId fn, NodeId param); // type of one of its parameters
+TypeId sema_value_type(Unit *u, SymId field_or_const);
+NodeId sema_fn_params(const Unit *u, SymId fn);      // its parameters after `self`
+int sema_is_std_print(const Unit *u, SymId binding); // `x := import("std").io.print`
+void sema_check(Unit *u);
+void sema_syntax_only(Unit *u); // for a file that is not checked: parse its bodies for errors //
+                                // every name and invocation in a body leads to a declaration
 
 #endif // MODAL_V2_CX_H

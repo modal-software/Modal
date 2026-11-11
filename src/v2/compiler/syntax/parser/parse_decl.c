@@ -52,21 +52,21 @@ NodeId parse_type(Parser *p)
         if (parser_consume(p, TOK_RBRACKET, "expected ']' (a slice type is written []T)"))
         {
             NodeId elem = parse_type(p);
-            type = elem ? ast.new.node(u, AST_TYPE_SLICE, tok_idx(p, t), elem, 0, 0) : 0;
+            type = elem ? node_new(u, AST_TYPE_SLICE, tok_idx(p, t), elem, 0, 0) : 0;
         }
         break;
     case TOK_STAR:
     {
         parser_advance(p);
         NodeId elem = parse_type(p);
-        type = elem ? ast.new.node(u, AST_TYPE_PTR, tok_idx(p, t), elem, 0, 0) : 0;
+        type = elem ? node_new(u, AST_TYPE_PTR, tok_idx(p, t), elem, 0, 0) : 0;
         break;
     }
     case TOK_STRUCT:
     {
         parser_advance(p);
         NodeId members = parse_struct_body(p);
-        type = p->panic ? 0 : ast.new.node(u, AST_TYPE_STRUCT, tok_idx(p, t), members, 0, 0);
+        type = p->panic ? 0 : node_new(u, AST_TYPE_STRUCT, tok_idx(p, t), members, 0, 0);
         break;
     }
     case TOK_IDENTIFIER:
@@ -80,7 +80,7 @@ NodeId parse_type(Parser *p)
             parser_advance(p);
             extra++;
         }
-        type = ast.new.node(u, AST_TYPE_NAME, tok_idx(p, t), 0, 0, 0);
+        type = node_new(u, AST_TYPE_NAME, tok_idx(p, t), 0, 0, 0);
         NODE(u, type)->aux = extra;
         break;
     }
@@ -120,7 +120,7 @@ NodeId parse_params(Parser *p, int *has_self)
             break;
         }
 
-        NodeId param = ast.new.node(u, AST_PARAM, tok_idx(p, name), 0, 0, 0);
+        NodeId param = node_new(u, AST_PARAM, tok_idx(p, name), 0, 0, 0);
         int is_self = is_self_token(name->start, name->len);
         node_list_push(u, &params, param);
 
@@ -182,6 +182,7 @@ static NodeId parse_method(Parser *p, const Token *name, NodeId ret, uint8_t fla
     Unit *u = p->unit;
     int has_self = 0;
     NodeId body = 0;
+    int deferred = 0;
     NodeId params = parse_params(p, &has_self);
 
     if (p->panic)
@@ -196,9 +197,9 @@ static NodeId parse_method(Parser *p, const Token *name, NodeId ret, uint8_t fla
             body = parse_expression(p); // T name(params): expr
             flags |= AST_F_ONELINE;
         }
-        else if (p->current->kind == TOK_LBRACE)
+        else if (is_body_start(p->current))
         {
-            body = parse_block(p);
+            body = parse_body(p, &deferred);
         }
         else
         {
@@ -218,12 +219,12 @@ static NodeId parse_method(Parser *p, const Token *name, NodeId ret, uint8_t fla
             }
             ret = parse_type(p);
         }
-        else if (p->current->kind != TOK_LBRACE && !(p->current->nl) && type_starts_at(p->current))
+        else if (!is_body_start(p->current) && !(p->current->nl) && type_starts_at(p->current))
         {
             ret = parse_type(p); // keyword profile: fun name(params) T { ... }
         }
 
-        if (!p->panic && p->current->kind != TOK_LBRACE)
+        if (!p->panic && !is_body_start(p->current))
         {
             parser_error_at(p, p->current,
                             "expected '{' to open the body of '%.*s' (a one-line body needs the "
@@ -232,7 +233,7 @@ static NodeId parse_method(Parser *p, const Token *name, NodeId ret, uint8_t fla
         }
         if (!p->panic)
         {
-            body = parse_block(p);
+            body = parse_body(p, &deferred);
         }
     }
 
@@ -241,8 +242,9 @@ static NodeId parse_method(Parser *p, const Token *name, NodeId ret, uint8_t fla
         return 0;
     }
 
-    NodeId method = ast.new.node(u, AST_METHOD_DECL, tok_idx(p, name), params, ret, body);
-    NODE(u, method)->flags = (uint8_t)(flags | (has_self ? AST_F_SELF : 0));
+    NodeId method = node_new(u, AST_METHOD_DECL, tok_idx(p, name), params, ret, body);
+    NODE(u, method)->flags =
+        (uint8_t)(flags | (has_self ? AST_F_SELF : 0) | (deferred ? AST_F_LAZY : 0));
     return method;
 }
 
@@ -265,7 +267,7 @@ static NodeId parse_type_last(Parser *p)
         {
             return 0;
         }
-        node_list_push(u, &fields, ast.new.node(u, AST_FIELD_DECL, tok_idx(p, name), 0, 0, 0));
+        node_list_push(u, &fields, node_new(u, AST_FIELD_DECL, tok_idx(p, name), 0, 0, 0));
         count++;
     } while (parser_match(p, TOK_COMMA));
 
@@ -347,7 +349,7 @@ static NodeId parse_type_first(Parser *p)
     {
         return 0;
     }
-    NodeId field = ast.new.node(u, AST_FIELD_DECL, tok_idx(p, name), type, init, 0);
+    NodeId field = node_new(u, AST_FIELD_DECL, tok_idx(p, name), type, init, 0);
     NODE(u, field)->flags = AST_F_MUT;
     return field;
 }
@@ -363,7 +365,7 @@ NodeId parse_define(Parser *p)
     {
         return 0;
     }
-    return ast.new.node(p->unit, AST_DEFINE, tok_idx(p, name), value, 0, 0);
+    return node_new(p->unit, AST_DEFINE, tok_idx(p, name), value, 0, 0);
 }
 
 // items := item (',' item)*      item := IDENT [ 'as' IDENT ]
@@ -392,7 +394,7 @@ NodeId parse_import_items(Parser *p, const Token *open)
         if (name->kind == TOK_IDENTIFIER)
         {
             parser_advance(p);
-            item = ast.new.node(u, AST_IMPORT_ITEM, tok_idx(p, name), 0, 0, 0);
+            item = node_new(u, AST_IMPORT_ITEM, tok_idx(p, name), 0, 0, 0);
             if (parser_match(p, TOK_AS))
             {
                 if (p->current->kind == TOK_IDENTIFIER)
@@ -470,7 +472,7 @@ static NodeId parse_val_decl(Parser *p)
         parser_error_at(p, val, "val (...) destructures an import: `val (a as b): import(x).y`");
         return 0;
     }
-    return ast.new.node(u, AST_VAL_DECL, tok_idx(p, val), items, source, 0);
+    return node_new(u, AST_VAL_DECL, tok_idx(p, val), items, source, 0);
 }
 
 // '{' member* '}' with ',', ';' or a newline between members.

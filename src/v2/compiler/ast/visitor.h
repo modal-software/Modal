@@ -48,6 +48,10 @@ static inline int walk_ast_iterative(Unit *u, NodeId root, VisitorFn visit, void
         WalkFrame f = stack[--sp];
         const AstNode *n = NODE(u, f.id);
         uint8_t mask = ast_child_mask[n->kind];
+        if (n->flags & AST_F_LAZY)
+        {
+            mask &= (uint8_t)~4u; // `c` is a token index while the body is unparsed
+        }
         NodeId a = n->a, b = n->b, c = n->c, next = n->next;
 
         int r = visit(u, f.id, f.depth, ctx);

@@ -46,6 +46,18 @@ int parser_enter(Parser *p);     // returns 0 (and reports) when nesting is too 
 void parser_leave(Parser *p);
 void node_list_push(Unit *u, NodeList *list, NodeId id);
 NodeId parse_program(Parser *p);
+// Is this token where a function body starts: a '{', or a body the scanner deferred?
+static inline int is_body_start(const Token *t)
+{
+    return t->kind == TOK_LBRACE || t->kind == TOK_BODY;
+}
+// Parses the function body at the current token. If the scanner deferred it (TOK_BODY), it
+// is one token: it is consumed, *deferred is set and its token index returned.
+NodeId parse_body(Parser *p, int *deferred);
+// Tokenizes and parses a deferred body into the tails of the unit's token and node arrays.
+// `body_tok` is the token index of its TOK_BODY. Returns the block, or 0 if the body has
+// errors (already reported). The caller cuts both tails off when it is done with the body.
+NodeId parse_function_body(Unit *u, uint32_t body_tok);
 
 static inline uint32_t tok_idx(const Parser *p, const Token *t)
 {

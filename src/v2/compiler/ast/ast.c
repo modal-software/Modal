@@ -2,6 +2,7 @@
 #include "v2/compiler/ast/visitor.h"
 #include "v2/compiler/cx.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 const uint8_t ast_child_mask[AST__COUNT] = {
@@ -13,15 +14,16 @@ const uint8_t ast_child_mask[AST__COUNT] = {
     [AST_IMPORT_ALL] = 1, [AST_IMPORT_PICK] = 3,
 };
 
+void node_array_grow(Unit *u)
+{
+    // In place: a file's nodes are the last array of the node region while it is parsed.
+    u->nodes.data = (AstNode *)region_grow_array(REGION_NODES, u->nodes.data, sizeof(AstNode),
+                                                 &u->nodes.cap, u->nodes.size + 1);
+}
+
 static NodeId ast_new_node(Unit *u, AstNodeKind kind, uint32_t tok, NodeId a, NodeId b, NodeId c)
 {
-    AstNode n = {.kind = (uint8_t)kind, .tok = tok, .a = a, .b = b, .c = c};
-    if (u->nodes.size == u->nodes.cap)
-    {
-        u->nodes.data = (AstNode *)arena_grow(u->nodes.data, sizeof(AstNode), &u->nodes.cap);
-    }
-    u->nodes.data[u->nodes.size++] = n;
-    return (NodeId)(u->nodes.size - 1);
+    return node_new(u, kind, tok, a, b, c);
 }
 
 static const char *ast_kind_name(AstNodeKind kind)
@@ -295,6 +297,10 @@ static int print_visit(Unit *u, NodeId id, uint32_t depth, void *ctx)
     if (n->flags & AST_F_SELF)
     {
         printf("  [self]");
+    }
+    if (n->flags & AST_F_LAZY)
+    {
+        printf("  [body not parsed]");
     }
     putchar('\n');
     return skip;

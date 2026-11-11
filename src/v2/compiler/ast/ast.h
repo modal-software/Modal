@@ -53,6 +53,9 @@ enum
     AST_F_MUT = 1u << 0,     // type-first declaration: mutable field / overloadable method
     AST_F_ONELINE = 1u << 1, // method body is `: expression`
     AST_F_SELF = 1u << 2,    // callable whose first parameter is `self`
+    // The body has not been parsed yet: `c` holds the TOKEN index of its '{', not a node.
+    // It is parsed, checked, emitted and discarded one function at a time (see check.c).
+    AST_F_LAZY = 1u << 3,
 };
 
 typedef struct AstNode

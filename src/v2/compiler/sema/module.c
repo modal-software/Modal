@@ -9,14 +9,14 @@
 //   folder  its files                                outside: what the parent's mod.modal binds
 // Nothing is listed anywhere, and a type crosses a domain boundary as an opaque type.
 #define _XOPEN_SOURCE 700
-#include "v2/compiler/ast/visitor.h"
 #include "v2/compiler/cx.h"
-#include "v2/compiler/sema/check.h"
 #include "v2/compiler/syntax/parser/parser.h"
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #define CHAIN_MAX 32
@@ -55,7 +55,7 @@ static const char *base_name(const char *path)
 
 const char *domain_name(uint16_t domain)
 {
-    return base_name(cx.domains[domain]);
+    return cx.domain_names[domain];
 }
 
 static uint16_t domain_intern(const char *dir, size_t len)
@@ -73,44 +73,156 @@ static uint16_t domain_intern(const char *dir, size_t len)
         exit(2);
     }
     cx.domains[cx.ndomains] = arena_strndup(dir, len);
+    cx.domain_names[cx.ndomains] = base_name(cx.domains[cx.ndomains]);
     return cx.ndomains++;
 }
 
-static int read_file(Unit *u)
+// The absolute form of `path` with `.`, `..` and repeated slashes removed, written to `out`.
+// Purely lexical: realpath() walks every component through the file system and costs about
+// 100-200 us per call on macOS, more than compiling a small file. Files reached through a link
+// are still recognised as one by their inode (see unit_load). Returns the length, 0 if too long.
+static size_t path_normalize(const char *path, char *out, size_t cap)
 {
-    FILE *f = fopen(u->canon, "rb");
-    if (!f)
+    static char cwd[PATH_MAX];
+    static size_t cwd_len;
+    size_t n = 0;
+
+    if (path[0] != '/')
     {
-        return 0;
+        if (!cwd_len)
+        {
+            if (!getcwd(cwd, sizeof(cwd)))
+            {
+                return 0;
+            }
+            cwd_len = strlen(cwd);
+        }
+        if (cwd_len >= cap)
+        {
+            return 0;
+        }
+        memcpy(out, cwd, cwd_len);
+        n = cwd_len;
+        if (n == 1)
+        {
+            n = 0; // cwd is "/": components are appended as "/name"
+        }
     }
-    fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (size < 0)
+
+    const char *c = path;
+    while (*c)
     {
-        fclose(f);
-        return 0;
+        while (*c == '/')
+        {
+            c++;
+        }
+        const char *part = c;
+        while (*c && *c != '/')
+        {
+            c++;
+        }
+        size_t len = (size_t)(c - part);
+        if (len == 0 || (len == 1 && part[0] == '.'))
+        {
+            continue;
+        }
+        if (len == 2 && part[0] == '.' && part[1] == '.')
+        {
+            while (n > 0 && out[n - 1] != '/')
+            {
+                n--;
+            }
+            if (n > 0)
+            {
+                n--; // drop the '/' too; at the root this leaves n == 0, which is "/"
+            }
+            continue;
+        }
+        if (n + 1 + len >= cap)
+        {
+            return 0;
+        }
+        out[n++] = '/';
+        memcpy(out + n, part, len);
+        n += len;
     }
-    char *buffer = (char *)arena_alloc((size_t)size + 1);
-    size_t got = fread(buffer, 1, (size_t)size, f);
-    fclose(f);
-    buffer[got] = '\0';
-    u->src = buffer;
-    u->len = strlen(buffer); // a stray NUL byte ends the source
-    return 1;
+    if (n == 0)
+    {
+        out[n++] = '/';
+    }
+    out[n] = '\0';
+    return n;
+}
+
+// Reads a regular file into the arena: one open, fstat, read and close, no stdio.
+// Returns the descriptor's identity through dev/ino, or 0 if the file cannot be read.
+static const char *read_source(const char *path, size_t *len, uint64_t *dev, uint64_t *ino)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+    {
+        return NULL;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode))
+    {
+        close(fd);
+        return NULL;
+    }
+    size_t size = (size_t)st.st_size;
+    char *buffer = (char *)arena_alloc(size + 1 + SOURCE_PADDING);
+    size_t got = 0;
+    while (got < size)
+    {
+        ssize_t r = read(fd, buffer + got, size - got);
+        if (r <= 0)
+        {
+            break;
+        }
+        got += (size_t)r;
+    }
+    close(fd);
+    arena_shrink(buffer, size + 1 + SOURCE_PADDING, got + 1 + SOURCE_PADDING);
+    memset(buffer + got, 0, 1 + SOURCE_PADDING);
+    *len = strlen(buffer); // a stray NUL byte ends the source
+    *dev = (uint64_t)st.st_dev;
+    *ino = (uint64_t)st.st_ino;
+    return buffer;
 }
 
 Unit *unit_load(const char *path)
 {
     char canon[PATH_MAX];
-    if (!realpath(path, canon))
+    size_t canon_len = path_normalize(path, canon, sizeof(canon));
+    if (!canon_len)
     {
         return NULL;
     }
+    // Same path as a loaded file: no system call at all.
     for (uint16_t i = 0; i < cx.nunits; i++)
     {
         if (strcmp(cx.units[i].canon, canon) == 0)
         {
+            return &cx.units[i];
+        }
+    }
+
+    // Opening is the existence test: a missing file costs one failed open(), and leaves
+    // nothing behind (no domain, no strings), so probing candidate paths is cheap.
+    ArenaMark mark = arena_mark();
+    size_t len = 0;
+    uint64_t dev = 0, ino = 0;
+    const char *src = read_source(canon, &len, &dev, &ino);
+    if (!src)
+    {
+        arena_release(mark);
+        return NULL;
+    }
+    for (uint16_t i = 0; i < cx.nunits; i++)
+    {
+        if (cx.units[i].dev == dev && cx.units[i].ino == ino)
+        {
+            arena_release(mark); // the same file under another name (a link)
             return &cx.units[i];
         }
     }
@@ -121,9 +233,9 @@ Unit *unit_load(const char *path)
     }
 
     Unit *u = &cx.units[cx.nunits];
-    *u = (Unit){.id = cx.nunits};
+    *u = (Unit){.id = cx.nunits, .src = src, .len = len, .dev = dev, .ino = ino};
     u->path = arena_strndup(path, strlen(path));
-    u->canon = arena_strndup(canon, strlen(canon));
+    u->canon = arena_strndup(canon, canon_len);
 
     const char *base = base_name(u->canon);
     size_t dir_len = base > u->canon + 1 ? (size_t)(base - u->canon) - 1 : 1;
@@ -142,45 +254,48 @@ Unit *unit_load(const char *path)
         u->name_len = dot ? (int)(dot - base) : (int)strlen(base);
     }
 
-    if (!read_file(u))
-    {
-        return NULL;
-    }
     cx.nunits++;
 
-    int lex_errors = scan_all(u->path, u->src, &u->tokens);
+    uint64_t t = clock_ns();
+    int lex_errors = scan_all(u->path, u->src, u->len, cx.eager, &u->tokens, &u->max_body);
     u->errors += lex_errors;
     cx.errors += lex_errors;
 
-    // A node needs at least one token of its own (the root and string-calls aside), so the
-    // token count bounds the tree: reserve once, then hand the unused tail back.
-    u->nodes.cap = u->tokens.size + 16;
-    u->nodes.data = (AstNode *)arena_alloc(u->nodes.cap * sizeof(AstNode));
-    u->nodes.data[u->nodes.size++] = (AstNode){0}; // slot 0 = "no node"
+    t = phase_end(PHASE_SCAN, t);
+
+    // The node array starts small and doubles; slot 0 means "no node".
+    node_new(u, AST_NONE, 0, 0, 0, 0);
 
     Parser parser;
     parser_init(&parser, u);
     u->root = parse_program(&parser);
 
-    arena_shrink(u->nodes.data, u->nodes.cap * sizeof(AstNode), u->nodes.size * sizeof(AstNode));
-    u->nodes.cap = u->nodes.size;
+    // Both arrays end their regions, so they are cut to the declarations plus room for the
+    // largest deferred body in place: the scanner bounded that body's token count while
+    // skipping it, and a body has fewer nodes than tokens. Bodies are tokenized and parsed
+    // into that room one at a time, so neither array grows or moves again, and the next file's
+    // arrays start right after. Nothing is copied.
+    size_t room = u->max_body ? u->max_body + 16 : 0;
+    u->tokens.cap = u->tokens.size + room;
+    region_set_end(REGION_TOKENS, u->tokens.data + u->tokens.cap);
+    u->nodes.cap = u->nodes.size + room;
+    region_set_end(REGION_NODES, u->nodes.data + u->nodes.cap);
+
+    cache_unit_loaded(u);
+    t = phase_end(PHASE_PARSE, t);
 
     sema_declare(u);
     u->broken = u->errors > 0;
+    phase_end(PHASE_DECLARE, t);
     return u;
 }
 
 // ---- import resolution -----------------------------------------------------------------------
 
-static int file_exists(const char *path)
-{
-    return access(path, R_OK) == 0;
-}
-
 // Finds the file an import names, relative to the importing file:
 //   import("./a/b.modal")  that file
 //   import("./a/b")        a/b.modal, or the domain a/b/mod.modal
-//   import(b)              the same lookup
+//   import(b)              a bare name: also looked for in every folder above
 // Only `std` may be missing from disk; any other import that resolves to nothing is an error.
 static Unit *import_target(Unit *u, NodeId import)
 {
@@ -212,24 +327,8 @@ static Unit *import_target(Unit *u, NodeId import)
         rel_len -= 2;
     }
 
-    char path[PATH_MAX];
-    const char *const forms[] = {"%.*s/%.*s", "%.*s/%.*s.modal", "%.*s/%.*s/mod.modal"};
-    for (int i = has_ext ? 0 : 1; i < (has_ext ? 1 : 3); i++)
-    {
-        int n = snprintf(path, sizeof(path), forms[i], dir_len, dir, rel_len, rel);
-        if (n > 0 && (size_t)n < sizeof(path) && file_exists(path))
-        {
-            Unit *target = unit_load(path);
-            if (target)
-            {
-                return target;
-            }
-        }
-    }
-
-    // Nothing was found next to the importing file. The only modules that live elsewhere are
-    // the external roots below; every other unresolved import is an error, so a mistyped or
-    // unreachable path can never pass unchecked.
+    // `std` lives outside the project and is reserved: no file is looked for, so importing
+    // it costs no system call.
     static const char *const external_roots[] = {"std"};
     for (size_t i = 0; i < sizeof(external_roots) / sizeof(external_roots[0]); i++)
     {
@@ -239,6 +338,46 @@ static Unit *import_target(Unit *u, NodeId import)
             return NULL;
         }
     }
+
+    // A path (`./x`, `a/b`, `x.modal`) is looked for next to the importing file only. A bare
+    // name is a module or a domain: it is looked for next to the file, then in each folder
+    // above it, so `import("example")` means the same anywhere inside the project, including
+    // inside `example/` itself, where it finds the domain's own mod.modal.
+    char path[PATH_MAX];
+    const char *const forms[] = {"%.*s/%.*s", "%.*s/%.*s.modal", "%.*s/%.*s/mod.modal"};
+    int bare = !relative && !has_ext && !memchr(name, '/', (size_t)len);
+    int up_len = dir_len;
+    for (;;)
+    {
+        for (int i = has_ext ? 0 : 1; i < (has_ext ? 1 : 3); i++)
+        {
+            int n = snprintf(path, sizeof(path), forms[i], up_len, dir, rel_len, rel);
+            if (n > 0 && (size_t)n < sizeof(path))
+            {
+                Unit *target = unit_load(path); // a failed open() is the "not found"
+                if (target)
+                {
+                    return target;
+                }
+            }
+        }
+        if (!bare || !slash)
+        {
+            break;
+        }
+        while (up_len > 0 && dir[up_len - 1] != '/') // one folder up
+        {
+            up_len--;
+        }
+        if (up_len <= 1)
+        {
+            break;
+        }
+        up_len--; // drop the '/'
+    }
+
+    // Nothing was found. An unresolved import is always an error, so a mistyped or
+    // unreachable path can never pass unchecked.
     if (has_ext)
     {
         diag_at(u, NODE(u, import)->tok, "error", "cannot find module %.*s (looked for %.*s/%.*s)",
@@ -247,8 +386,9 @@ static Unit *import_target(Unit *u, NodeId import)
     else
     {
         diag_at(u, NODE(u, import)->tok, "error",
-                "cannot find module %.*s (looked for %.*s/%.*s.modal and %.*s/%.*s/mod.modal)",
-                arg->len, arg->start, dir_len, dir, rel_len, rel, dir_len, dir, rel_len, rel);
+                "cannot find module %.*s (looked for %.*s/%.*s.modal and %.*s/%.*s/mod.modal%s)",
+                arg->len, arg->start, dir_len, dir, rel_len, rel, dir_len, dir, rel_len, rel,
+                bare ? ", and in the folders above" : "");
     }
     return NULL;
 }
@@ -400,7 +540,7 @@ static Target chain_step(Unit *u, uint32_t tok, Target cur, ChainMode mode, int 
         container = symbol_name(cur.scope->owner, &container_len);
     }
 
-    SymId id = cur.scope ? scope_find(cur.scope, name->start, (size_t)name->len) : 0;
+    SymId id = cur.scope ? scope_find_token(cur.scope, name) : 0;
     if (!id)
     {
         if (mode == CHAIN_CHECK)
@@ -482,7 +622,7 @@ static Target chain_eval(Unit *u, NodeId chain, ChainMode mode, int depth)
     else if (base->kind == AST_IDENT)
     {
         const Token *name = TOK(u, base->tok);
-        SymId binding = scope_find(u->scope, name->start, (size_t)name->len);
+        SymId binding = scope_find_token(u->scope, name);
         if (!binding || (SYM(binding)->kind != SYM_IMPORT && SYM(binding)->kind != SYM_CONST))
         {
             return (Target){0}; // a local value, `self`, ...: not a module path
@@ -514,49 +654,79 @@ static Target chain_eval(Unit *u, NodeId chain, ChainMode mode, int depth)
 
 // Checks every module path in a file, wherever it is written: top level or inside a body,
 // spelled as an import or as member access on a binding.
-static int check_visit(Unit *u, NodeId id, uint32_t depth, void *ctx)
+//
+// The node array is scanned linearly, not walked as a tree: a chain is checked once, from
+// its outermost node, and a first pass marks which chain nodes sit inside another (one bit
+// per node) so the second can tell. Two sequential sweeps over a flat array are several
+// times cheaper than a traversal, and a file with no import is skipped outright, since no
+// name in it can lead to another module.
+void module_check_paths(Unit *u, NodeId from, NodeId to)
 {
-    (void)depth;
-    (void)ctx;
-    const AstNode *n = NODE(u, id);
+    if (!u->nimports || from >= to)
+    {
+        return;
+    }
 
-    if (n->kind == AST_VAL_DECL)
+    ArenaMark mark = arena_mark();
+    size_t words = (to - from + 63) / 64;
+    uint64_t *inner = (uint64_t *)arena_alloc(words * sizeof(uint64_t));
+    memset(inner, 0, words * sizeof(uint64_t));
+
+    for (NodeId id = from; id < to; id++)
     {
-        Target end = chain_eval(u, n->b, CHAIN_CHECK, 0);
-        if (end.known)
+        const AstNode *n = NODE(u, id);
+        NodeId child = is_chain_segment(n->kind) ? n->a : n->kind == AST_VAL_DECL ? n->b : 0;
+        if (child >= from) // a chain's inner nodes are created just before it
         {
-            chain_items(u, n->a, end, CHAIN_CHECK, 0);
-        }
-        return VISIT_SKIP;
-    }
-    if (n->kind == AST_IMPORT || is_chain_segment(n->kind))
-    {
-        NodeId base = id;
-        while (is_chain_segment(NODE(u, base)->kind))
-        {
-            base = NODE(u, base)->a;
-        }
-        uint8_t kind = NODE(u, base)->kind;
-        if (kind == AST_IMPORT || kind == AST_IDENT)
-        {
-            chain_eval(u, id, CHAIN_CHECK, 0); // the whole chain at once, from its outermost node
-            return VISIT_SKIP;
+            inner[(child - from) >> 6] |= (uint64_t)1 << ((child - from) & 63);
         }
     }
-    return VISIT_CONTINUE;
+
+    for (NodeId id = from; id < to; id++)
+    {
+        const AstNode *n = NODE(u, id);
+        if (n->kind == AST_VAL_DECL)
+        {
+            Target end = chain_eval(u, n->b, CHAIN_CHECK, 0);
+            if (end.known)
+            {
+                chain_items(u, n->a, end, CHAIN_CHECK, 0);
+            }
+        }
+        else if ((n->kind == AST_IMPORT || is_chain_segment(n->kind)) &&
+                 !(inner[(id - from) >> 6] >> ((id - from) & 63) & 1))
+        {
+            NodeId base = id;
+            while (is_chain_segment(NODE(u, base)->kind))
+            {
+                base = NODE(u, base)->a;
+            }
+            uint8_t kind = NODE(u, base)->kind;
+            if (kind == AST_IMPORT || kind == AST_IDENT)
+            {
+                chain_eval(u, id, CHAIN_CHECK, 0);
+            }
+        }
+    }
+    arena_release(mark);
 }
 
-// Finds the file behind every import in a unit, including imports written inside bodies.
-static int discover_visit(Unit *u, NodeId id, uint32_t depth, void *ctx)
+// Finds the file behind every import among the nodes [from, to) of a unit. Returns how many
+// imports were found.
+static uint32_t discover_imports(Unit *u, NodeId from, NodeId to)
 {
-    (void)depth;
-    (void)ctx;
-    if (NODE(u, id)->kind == AST_IMPORT)
+    uint32_t found = 0;
+    for (NodeId id = from; id < to; id++)
     {
-        Unit *target = import_target(u, id);
-        NODE(u, id)->aux = target ? (uint16_t)(target->id + 1) : 0;
+        if (NODE(u, id)->kind == AST_IMPORT)
+        {
+            Unit *target = import_target(u, id);
+            NODE(u, id)->aux = target ? (uint16_t)(target->id + 1) : 0;
+            found++;
+        }
     }
-    return VISIT_CONTINUE;
+    u->nimports += found;
+    return found;
 }
 
 // ---- mod.modal: configuration and the face of the domain ----------------------------------------
@@ -742,44 +912,87 @@ void contract_print(void)
 
 // ---- linking ---------------------------------------------------------------------------------
 
-void modules_link(void)
+// Brings every unit loaded so far up to date: its domain's mod.modal is loaded, its imports
+// are resolved (which may load more units, handled by the same loop), and if it is a
+// manifest its configuration and bindings are read. Called again whenever a function body
+// turns out to contain an import.
+static void link_new_units(void)
 {
-    // A. Discover. cx.units is the worklist: loading appends to it, the loop catches up.
-    for (uint16_t i = 0; i < cx.nunits; i++)
+    while (cx.linked < cx.nunits)
     {
-        Unit *u = &cx.units[i];
+        Unit *u = &cx.units[cx.linked++];
+        uint64_t t = clock_ns();
+        uint64_t loading =
+            cx.phase_ns[PHASE_SCAN] + cx.phase_ns[PHASE_PARSE] + cx.phase_ns[PHASE_DECLARE];
 
-        if (!u->is_manifest)
+        // A domain's mod.modal is looked for once, not once per file of the domain.
+        if (!u->is_manifest && !cx.domain_manifest[u->domain])
         {
+            cx.domain_manifest[u->domain] = 1;
             char manifest[PATH_MAX];
             const char *slash = strrchr(u->path, '/');
             int n = snprintf(manifest, sizeof(manifest), "%.*s/mod.modal",
                              slash ? (int)(slash - u->path) : 1, slash ? u->path : ".");
-            if (n > 0 && (size_t)n < sizeof(manifest) && file_exists(manifest))
+            if (n > 0 && (size_t)n < sizeof(manifest))
             {
                 unit_load(manifest);
             }
         }
+        discover_imports(u, 1, (NodeId)u->nodes.size);
+        if (u->is_manifest && !u->broken)
+        {
+            read_manifest(u);
+        }
 
-        walk_ast_iterative(u, u->root, discover_visit, NULL);
+        // loading an imported file is accounted to its own scan/parse/declare
+        cx.phase_ns[PHASE_LINK] += clock_ns() - t -
+                                   (cx.phase_ns[PHASE_SCAN] + cx.phase_ns[PHASE_PARSE] +
+                                    cx.phase_ns[PHASE_DECLARE] - loading);
     }
+}
 
-    // B. Read every mod.modal: its configuration, and which modules form the domain's face.
+void module_body_nodes(Unit *u, NodeId from)
+{
+    if (discover_imports(u, from, (NodeId)u->nodes.size))
+    {
+        link_new_units(); // an import inside a body: its file must be linked before use
+    }
+    module_check_paths(u, from, (NodeId)u->nodes.size);
+}
+
+void modules_link(void)
+{
+    link_new_units();
+
+    // Each file: the module paths of its declarations, then its bodies one at a time.
     for (uint16_t i = 0; i < cx.nunits; i++)
     {
-        if (cx.units[i].is_manifest && !cx.units[i].broken)
+        Unit *u = &cx.units[i];
+        if (u->broken)
         {
-            read_manifest(&cx.units[i]);
+            sema_syntax_only(u); // still report the syntax errors inside its bodies
+            continue;
         }
-    }
+        uint64_t t = clock_ns();
+        module_check_paths(u, 1, (NodeId)u->nodes.size);
+        t = phase_end(PHASE_LINK, t);
 
-    // C. Check every import against what exists and what can be seen from the importer.
-    for (uint16_t i = 0; i < cx.nunits; i++)
-    {
-        if (!cx.units[i].broken)
+        if (cache_lookup(u))
         {
-            walk_ast_iterative(&cx.units[i], cx.units[i].root, check_visit, NULL);
-            sema_check(&cx.units[i]); // D. names and invocations inside bodies
+            phase_end(PHASE_CHECK, t);
+            continue; // unchanged, and so were the declarations it can see: checked before
         }
+
+        uint64_t inside = cx.phase_ns[PHASE_PARSE] + cx.phase_ns[PHASE_EMIT];
+        uint32_t names = cx.names_resolved, calls = cx.calls_resolved;
+        uint16_t units = cx.nunits;
+        sema_check(u);
+        if (!u->errors && cx.nunits == units) // clean, and no body brought in another file
+        {
+            cache_record(u, cx.names_resolved - names, cx.calls_resolved - calls);
+        }
+        // bodies parsed and emitted during the check are accounted to their own phases
+        cx.phase_ns[PHASE_CHECK] +=
+            clock_ns() - t - (cx.phase_ns[PHASE_PARSE] + cx.phase_ns[PHASE_EMIT] - inside);
     }
 }

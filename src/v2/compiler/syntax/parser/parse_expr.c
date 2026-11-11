@@ -77,19 +77,19 @@ NodeId parse_expression(Parser *p)
 static NodeId nud_number(Parser *p)
 {
     parser_advance(p);
-    return ast.new.node(p->unit, AST_NUMBER_LIT, tok_idx(p, p->previous), 0, 0, 0);
+    return node_new(p->unit, AST_NUMBER_LIT, tok_idx(p, p->previous), 0, 0, 0);
 }
 
 static NodeId nud_string(Parser *p)
 {
     parser_advance(p);
-    return ast.new.node(p->unit, AST_STRING_LIT, tok_idx(p, p->previous), 0, 0, 0);
+    return node_new(p->unit, AST_STRING_LIT, tok_idx(p, p->previous), 0, 0, 0);
 }
 
 static NodeId nud_ident(Parser *p)
 {
     parser_advance(p);
-    return ast.new.node(p->unit, AST_IDENT, tok_idx(p, p->previous), 0, 0, 0);
+    return node_new(p->unit, AST_IDENT, tok_idx(p, p->previous), 0, 0, 0);
 }
 
 static NodeId nud_unary(Parser *p)
@@ -97,7 +97,7 @@ static NodeId nud_unary(Parser *p)
     const Token *op = p->current;
     parser_advance(p);
     NodeId operand = parse_precedence(p, PREC_UNARY);
-    return operand ? ast.new.node(p->unit, AST_UNARY_OP, tok_idx(p, op), operand, 0, 0) : 0;
+    return operand ? node_new(p->unit, AST_UNARY_OP, tok_idx(p, op), operand, 0, 0) : 0;
 }
 
 // `(` opens either a grouped expression or a function literal `(params) [T] { ... }`.
@@ -110,7 +110,7 @@ static int paren_opens_fn_literal(const Parser *p, const Token *open)
         return 0;
     }
     const Token *after = TOK(p->unit, open->match) + 1;
-    if (after->kind == TOK_LBRACE)
+    if (is_body_start(after))
     {
         return 1;
     }
@@ -122,6 +122,36 @@ static int paren_opens_fn_literal(const Parser *p, const Token *open)
            (after->kind == TOK_LBRACKET && after[1].kind == TOK_RBRACKET);
 }
 
+// (params) [T] { body }
+static NodeId parse_fn_literal(Parser *p)
+{
+    Unit *u = p->unit;
+    const Token *open = p->current;
+    int has_self = 0, deferred = 0;
+    NodeId ret = 0;
+    NodeId params = parse_params(p, &has_self);
+    if (p->panic)
+    {
+        return 0;
+    }
+    if (!is_body_start(p->current))
+    {
+        ret = parse_type(p);
+        if (!ret)
+        {
+            return 0;
+        }
+    }
+    NodeId body = parse_body(p, &deferred);
+    if (!body)
+    {
+        return 0;
+    }
+    NodeId fn = node_new(u, AST_FN_LIT, tok_idx(p, open), params, ret, body);
+    NODE(u, fn)->flags = (uint8_t)((has_self ? AST_F_SELF : 0) | (deferred ? AST_F_LAZY : 0));
+    return fn;
+}
+
 static NodeId nud_paren(Parser *p)
 {
     Unit *u = p->unit;
@@ -129,29 +159,7 @@ static NodeId nud_paren(Parser *p)
 
     if (paren_opens_fn_literal(p, open))
     {
-        int has_self = 0;
-        NodeId ret = 0;
-        NodeId params = parse_params(p, &has_self);
-        if (p->panic)
-        {
-            return 0;
-        }
-        if (p->current->kind != TOK_LBRACE)
-        {
-            ret = parse_type(p);
-            if (!ret)
-            {
-                return 0;
-            }
-        }
-        NodeId body = parse_block(p);
-        if (!body)
-        {
-            return 0;
-        }
-        NodeId fn = ast.new.node(u, AST_FN_LIT, tok_idx(p, open), params, ret, body);
-        NODE(u, fn)->flags = has_self ? AST_F_SELF : 0;
-        return fn;
+        return parse_fn_literal(p);
     }
 
     parser_advance(p);
@@ -162,7 +170,7 @@ static NodeId nud_paren(Parser *p)
     {
         return 0;
     }
-    return ast.new.node(u, AST_PAREN_GROUP, tok_idx(p, open), inner, 0, 0);
+    return node_new(u, AST_PAREN_GROUP, tok_idx(p, open), inner, 0, 0);
 }
 
 // import("std")   import(std)   -- a comptime macro; selectors are applied by led_dot.
@@ -184,7 +192,7 @@ static NodeId nud_import(Parser *p)
     {
         return 0;
     }
-    return ast.new.node(p->unit, AST_IMPORT, tok_idx(p, arg), 0, 0, 0);
+    return node_new(p->unit, AST_IMPORT, tok_idx(p, arg), 0, 0, 0);
 }
 
 // ---- infix handlers --------------------------------------------------------------------------
@@ -194,7 +202,7 @@ static NodeId led_binary(Parser *p, NodeId left)
     const Token *op = p->current;
     parser_advance(p);
     NodeId right = parse_precedence(p, rules[op->kind].prec); // left-associative
-    return right ? ast.new.node(p->unit, AST_BIN_OP, tok_idx(p, op), left, right, 0) : 0;
+    return right ? node_new(p->unit, AST_BIN_OP, tok_idx(p, op), left, right, 0) : 0;
 }
 
 static NodeId led_assign(Parser *p, NodeId left)
@@ -202,7 +210,7 @@ static NodeId led_assign(Parser *p, NodeId left)
     const Token *op = p->current;
     parser_advance(p);
     NodeId value = parse_precedence(p, PREC_ASSIGN - 1); // right-associative
-    return value ? ast.new.node(p->unit, AST_ASSIGN, tok_idx(p, op), left, value, 0) : 0;
+    return value ? node_new(p->unit, AST_ASSIGN, tok_idx(p, op), left, value, 0) : 0;
 }
 
 static NodeId led_call(Parser *p, NodeId left)
@@ -232,7 +240,7 @@ static NodeId led_call(Parser *p, NodeId left)
     {
         return 0;
     }
-    return ast.new.node(u, AST_CALL, tok_idx(p, open), left, args.head, 0);
+    return node_new(u, AST_CALL, tok_idx(p, open), left, args.head, 0);
 }
 
 // Lua-style call with a single string argument: print "hello"
@@ -247,7 +255,7 @@ static NodeId led_string_call(Parser *p, NodeId left)
         return 0;
     }
     NodeId arg = nud_string(p);
-    return ast.new.node(u, AST_CALL, NODE(u, arg)->tok, left, arg, 0);
+    return node_new(u, AST_CALL, NODE(u, arg)->tok, left, arg, 0);
 }
 
 static NodeId led_index(Parser *p, NodeId left)
@@ -261,7 +269,7 @@ static NodeId led_index(Parser *p, NodeId left)
     {
         return 0;
     }
-    return ast.new.node(p->unit, AST_INDEX, tok_idx(p, open), left, index, 0);
+    return node_new(p->unit, AST_INDEX, tok_idx(p, open), left, index, 0);
 }
 
 // left.name   and, on an import chain only:   left.*   left.(a, b as c)
@@ -281,7 +289,7 @@ static NodeId led_dot(Parser *p, NodeId left)
     if (t->kind == TOK_IDENTIFIER)
     {
         parser_advance(p);
-        return ast.new.node(u, AST_SELECTOR, tok_idx(p, t), left, 0, 0);
+        return node_new(u, AST_SELECTOR, tok_idx(p, t), left, 0, 0);
     }
 
     if (t->kind == TOK_STAR || t->kind == TOK_LPAREN)
@@ -294,7 +302,7 @@ static NodeId led_dot(Parser *p, NodeId left)
         parser_advance(p);
         if (t->kind == TOK_STAR)
         {
-            return ast.new.node(u, AST_IMPORT_ALL, tok_idx(p, t), left, 0, 0);
+            return node_new(u, AST_IMPORT_ALL, tok_idx(p, t), left, 0, 0);
         }
 
         p->paren_depth++;
@@ -304,7 +312,7 @@ static NodeId led_dot(Parser *p, NodeId left)
         {
             return 0;
         }
-        return ast.new.node(u, AST_IMPORT_PICK, tok_idx(p, t), left, items, 0);
+        return node_new(u, AST_IMPORT_PICK, tok_idx(p, t), left, items, 0);
     }
 
     parser_error_at(p, t, "expected a member name after '.'");

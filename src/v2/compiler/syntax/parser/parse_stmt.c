@@ -25,7 +25,7 @@ NodeId parse_statement(Parser *p)
                 return 0;
             }
         }
-        return ast.new.node(p->unit, AST_RETURN, tok_idx(p, t), value, 0, 0);
+        return node_new(p->unit, AST_RETURN, tok_idx(p, t), value, 0, 0);
     }
     case TOK_LBRACE:
         return parse_block(p);
@@ -81,5 +81,5 @@ NodeId parse_block(Parser *p)
     {
         return 0;
     }
-    return ast.new.node(u, AST_BLOCK, tok_idx(p, open), stmts.head, 0, 0);
+    return node_new(u, AST_BLOCK, tok_idx(p, open), stmts.head, 0, 0);
 }
