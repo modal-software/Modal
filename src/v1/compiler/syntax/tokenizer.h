@@ -40,7 +40,7 @@ typedef enum
     TOK_AWAIT,
     TOK_AND,
     TOK_OR,
-    TOK_WRITE,
+    // TOK_WRITE,
     // Multi-char operators
     TOK_Q_DOT,
     TOK_EQ,

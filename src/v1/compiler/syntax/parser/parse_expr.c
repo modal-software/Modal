@@ -22,15 +22,18 @@ uint32_t hash(char *str)
 static void declare(AstNode *expr);
 static inline AstNode *parse_primary(Parser *p)
 {
+    // ANALYSE: NUMBER
     if (parser_match(p, NUMBER))
     {
         long long val = strtoll(p->previous.start, NULL, 10);
         return ast.new.number(p->previous, val);
     }
 
+    // ANALYSE: CONST
     if (parser_match(p, TOK_CONST))
     {
         Token tok = p->current;
+        // ANALYSE: CONST -> IDENTIFIER 'X' I.e: 'const x'
         parser_match(p, IDENTIFIER);
         printf("%s", p->current.start);
         return ast.new.ident(p->previous);
@@ -44,6 +47,7 @@ static inline AstNode *parse_primary(Parser *p)
         sprintf(buffer, "%.*s", tok.len, tok.start);
 
         const char *ident = buffer;
+        printf("%.s", p->previous.start);
 
         if (parser_match(p, TOK_DEFINE))
         {
@@ -61,6 +65,14 @@ static inline AstNode *parse_primary(Parser *p)
             return define;
         }
 
+        if (p->current.kind == LPAREN)
+        {
+            // AstNode *expr = parse_group(p);
+            AstNode *expr = parse_invoke(p);
+            ast.print(expr);
+            return expr;
+        }
+
         if (parser_match(p, TOK_EQ))
         {
             printf("%s", ident);
@@ -70,6 +82,13 @@ static inline AstNode *parse_primary(Parser *p)
     }
 
     if (parser_match(p, LPAREN))
+    {
+        AstNode *expr = parse_group(p);
+        // ast.print(expr);
+        return expr;
+    }
+
+    if (parser_match(p, LBRACE))
     {
         AstNode *expr = parse_group(p);
         // ast.print(expr);
@@ -195,7 +214,7 @@ AstNode *parse_group(Parser *p)
 
     while (p->current.kind != RPAREN && p->current.kind != TOK_EOF)
     {
-        AstNode *stmt = parse_statement(p);
+        AstNode *stmt = parse_expression(p);
         if (p->had_error || !stmt)
         {
             parser_synchronize(p);
@@ -227,6 +246,93 @@ AstNode *parse_group(Parser *p)
     parser_advance(p);
 
     return ast.new.group(open_tok, stmts, count);
+}
+
+AstNode *parse_block(Parser *p)
+{
+    if (!parser_match(p, LBRACE))
+    {
+        parser_error_at(p, &p->current, "expected '{' to start block");
+        return NULL;
+    }
+
+    Token open_tok = p->previous;
+
+    size_t count = 0, cap = 4;
+    AstNode **stmts = malloc(cap * sizeof(AstNode *));
+    if (!stmts)
+    {
+        return NULL;
+    }
+
+    while (p->current.kind != RBRACE && p->current.kind != TOK_EOF)
+    {
+        AstNode *stmt = parse_statement(p);
+        if (p->had_error || !stmt)
+        {
+            parser_synchronize(p);
+            continue;
+        }
+
+        if (count >= cap)
+        {
+            cap *= 2;
+            AstNode **new_stmts = realloc(stmts, cap * sizeof(AstNode *));
+            if (!new_stmts)
+            {
+                free(stmts);
+                return NULL;
+            }
+            stmts = new_stmts;
+        }
+
+        stmts[count++] = stmt;
+    }
+
+    parser_consume(p, RBRACE, "expected '}' at end of block");
+    AstNode *node = ast.new.block(open_tok, stmts, count);
+    return node;
+}
+AstNode *parse_invoke(Parser *p)
+{
+    // parser_consume(p, TOK_DEFINE, "missing 'write' statement");
+
+    AstNode *args = {0};
+    Fmt fmt = FMT_LITERAL;
+    //
+    // if (p->current.kind != LPAREN)
+    // {
+    //     args = parse_expression(p);
+    //     write(STDOUT_FILENO, args->data.string.value, args->data.string.len);
+    //
+    //     return ast.new.write(args, fmt);
+    // }
+
+    fmt = FMT_GROUPED;
+    AstNode *ident = ast.new.ident(p->previous);
+    // printf("%s", ident->data.ident.name);
+    args = parse_expression(p);
+
+    // Storage arguments statements
+    AstNode **stmts = args->data.block_or_group.stmts;
+
+    size_t stmts_count = args->data.block_or_group.count;
+    // Valid those statements, in our case we need to validate if are string
+    if (stmts_count == 0)
+    {
+        parser_error_at(p, &p->previous, "%.*s must have arguments", (int)ident->data.ident.len,
+                        ident->data.ident.name);
+    }
+
+    // printf("invoked: %.*s\n", (int)ident->data.ident.len, ident->data.ident.name);
+
+    for (size_t i = 0; i < args->data.block_or_group.count; i++)
+    {
+        // write(STDOUT_FILENO, stmts[i]->data.string.value, stmts[i]->data.string.len);
+    }
+    // return ast.new.write(args, fmt);
+    printf("%s", ident->data.ident.name);
+    return ast.new.invoke(args, ident);
 }
 
 void exec_node(AstNode *node)

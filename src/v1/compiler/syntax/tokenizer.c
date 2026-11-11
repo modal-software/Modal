@@ -10,7 +10,7 @@ static const Keyword keywords[] = {
     {"alias", 5, TOK_ALIAS}, {"use", 3, TOK_USE},           {"comptime", 8, TOK_COMPTIME},
     {"union", 5, TOK_UNION}, {"asm", 3, TOK_ASM},           {"volatile", 8, TOK_VOLATILE},
     {"async", 5, TOK_ASYNC}, {"await", 5, TOK_AWAIT},       {"and", 3, TOK_AND},
-    {"or", 2, TOK_OR},       {"write", 5, TOK_WRITE},       {"const", 5, TOK_CONST},
+    {"or", 2, TOK_OR},       {"const", 5, TOK_CONST},
 };
 
 static TokenKind check_identifier(const char *s, int len)
@@ -22,7 +22,7 @@ static TokenKind check_identifier(const char *s, int len)
             return keywords[i].kind;
         }
     }
-    return TOK_IDENTIFIER;
+    return IDENTIFIER;
 }
 
 Token next(Tokenizer *t)
@@ -286,7 +286,7 @@ Token next(Tokenizer *t)
         default:
             tokenizer.advance(t);
             t->state = LEX_STATE_START;
-            return token.new(TOK_UNKNOWN, start, 1, start_line, start_col);
+            return token.new(UNKNOWN, start, 1, start_line, start_col);
         }
     }
 }

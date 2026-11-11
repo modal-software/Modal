@@ -43,19 +43,43 @@ void parser_consume(Parser *p, Kind kind, const char *msg)
 AstNode *parse_program(Parser *p)
 {
     AstNode **stmts = NULL;
+    LFPool *lfpool = {0};
     size_t count = 0;
     size_t cap = 8;
 
-    stmts = malloc(cap * sizeof(AstNode *));
+    if (!pool->allocator(&lfpool, cap * sizeof(AstNode *)))
+    {
+        return NULL;
+    };
+    stmts = (AstNode **)pool->alloc(lfpool);
     if (!stmts)
     {
+        pool->drop(lfpool);
         return NULL;
     }
 
     while (p->current.kind != TOK_EOF)
     {
 
-        AstNode *stmt = parse_statement(p);
+        AstNode *stmt = {0};
+        switch (p->current.kind)
+        {
+        case LPAREN:
+        case IDENTIFIER:
+        case TOK_CONST:
+        case TOK_DEFINE:
+        case STRING:
+            stmt = parse_expression(p);
+        case ASSERT:
+        case TEST:
+            stmt = parse_statement(p);
+        default:
+        {
+            // stmt = parse_expression(p);
+
+            return NULL;
+        }
+        }
         if (p->had_error)
         {
             parser_synchronize(p);
@@ -81,16 +105,3 @@ AstNode *parse_program(Parser *p)
 
     return *stmts;
 }
-
-// if (count >= cap)
-// {
-//     cap *= 2;
-//     AstNode **new_stmts = realloc(stmts, cap * sizeof(AstNode *));
-//     if (!new_stmts)
-//     {
-//         free((void *)stmts);
-//         return NULL;
-//     }
-//     stmts = new_stmts;
-// }
-// stmts[count++] = stmt;

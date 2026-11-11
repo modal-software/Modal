@@ -1,3 +1,4 @@
+#include "cx.h"
 #include "syntax/parser/parser.h"
 #include <stdarg.h>
 #include <stdio.h>
@@ -10,8 +11,9 @@ void fatal(const char *fmt)
 void parser_error_at(Parser *p, Token *tok, const char *fmt, ...)
 {
     p->had_error = 1; // global state for application
+    cx.ok = 0;
 
-    fprintf(stderr, "\nerror [%s:%d:%d]: ", p->filename, tok->line, tok->col);
+    fprintf(stderr, "\nfatal [%s:%d:%d]: ", p->filename, tok->line, tok->col);
 
     va_list args;
     va_start(args, fmt);
@@ -57,7 +59,7 @@ void parser_synchronize(Parser *p)
         switch (p->current.kind)
         { // keywords que começam novo stmt
         case TEST:
-        case WRITE:
+        case IDENTIFIER:
         case ASSERT:
         case LBRACE:
         case RBRACE:

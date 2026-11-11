@@ -69,6 +69,15 @@ static void printer(AstNode *tree)
                tree->data.expr.rhs->data.ident.name);
         break;
     }
+
+        // case AST_INVOKE:
+        // {
+        //     printf("\n\nAST_INVOKE:\n     \tcallee:\n\t     --\tfunction: %.*s",
+        //            tree->data.invoke.callee->data.ident.len,
+        //            tree->data.invoke.callee->data.ident.name);
+        //
+        //     break;
+        // }
     default:
         break;
     }
@@ -285,6 +294,39 @@ static AstNode *ast_new_test(Token tok, AstNode *block)
     return node;
 }
 
+static AstNode *ast_new_invoke(AstNode *n, AstNode *c)
+{
+    AstNode *node = malloc(sizeof(AstNode));
+    if (!node)
+    {
+        return NULL;
+    }
+
+    // if (n->kind != AST_PAREN_GROUP)
+    // {
+    //
+    //     *node = (AstNode){.kind = AST_WRITE_STMT,
+    //                       .token = n->token,
+    //                       .data = {.write = {.group = NULL, fmt = fmt}}};
+    //     return node;
+    // }
+
+    *node = (AstNode){
+        .kind = AST_INVOKE,
+        .token = n->token,
+        .data =
+            {
+                .invoke =
+                    {
+                        .expr = n,
+                        .callee = c,
+                    },
+            },
+    };
+
+    return node;
+}
+
 static AstNode *ast_new_write(AstNode *n, Fmt fmt)
 {
     AstNode *node = malloc(sizeof(AstNode));
@@ -303,7 +345,17 @@ static AstNode *ast_new_write(AstNode *n, Fmt fmt)
     }
 
     *node = (AstNode){
-        .kind = AST_WRITE_STMT, .token = n->token, .data = {.write = {.group = n, fmt = fmt}}};
+        .kind = AST_WRITE_STMT,
+        .token = n->token,
+        .data =
+            {
+                .write =
+                    {
+                        .group = n,
+                        fmt = fmt,
+                    },
+            },
+    };
 
     return node;
 }
@@ -332,6 +384,9 @@ static void ast_free(struct AstNode *node)
         }
         free(node->data.block_or_group.stmts);
         break;
+    case AST_INVOKE:
+        ast_free(node->data.invoke.expr);
+        break;
     case AST_TEST_STMT:
         ast_free(node->data.test.block);
         break;
@@ -355,6 +410,7 @@ const AstImpl ast = (AstImpl){
     .free = ast_free,
     .new =
         {
+            .invoke = ast_new_invoke,
             .string = ast_new_string,
             .write = ast_new_write,
             .test = ast_new_test,

@@ -44,6 +44,8 @@ typedef enum
     AST_BLOCK,
     AST_EXPR,
     AST_TEST_STMT,
+    AST_INVOKE,
+    AST_SELECTOR,
     AST_ASSERT_STMT,
     AST_WRITE_STMT,
     AST_STRING_LIT,
@@ -53,7 +55,7 @@ typedef enum
 typedef enum
 {
     FMT_GROUPED,
-    FMT_LITERAL
+    FMT_LITERAL,
 } Fmt;
 
 typedef struct AstNode
@@ -116,6 +118,18 @@ typedef struct AstNode
 
         struct
         {
+            struct AstNode *operand;
+            const char *field;
+        } selector;
+
+        struct
+        {
+            struct AstNode *callee;
+            struct AstNode *expr;
+        } invoke;
+
+        struct
+        {
             struct AstNode *group;
             Fmt fmt;
         } write;
@@ -149,6 +163,7 @@ typedef struct
     AstNode *(*group)(Token open_brace, AstNode **stmts, size_t count);
     AstNode *(*block)(Token open_brace, AstNode **stmts, size_t count);
     AstNode *(*test)(Token token, AstNode *block);
+    AstNode *(*invoke)(AstNode *n, AstNode *c);
     AstNode *(*write)(AstNode *n, Fmt fmt);
     AstNode *(*assertFn)(AstNode *expr);
     AstNode *(*number)(Token tok, long long val);

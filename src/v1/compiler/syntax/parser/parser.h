@@ -73,12 +73,13 @@ uint64_t eval_expr(AstNode *expr);    // em parse_expr.c
 void exec_node(AstNode *node);        // em parse_expr.c
 void exec_program(AstNode *root);     // em parse_expr.c
 AstNode *parse_string(Parser *p);     // em parse_stmt.c
-AstNode *parse_write(Parser *p);      // em parse_stmt.c
-AstNode *parse_assert(Parser *p);     // em parse_stmt.c
-AstNode *parse_statement(Parser *p);  // em parse_stmt.c
-AstNode *parse_block(Parser *p);      // em parse_stmt.c
-AstNode *parse_assert(Parser *p);     // em parse_stmt.c
-AstNode *parse_group(Parser *p);      // em parse_stmt.c
+// AstNode *parse_write(Parser *p);      // em parse_stmt.c
+AstNode *parse_invoke(Parser *p);    // em parse_stmt.c
+AstNode *parse_assert(Parser *p);    // em parse_stmt.c
+AstNode *parse_statement(Parser *p); // em parse_stmt.c
+AstNode *parse_block(Parser *p);     // em parse_stmt.c
+AstNode *parse_assert(Parser *p);    // em parse_stmt.c
+AstNode *parse_group(Parser *p);     // em parse_stmt.c
 // Futuro:
 AstNode *parse_test_decl(Parser *p);
 // AstNode  *parse_declaration(Parser *p);        // fn, struct, var...
