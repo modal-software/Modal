@@ -1,0 +1,84 @@
+-- invocations that resolve: each one leads to a declaration and fits it.
+-- The failing counterparts are in errors/calls.modal.
+
+counter: struct {
+    u8 total,
+
+    -- inside the braces: a helper, reached through self
+    bump(self, by: u8): u8 {
+        return self.total + by
+    }
+
+    -- overloaded helpers: told apart by the number of arguments
+    u8 mix(self, a: u8): self.total + a
+    u8 mix(self, a, b: u8): self.total + a + b
+}
+
+-- the face of counter: methods written outside its braces
+read(self: counter): u8 {
+    return self.total
+}
+
+advance(self: counter, by: u8): u8 {
+    once := self.bump(by)
+    twice := self.bump(once)
+    return self.mix(once) + self.mix(once, twice)
+}
+
+-- free functions
+double(n: u8): u8 {
+    return n * 2
+}
+
+u8 scale(n: u8): n * 2
+u8 scale(n, factor: u8): n * factor
+
+-- a function declared later can be called from earlier code
+first(): u8 {
+    return second(1)
+}
+
+second(n: u8): u8 {
+    return double(n)
+}
+
+-- a binding that holds a function is called like any other
+triple := (n: u8) u8 {
+    return n * 3
+}
+
+-- calls through imports
+print := import("std").io.print
+
+main(c: counter): u8 {
+    -- one definition
+    a := double(1)
+
+    -- an overload set: either definition may match
+    b := scale(a)
+    d := scale(a, b)
+
+    -- a call as an argument, and a call on the result of a binding
+    e := double(scale(a, triple(b)))
+
+    -- methods on a value
+    f := c.read()
+    g := c.advance(e)
+
+    -- a local is visible after its declaration, also inside a nested function
+    add_e := (n: u8) u8 {
+        return n + e + double(n)
+    }
+    h := add_e(f)
+
+    -- an inner block sees the outer locals
+    {
+        inner := first() + h
+        print(inner)
+    }
+
+    -- Lua-style call with one string argument
+    print "done"
+
+    return g + second(d)
+}

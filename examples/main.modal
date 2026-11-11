@@ -1,0 +1,41 @@
+-- entry point, in the root domain: it sees `example` only through example/mod.modal
+
+-- the three import spellings
+can_import_directly_the_module := import("./example")
+or_can_import_directly_the_file := import("john.modal")
+
+-- selectors, wildcard, destructuring, aliases
+john_class := import("john").john_nested_class
+io := import("std").io.*
+file_and_print := import("std").io.(file, print)
+
+val (
+    new as make_john,
+    add_normal as add
+): import("john").john_nested_class
+
+import("std").io.(
+    file as fake_get_filename_function,
+    print as fake_print_function
+)
+
+-- 1. a binding that holds a function
+start := () int {
+    print "starting"
+    return 0
+}
+
+-- 2. immutable method
+main(): u8 {
+    john := make_john()
+    total := add(john, 3)
+    fake_print_function(total)
+    return 0
+}
+
+-- 3. mutable methods: the same name with different parameter types
+u8 scale(n: u8) {
+    return n * 2
+}
+
+u8 scale(n, factor: u8): n * factor

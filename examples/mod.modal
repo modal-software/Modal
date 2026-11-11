@@ -1,0 +1,12 @@
+-- domain `example`: its configuration, and the modules that form its face.
+-- Members are never listed here; each struct decides its own face by position.
+
+implicit_self := false
+nil_return := true
+version := "0.1.0"
+
+john := import("./john")
+
+init := (self) {
+    return self
+}

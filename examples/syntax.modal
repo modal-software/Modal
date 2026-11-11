@@ -1,0 +1,33 @@
+-- each mistake below is reported once, and parsing carries on after it
+
+val (
+    file as,
+    123,
+    print as fake_print
+): import(std).io
+
+point: struct {
+pub:
+    x: u8,
+    u8 y
+}
+
+area(self: point): u8 {
+    a := self.x b := self.y
+    return a * b
+}
+
+area(self: point): u8 {
+    return 0
+}
+
+u8 twice(n: u8): n * 2
+u8 twice(m: u8): m + m
+
+grow(self: elsewhere): u8 {
+    return 1
+}
+
+sum(a, b): u8 {
+    return a + b
+}

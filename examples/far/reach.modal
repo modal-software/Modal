@@ -1,0 +1,2 @@
+-- `inner` is internal to `example`; this file is not under `example`
+gauge := import("../../example/inner").deep.gauge
