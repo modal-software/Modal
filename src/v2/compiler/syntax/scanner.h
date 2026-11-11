@@ -1,10 +1,16 @@
-#ifndef LEXER_H
-#define LEXER_H
+// scanner.h (v2): flat, zero-copy token stream.
+//
+// Tokens are slices into the source buffer (start + len). The whole file is scanned once into
+// one contiguous array, sized exactly, that ends with a TOK_EOF sentinel, so the parser walks it
+// with a plain pointer and can look ahead with tok[1] at no cost.
+#ifndef MODAL_V2_SCANNER_H
+#define MODAL_V2_SCANNER_H
 
 #include <stddef.h>
+#include <stdint.h>
+
 #define MODAL_VERSION "0.0.3"
 
-// Token kinds - what the token represents
 typedef enum
 {
     TOK_EOF,
@@ -54,38 +60,50 @@ typedef enum
     TOK_ELLIPSIS,
     TOK_DOTDOT,
     TOK_ARROW,
+    // v2: operators that used to be lumped into TOK_OPERATOR
+    TOK_LBRACKET,
+    TOK_RBRACKET,
+    TOK_DOT,
+    TOK_STAR,
+    TOK_PLUS,
+    TOK_MINUS,
+    TOK_SLASH,
+    TOK_AMP,
+    TOK_BANG,
+    TOK_NEQ,
+    TOK_LT,
+    TOK_GT,
+    TOK_LE,
+    TOK_GE,
+    // v2: keywords
+    TOK_STRUCT,
+    TOK_IMPORT,
+    TOK_AS,
+    TOK_VAL,
+    TOK_RETURN,
+    TOK__COUNT,
 } TokenKind;
 
-// Lexer states - internal scanning state machine
-typedef enum
-{
-    LEX_STATE_START,
-    LEX_STATE_IDENTIFIER,
-    LEX_STATE_GENDECL,
-    LEX_STATE_NUMBER_INT,
-    LEX_STATE_NUMBER_FLOAT,
-    LEX_STATE_STRING_LIT,
-    LEX_STATE_LINE_COMMENT,
-    LEX_STATE_BLOCK_COMMENT,
-} LexerState;
-
+// 16 bytes. A token is a slice of the source buffer plus what the parser needs to move fast.
+// Line and column are not stored: they are only needed for a diagnostic, and are recomputed
+// from `start` at that moment (see source_pos).
 typedef struct
 {
-    TokenKind kind;
-    const char *start;
-    int len;
-    int line;
-    int col;
+    const char *start;   // into the source buffer, never copied
+    uint32_t len : 24;   // a token is at most 16 MB long
+    uint32_t kind : 8;   // TokenKind
+    uint32_t match : 31; // for ( [ { and their closers: index of the partner, 0 if unbalanced
+    uint32_t nl : 1;     // first token on its line: this is how statements end without ';'
 } Token;
 
+_Static_assert(sizeof(Token) == 16, "Token must stay 16 bytes");
+
 typedef struct
 {
-    const char *buffer;
-    int pos;
-    int line;
-    int col;
-    LexerState state;
-} Tokenizer;
+    Token *data;
+    size_t size;
+    size_t cap;
+} TokenVec;
 
 typedef struct
 {
@@ -94,46 +112,14 @@ typedef struct
     TokenKind kind;
 } Keyword;
 
-// Legacy aliases for compatibility - can be removed once parser is updated
-#define Kind TokenKind
-#define LPAREN TOK_LPAREN
-#define RPAREN TOK_RPAREN
-#define LBRACE TOK_LBRACE
-#define RBRACE TOK_RBRACE
-#define OPERATOR TOK_OPERATOR
-#define IDENTIFIER TOK_IDENTIFIER
-#define UNKNOWN TOK_UNKNOWN
-#define NUMBER TOK_NUMBER
-#define STRING TOK_STRING
-#define TEST TOK_TEST
-#define ASSERT TOK_ASSERT
-#define WRITE TOK_WRITE
-#define SIZEOF TOK_SIZEOF
-#define DEFER TOK_DEFER
-#define AUTOFREE TOK_AUTOFREE
-#define ALIAS TOK_ALIAS
-#define USE TOK_USE
-#define COMPTIME TOK_COMPTIME
-#define UNION TOK_UNION
-#define ASM TOK_ASM
-#define VOLATILE TOK_VOLATILE
-#define ASYNC TOK_ASYNC
-#define AWAIT TOK_AWAIT
-#define AND TOK_AND
-#define OR TOK_OR
-#define Q_DOT TOK_Q_DOT
-#define QQ_EQ TOK_QQ_EQ
-#define QQ TOK_QQ
-#define QUESTION TOK_QUESTION
-#define PIPE TOK_PIPE
-#define DCOLON TOK_DCOLON
-#define ELLIPSIS TOK_ELLIPSIS
-#define DOTDOT TOK_DOTDOT
-#define ARROW TOK_ARROW
-#define PREPROC TOK_PREPROC
+// Scans `src` (NUL-terminated) into `out`. The source is scanned twice: once to count the
+// tokens, once to fill an array of exactly that size, so nothing is over-reserved or moved.
+// Returns the number of lexical errors (already reported to stderr).
+int scan_all(const char *filename, const char *src, TokenVec *out);
 
-Token next(Tokenizer *t);
-#define peek(t) ((t)->buffer[(t)->pos])
-#define peek_next(t) ((t)->buffer[(t)->pos] ? (t)->buffer[(t)->pos + 1] : '\0')
+// Line and column (1-based) of a position in `src`.
+void source_pos(const char *src, const char *at, int *line, int *col);
 
-#endif
+const char *token_kind_name(TokenKind kind);
+
+#endif // MODAL_V2_SCANNER_H

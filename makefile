@@ -5,7 +5,9 @@ LIBS = -lm -lpthread -ldl
 
 SRCS = ./src/v1/compiler/cx.c ./src/v1/compiler/syntax/tokenizer.impl.c ./src/v1/compiler/syntax/tokenizer.c ./src/v1/compiler/syntax/parser/parser.c ./src/v1/compiler/ast/ast.c ./src/v1/compiler/ast/error.c ./src/v1/compiler/syntax/parser/parse_decl.c ./src/v1/compiler/syntax/parser/parse_expr.c ./src/v1/compiler/syntax/parser/parse_stmt.c ./src/v1/compiler/test_runner.c ./main.c  # adicione todos .c
 
-SRCS_V2 = ./src/v2/compiler/syntax/scanner.c
+SRCS_V2 = ./src/v2/main.c ./src/v2/compiler/cx.c ./src/v2/compiler/syntax/scanner.c ./src/v2/compiler/syntax/parser/parser.c ./src/v2/compiler/syntax/parser/parse_decl.c ./src/v2/compiler/syntax/parser/parse_expr.c ./src/v2/compiler/syntax/parser/parse_stmt.c ./src/v2/compiler/ast/ast.c ./src/v2/compiler/ast/symbol.c ./src/v2/compiler/sema/resolve.c ./src/v2/compiler/sema/module.c ./src/v2/compiler/sema/check.c
+HDRS_V2 = $(wildcard ./src/v2/compiler/*.h ./src/v2/compiler/*/*.h ./src/v2/compiler/*/*/*.h ./src/v1/utils/*.h)
+CFLAGS_V2 = -Wall -Wextra -O2 -g -std=c17 -I src
 OBJS = $(SRCS:.c=.o)
 
 OUT_DIR := ./out
@@ -20,6 +22,18 @@ modal: $(OBJS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
+
+# v2 front-end: scan -> parse -> declare -> link (see docs/v2-frontend.md)
+v2: modal-v2
+
+modal-v2: $(SRCS_V2) $(HDRS_V2)
+	$(CC) $(CFLAGS_V2) $(SRCS_V2) -o ./modal-v2
+
+run_v2: modal-v2
+	./modal-v2 --syms --stats ./examples/v2/main.modal
+
+test_v2: modal-v2
+	sh ./src/v2/tests/run.sh
 
 run: modal
 	clear; ./modal ./examples/add.modal
@@ -62,6 +76,6 @@ bundle:
 	mkdir -p $(OUT_DIR)	
 
 clean:
-	rm -f $(OBJS) $(OBJS:.o=.d) modal
+	rm -f $(OBJS) $(OBJS:.o=.d) modal modal-v2
 
 -include $(OBJS:.o=.d)

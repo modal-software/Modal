@@ -1,24 +1,32 @@
-#include "cx.h"
-#include "v1/compiler/syntax/tokenizer.h"
-#include "v1/compiler/syntax/tokenizer.impl.h"
-#include <ctype.h>
+#include "v2/compiler/syntax/scanner.h"
+#include "v2/compiler/cx.h"
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
+#define SCAN_MAX_NESTING 256
+
 static const Keyword keywords[] = {
-    {"test", 4, TOK_TEST},   {"assert", 6, TOK_ASSERT},     {"sizeof", 6, TOK_SIZEOF},
-    {"defer", 5, TOK_DEFER}, {"autofree", 8, TOK_AUTOFREE}, {"fun", 3, TOK_FUNCTION},
-    {"alias", 5, TOK_ALIAS}, {"use", 3, TOK_USE},           {"comptime", 8, TOK_COMPTIME},
-    {"union", 5, TOK_UNION}, {"asm", 3, TOK_ASM},           {"volatile", 8, TOK_VOLATILE},
-    {"async", 5, TOK_ASYNC}, {"await", 5, TOK_AWAIT},       {"and", 3, TOK_AND},
-    {"or", 2, TOK_OR},       {"write", 5, TOK_WRITE},       {"const", 5, TOK_CONST},
+    {"test", 4, TOK_TEST},     {"assert", 6, TOK_ASSERT},     {"sizeof", 6, TOK_SIZEOF},
+    {"defer", 5, TOK_DEFER},   {"autofree", 8, TOK_AUTOFREE}, {"fun", 3, TOK_FUNCTION},
+    {"alias", 5, TOK_ALIAS},   {"use", 3, TOK_USE},           {"comptime", 8, TOK_COMPTIME},
+    {"union", 5, TOK_UNION},   {"asm", 3, TOK_ASM},           {"volatile", 8, TOK_VOLATILE},
+    {"async", 5, TOK_ASYNC},   {"await", 5, TOK_AWAIT},       {"and", 3, TOK_AND},
+    {"or", 2, TOK_OR},         {"write", 5, TOK_WRITE},       {"const", 5, TOK_CONST},
+    {"struct", 6, TOK_STRUCT}, {"import", 6, TOK_IMPORT},     {"as", 2, TOK_AS},
+    {"val", 3, TOK_VAL},       {"return", 6, TOK_RETURN},
 };
 
-static TokenKind check_identifier(const char *s, int len)
+static TokenKind keyword_kind(const char *s, int len)
 {
+    if (len < 2 || len > 8)
+    {
+        return TOK_IDENTIFIER;
+    }
     for (size_t i = 0; i < sizeof(keywords) / sizeof(keywords[0]); i++)
     {
-        if ((int)keywords[i].len == len && memcmp(s, keywords[i].kw, len) == 0)
+        if ((int)keywords[i].len == len && keywords[i].kw[0] == s[0] &&
+            memcmp(s, keywords[i].kw, (size_t)len) == 0)
         {
             return keywords[i].kind;
         }
@@ -26,284 +34,446 @@ static TokenKind check_identifier(const char *s, int len)
     return TOK_IDENTIFIER;
 }
 
-Token next(Tokenizer *t)
+static inline int is_digit(char c)
 {
-    const char *start = NULL;
-    int start_line = 0;
-    int start_col = 0;
-    // printf("s: %s\n", t->buffer);
+    return c >= '0' && c <= '9';
+}
 
-    for (;;)
+static inline int is_ident_start(char c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+}
+
+static inline int is_ident_char(char c)
+{
+    return is_ident_start(c) || is_digit(c);
+}
+
+static void scan_error(const char *filename, int line, int col, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    fprintf(stderr, "\nerror [%s:%d:%d]: ", filename, line, col);
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+    va_end(ap);
+}
+
+static TokenKind opener_of(TokenKind closer)
+{
+    switch (closer)
     {
-
-        char c = peek(t);
-        // printf("c: %c i: %i\n", c, t->state);
-
-        if (!c)
-        {
-            return token.new(TOK_EOF, t->buffer + t->pos, 0, t->line, t->col);
-        }
-
-        switch (t->state)
-        {
-        case LEX_STATE_START:
-            if (c == '"')
-            {
-                start = t->buffer + t->pos;
-                start_line = t->line;
-                start_col = t->col;
-                tokenizer.advance(t);
-                t->state = LEX_STATE_STRING_LIT;
-                continue;
-            }
-
-            if (isspace(c) || c == '\t' || c == '\r')
-            {
-                tokenizer.advance(t);
-                continue;
-            }
-
-            if (isalpha(c) || c == '_')
-            {
-                start = t->buffer + t->pos;
-                start_line = t->line;
-                start_col = t->col;
-                t->state = LEX_STATE_IDENTIFIER;
-                tokenizer.advance(t);
-                continue;
-            }
-
-            start = t->buffer + t->pos;
-            start_line = t->line;
-            start_col = t->col;
-
-            if (isdigit(c))
-            {
-                t->state = LEX_STATE_NUMBER_INT;
-                tokenizer.advance(t);
-                continue;
-            }
-
-            if (c == '-' && peek_next(t) == '-')
-            {
-                t->state = LEX_STATE_LINE_COMMENT;
-                tokenizer.advance(t);
-                continue;
-            }
-
-            if (c == '-' && peek_next(t) == '{')
-            {
-                t->state = LEX_STATE_BLOCK_COMMENT;
-                tokenizer.advance(t);
-                continue;
-            }
-
-            tokenizer.advance(t);
-            switch (c)
-            {
-            case '(':
-                return token.new(TOK_LPAREN, start, 1, start_line, start_col);
-            case ')':
-                return token.new(TOK_RPAREN, start, 1, start_line, start_col);
-            case '{':
-                return token.new(TOK_LBRACE, start, 1, start_line, start_col);
-            case '}':
-                return token.new(TOK_RBRACE, start, 1, start_line, start_col);
-            case '?':
-                if (peek(t) == '?')
-                {
-                    tokenizer.advance(t);
-                    if (peek(t) == '=')
-                    {
-                        tokenizer.advance(t);
-                        return token.new(TOK_QQ_EQ, start, 3, start_line, start_col);
-                    }
-                    return token.new(TOK_QQ, start, 2, start_line, start_col);
-                }
-                if (peek(t) == '.')
-                {
-                    tokenizer.advance(t);
-                    return token.new(TOK_Q_DOT, start, 2, start_line, start_col);
-                }
-                return token.new(TOK_QUESTION, start, 1, start_line, start_col);
-            case '.':
-                if (peek(t) == '.' && peek_next(t) == '.')
-                {
-                    tokenizer.advance(t);
-                    tokenizer.advance(t);
-                    return token.new(TOK_ELLIPSIS, start, 3, start_line, start_col);
-                }
-                if (peek(t) == '.')
-                {
-                    tokenizer.advance(t);
-                    return token.new(TOK_DOTDOT, start, 2, start_line, start_col);
-                }
-                break;
-            case '-':
-                if (peek(t) == '>')
-                {
-                    tokenizer.advance(t);
-                    return token.new(TOK_ARROW, start, 2, start_line, start_col);
-                }
-                break;
-            case '=':
-                if (peek(t) == '=')
-                {
-                    tokenizer.advance(t);
-                    return token.new(TOK_CMP, start, 2, start_line, start_col);
-                }
-                return token.new(TOK_EQ, start, 2, start_line, start_col);
-                break;
-            case ':':
-                if (peek(t) == ':')
-                {
-                    tokenizer.advance(t);
-                    return token.new(TOK_DCOLON, start, 2, start_line, start_col);
-                }
-                if (peek(t) == '=')
-                {
-                    tokenizer.advance(t);
-                    return token.new(TOK_DEFINE, start, 2, start_line, start_col);
-                }
-                break;
-            case '|':
-                return token.new(TOK_PIPE, start, 1, start_line, start_col);
-            }
-
-            return token.new(TOK_OPERATOR, start, 1, start_line, start_col);
-
-        case LEX_STATE_IDENTIFIER:
-            if (isalnum(c) || c == '_' || isalpha(c))
-            {
-                tokenizer.advance(t);
-                continue;
-            }
-            int len = (int)((t->buffer + t->pos) - start);
-
-            const TokenKind keyword = check_identifier(start, len);
-
-            t->state = LEX_STATE_START;
-            return token.new(keyword, start, len, start_line, start_col);
-
-        case LEX_STATE_NUMBER_INT:
-            if (isdigit(c))
-            {
-                tokenizer.advance(t);
-                continue;
-            }
-            if (c == '.')
-            {
-                t->state = LEX_STATE_NUMBER_FLOAT;
-                tokenizer.advance(t);
-                continue;
-            }
-            {
-                int len = (int)((t->buffer + t->pos) - start);
-                t->state = LEX_STATE_START;
-                return token.new(TOK_NUMBER, start, len, start_line, start_col);
-            }
-
-        case LEX_STATE_NUMBER_FLOAT:
-            if (isdigit(c))
-            {
-                tokenizer.advance(t);
-                continue;
-            }
-            {
-                int len = (int)((t->buffer + t->pos) - start);
-                t->state = LEX_STATE_START;
-                return token.new(TOK_NUMBER, start, len, start_line, start_col);
-            }
-        case LEX_STATE_STRING_LIT:
-        {
-            const char *buf = t->buffer;
-            int pos = t->pos;
-            // printf("STRING_LIT entry: \npos=%d \nchar='%c'\n\n", pos, buf[pos]);
-
-            while (buf[pos] != '\0' && buf[pos] != '"')
-            {
-                if (buf[pos] == '\\')
-                {
-                    pos++;
-                    t->col++;
-                    if (buf[pos] != '\0')
-                    {
-                        pos++;
-                        t->col++;
-                    }
-                }
-                else
-                {
-                    if (buf[pos] == '\n')
-                    {
-                        t->line++;
-                        t->col = 1;
-                    }
-                    else
-                    {
-                        t->col++;
-                    }
-                    pos++;
-                }
-            }
-
-            if (buf[pos] == '"')
-            {
-                pos++;
-                t->col++;
-            }
-            t->pos = pos;
-
-            int len = (int)((buf + t->pos) - start);
-            t->state = LEX_STATE_START;
-            // printf("STRING_LIT exit: \n\t-> pos=%d \n\t-> len=%d \n\t-> delimiter_char='%c' "
-            //        "\n\t-> raw=%.*s\n\n",
-            //        t->pos, len, buf[t->pos], len, start);
-
-            return token.new(TOK_STRING, start, len, start_line, start_col);
-        }
-
-        case LEX_STATE_LINE_COMMENT:
-            if (c == '\n' || c == '\0')
-            {
-                tokenizer.advance(t);
-                t->state = LEX_STATE_START;
-                continue;
-            }
-            tokenizer.advance(t);
-            continue;
-
-        case LEX_STATE_BLOCK_COMMENT:
-            if (c == '}' && peek_next(t) == '-')
-            {
-                tokenizer.advance(t);
-                tokenizer.advance(t);
-                t->state = LEX_STATE_START;
-                continue;
-            }
-            tokenizer.advance(t);
-            continue;
-
-        default:
-            tokenizer.advance(t);
-            t->state = LEX_STATE_START;
-            return token.new(TOK_UNKNOWN, start, 1, start_line, start_col);
-        }
+    case TOK_RPAREN:
+        return TOK_LPAREN;
+    case TOK_RBRACKET:
+        return TOK_LBRACKET;
+    default:
+        return TOK_LBRACE;
     }
 }
 
-static void lex_all(Tokenizer *t, _mvec_token *out)
+void source_pos(const char *src, const char *at, int *line, int *col)
 {
-    size_t per_chunk = CHUNK_SZ / sizeof(Token);
-    size_t guess = ((size_t)t->pos / 2) + 16;
-    *out = tokenvec.init(cx.pool, (guess / per_chunk) + 1);
+    const char *line_start = src;
+    *line = 1;
+    for (const char *c = src; c < at; c++)
+    {
+        if (*c == '\n')
+        {
+            (*line)++;
+            line_start = c + 1;
+        }
+    }
+    *col = (int)(at - line_start) + 1;
+}
+
+// One pass over the source. With out == NULL it only counts tokens: nothing is reported and
+// no brackets are matched. With an array it fills it, reports errors and matches brackets.
+static size_t scan_pass(const char *filename, const char *src, Token *out, int *error_count)
+{
+    size_t count = 0;
+    int open_stack[SCAN_MAX_NESTING];
+    int sp = 0;
+    int errors = 0;
+    int too_deep = 0;
+
+    const char *c = src;
+    const char *line_start = src;
+    int line = 1;
+    uint32_t nl = 1;
+
     for (;;)
     {
-        Token tok = next(t);
-        tokenvec.push(out, tok);
-        if (tok.kind == TOK_EOF)
+        // Whitespace and comments: `-- line` and `-{ block }-`.
+        for (;;)
         {
-            return;
+            if (*c == ' ' || *c == '\t' || *c == '\r')
+            {
+                c++;
+            }
+            else if (*c == '\n')
+            {
+                c++;
+                line++;
+                line_start = c;
+                nl = 1;
+            }
+            else if (c[0] == '-' && c[1] == '-')
+            {
+                while (*c && *c != '\n')
+                {
+                    c++;
+                }
+            }
+            else if (c[0] == '-' && c[1] == '{')
+            {
+                int at_line = line;
+                int at_col = (int)(c - line_start) + 1;
+                c += 2;
+                while (*c && !(c[0] == '}' && c[1] == '-'))
+                {
+                    if (*c == '\n')
+                    {
+                        line++;
+                        line_start = c + 1;
+                        nl = 1;
+                    }
+                    c++;
+                }
+                if (!*c)
+                {
+                    if (out)
+                    {
+                        scan_error(filename, at_line, at_col, "unterminated block comment");
+                    }
+                    errors++;
+                }
+                else
+                {
+                    c += 2;
+                }
+            }
+            else
+            {
+                break;
+            }
         }
+
+        const char *start = c;
+        int tok_line = line;
+        int tok_col = (int)(c - line_start) + 1;
+        TokenKind kind = TOK_UNKNOWN;
+
+        if (!*c)
+        {
+            if (out)
+            {
+                out[count] = (Token){.start = start, .kind = TOK_EOF, .nl = 1};
+            }
+            count++;
+            break;
+        }
+
+        if (is_ident_start(*c))
+        {
+            do
+            {
+                c++;
+            } while (is_ident_char(*c));
+            kind = keyword_kind(start, (int)(c - start));
+        }
+        else if (is_digit(*c))
+        {
+            do
+            {
+                c++;
+            } while (is_digit(*c));
+            if (c[0] == '.' && is_digit(c[1]))
+            {
+                do
+                {
+                    c++;
+                } while (is_digit(*c));
+            }
+            kind = TOK_NUMBER;
+        }
+        else if (*c == '"')
+        {
+            c++;
+            while (*c && *c != '"')
+            {
+                if (*c == '\\' && c[1])
+                {
+                    c++;
+                }
+                if (*c == '\n')
+                {
+                    line++;
+                    line_start = c + 1;
+                }
+                c++;
+            }
+            if (*c == '"')
+            {
+                c++;
+            }
+            else
+            {
+                if (out)
+                {
+                    scan_error(filename, tok_line, tok_col, "unterminated string literal");
+                }
+                errors++;
+            }
+            kind = TOK_STRING;
+        }
+        else
+        {
+            char ch = *c++;
+            switch (ch)
+            {
+            case '(':
+                kind = TOK_LPAREN;
+                break;
+            case ')':
+                kind = TOK_RPAREN;
+                break;
+            case '{':
+                kind = TOK_LBRACE;
+                break;
+            case '}':
+                kind = TOK_RBRACE;
+                break;
+            case '[':
+                kind = TOK_LBRACKET;
+                break;
+            case ']':
+                kind = TOK_RBRACKET;
+                break;
+            case ',':
+                kind = TOK_COMMA;
+                break;
+            case ';':
+                kind = TOK_SEMICOLON;
+                break;
+            case '+':
+                kind = TOK_PLUS;
+                break;
+            case '*':
+                kind = TOK_STAR;
+                break;
+            case '/':
+                kind = TOK_SLASH;
+                break;
+            case '&':
+                kind = TOK_AMP;
+                break;
+            case '|':
+                kind = TOK_PIPE;
+                break;
+            case '-':
+                kind = TOK_MINUS;
+                if (*c == '>')
+                {
+                    c++;
+                    kind = TOK_ARROW;
+                }
+                break;
+            case '=':
+                kind = TOK_EQ;
+                if (*c == '=')
+                {
+                    c++;
+                    kind = TOK_CMP;
+                }
+                break;
+            case '!':
+                kind = TOK_BANG;
+                if (*c == '=')
+                {
+                    c++;
+                    kind = TOK_NEQ;
+                }
+                break;
+            case '<':
+                kind = TOK_LT;
+                if (*c == '=')
+                {
+                    c++;
+                    kind = TOK_LE;
+                }
+                break;
+            case '>':
+                kind = TOK_GT;
+                if (*c == '=')
+                {
+                    c++;
+                    kind = TOK_GE;
+                }
+                break;
+            case ':':
+                kind = TOK_COLON;
+                if (*c == ':')
+                {
+                    c++;
+                    kind = TOK_DCOLON;
+                }
+                else if (*c == '=')
+                {
+                    c++;
+                    kind = TOK_DEFINE;
+                }
+                break;
+            case '.':
+                kind = TOK_DOT;
+                if (c[0] == '.' && c[1] == '.')
+                {
+                    c += 2;
+                    kind = TOK_ELLIPSIS;
+                }
+                else if (c[0] == '.')
+                {
+                    c++;
+                    kind = TOK_DOTDOT;
+                }
+                break;
+            case '?':
+                kind = TOK_QUESTION;
+                if (c[0] == '?' && c[1] == '=')
+                {
+                    c += 2;
+                    kind = TOK_QQ_EQ;
+                }
+                else if (c[0] == '?')
+                {
+                    c++;
+                    kind = TOK_QQ;
+                }
+                else if (c[0] == '.')
+                {
+                    c++;
+                    kind = TOK_Q_DOT;
+                }
+                break;
+            default:
+                if (out)
+                {
+                    scan_error(filename, tok_line, tok_col, "unexpected character '%c'", ch);
+                }
+                errors++;
+                break;
+            }
+        }
+
+        if (out)
+        {
+            uint32_t match = 0;
+
+            // Bracket matching happens here, once, so the parser can jump over any group in
+            // O(1) (function-literal detection, error recovery).
+            if (kind == TOK_LPAREN || kind == TOK_LBRACKET || kind == TOK_LBRACE)
+            {
+                if (sp < SCAN_MAX_NESTING)
+                {
+                    open_stack[sp++] = (int)count;
+                }
+                else if (!too_deep)
+                {
+                    scan_error(filename, tok_line, tok_col,
+                               "brackets are nested too deeply (limit is %d levels)",
+                               SCAN_MAX_NESTING);
+                    errors++;
+                    too_deep = 1; // say it once; the unmatched closers would only repeat it
+                }
+            }
+            else if (kind == TOK_RPAREN || kind == TOK_RBRACKET || kind == TOK_RBRACE)
+            {
+                if (sp > 0 && out[open_stack[sp - 1]].kind == (uint32_t)opener_of(kind))
+                {
+                    match = (uint32_t)open_stack[--sp];
+                    out[match].match = (uint32_t)count;
+                }
+                else if (!too_deep)
+                {
+                    scan_error(filename, tok_line, tok_col, "unbalanced '%c'", *start);
+                    errors++;
+                }
+            }
+
+            out[count] = (Token){
+                .start = start,
+                .len = (uint32_t)(c - start),
+                .kind = kind,
+                .match = match,
+                .nl = nl,
+            };
+        }
+        count++;
+        nl = 0;
+    }
+
+    while (out && sp > 0 && !too_deep)
+    {
+        const Token *open = &out[open_stack[--sp]];
+        int open_line, open_col;
+        source_pos(src, open->start, &open_line, &open_col);
+        scan_error(filename, open_line, open_col, "'%c' is never closed", *open->start);
+        errors++;
+    }
+
+    *error_count = errors;
+    return count;
+}
+
+int scan_all(const char *filename, const char *src, TokenVec *out)
+{
+    int errors = 0;
+    size_t count = scan_pass(filename, src, NULL, &errors);
+
+    out->data = (Token *)arena_alloc(count * sizeof(Token));
+    out->size = count;
+    out->cap = count;
+    scan_pass(filename, src, out->data, &errors);
+    return errors;
+}
+
+const char *token_kind_name(TokenKind kind)
+{
+    switch (kind)
+    {
+    case TOK_EOF:
+        return "end of file";
+    case TOK_LPAREN:
+        return "'('";
+    case TOK_RPAREN:
+        return "')'";
+    case TOK_LBRACE:
+        return "'{'";
+    case TOK_RBRACE:
+        return "'}'";
+    case TOK_LBRACKET:
+        return "'['";
+    case TOK_RBRACKET:
+        return "']'";
+    case TOK_COLON:
+        return "':'";
+    case TOK_COMMA:
+        return "','";
+    case TOK_SEMICOLON:
+        return "';'";
+    case TOK_DEFINE:
+        return "':='";
+    case TOK_EQ:
+        return "'='";
+    case TOK_DOT:
+        return "'.'";
+    case TOK_IDENTIFIER:
+        return "identifier";
+    case TOK_NUMBER:
+        return "number";
+    case TOK_STRING:
+        return "string";
+    default:
+        return "token";
     }
 }

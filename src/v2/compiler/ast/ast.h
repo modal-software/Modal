@@ -1,173 +1,110 @@
-// ast.h
-#ifndef AST_H
-#define AST_H
+// ast.h (v2): compact, index-linked AST.
+//
+// A node is 24 bytes and lives in one flat array per file. Children are referenced by index
+// (NodeId), never by pointer, so the array can sit in the arena and the tree stays valid no
+// matter where it is stored. Lists (statements, members, params, args) are chained through
+// `next`. Source text is reached through `tok`, an index into the unit's token stream.
+#ifndef MODAL_V2_AST_H
+#define MODAL_V2_AST_H
 
-#include "v1/compiler/syntax/tokenizer.h"
-#include "v1/utils/mvec.h"
+#include <stddef.h>
+#include <stdint.h>
 
-// unused
-typedef enum
-{
-    T_NIL,
-    T_BOOL,
-
-    // Unsigned integers
-    T_U0,
-    T_U8,
-    T_U16,
-    T_U32,
-    T_U64,
-
-    // Signed Integers
-    T_I0,
-    T_i8,
-    T_I16,
-    T_I32,
-    T_I64,
-} TypeKind;
-
-// unused
-typedef struct Type
-{
-    TypeKind kind;
-    char *name;
-    struct Type *child;
-} Type;
+typedef struct Unit Unit;
+typedef uint32_t NodeId; // 0 = no node
 
 typedef enum
 {
-    AST_NUMBER_LIT,
-    AST_IDENT,
-    AST_BIN_OP,
-    AST_UNARY_OP,
-    AST_PAREN_GROUP,
-    AST_BLOCK,
-    AST_TEST_STMT,
-    AST_ASSERT_STMT,
-    AST_WRITE_STMT,
-    AST_STRING_LIT,
-    AST_ASSIGN_STMT,
+    AST_NONE,
+    //                  tok          a            b            c
+    AST_MODULE,      // -            decls
+    AST_STRUCT_DECL, // name         members
+    AST_FIELD_DECL,  // name         type         init
+    AST_METHOD_DECL, // name         params       return type  body
+    AST_PARAM,       // name         type
+    AST_DEFINE,      // name         value                               name := value
+    AST_VAL_DECL,    // 'val'        items        source                 val (a as b): import(x)
+    AST_TYPE_NAME,   // first ident  (aux = number of extra `.segment`s)
+    AST_TYPE_SLICE,  // '['          element
+    AST_TYPE_PTR,    // '*'          pointee
+    AST_TYPE_STRUCT, // 'struct'     members
+    AST_FN_LIT,      // '('          params       return type  body
+    AST_BLOCK,       // '{'          statements
+    AST_RETURN,      // 'return'     value
+    AST_ASSIGN,      // '='          target       value
+    AST_BIN_OP,      // operator     left         right
+    AST_UNARY_OP,    // operator     operand
+    AST_CALL,        // '(' / string callee       args
+    AST_INDEX,       // '['          target       index
+    AST_SELECTOR,    // member name  target
+    AST_PAREN_GROUP, // '('          expr
+    AST_IDENT,       // name
+    AST_NUMBER_LIT,  // literal
+    AST_STRING_LIT,  // literal
+    AST_IMPORT,      // module arg   (aux = target unit id + 1, 0 = external; set by the linker)
+    AST_IMPORT_ALL,  // '*'          chain                               import(x).*
+    AST_IMPORT_PICK, // '('          chain        items                  import(x).(a, b as c)
+    AST_IMPORT_ITEM, // name                                   alias TOKEN index (0 = none)
+    AST__COUNT,
 } AstNodeKind;
 
-typedef enum
+enum
 {
-    FMT_GROUPED,
-    FMT_LITERAL
-} Fmt;
+    AST_F_MUT = 1u << 0,     // type-first declaration: mutable field / overloadable method
+    AST_F_ONELINE = 1u << 1, // method body is `: expression`
+    AST_F_SELF = 1u << 2,    // callable whose first parameter is `self`
+};
 
 typedef struct AstNode
 {
-    AstNodeKind kind;
-    Token token;
-
-    union
-    {
-        struct
-        {                    // AST_NUMBER_LIT
-            long long value; // ou double se quiser float
-        } number;
-
-        struct
-        {                     // AST_IDENT
-            const char *name; // apontador pro token.start (não copia)
-            size_t len;
-        } ident;
-
-        struct
-        { // AST_BIN_OP
-            struct AstNode *left;
-            struct AstNode *right;
-            Kind op; // +, -, *, / etc.
-        } binop;
-
-        struct
-        { // AST_UNARY_OP
-            struct AstNode *expr;
-            Kind op; // -, ! etc.
-        } unary;
-
-        struct
-        {
-            Kind op;
-            size_t op_len;
-
-            struct AstNode *lhs;
-            struct AstNode *rhs;
-        } expr;
-
-        struct
-        {
-            const char *name;
-        } var;
-
-        struct
-        {                           // AST_PAREN_GROUP / AST_BLOCK
-            struct AstNode **stmts; // array dinâmico (ou lista)
-            size_t count;
-        } block_or_group;
-
-        struct
-        {
-            struct AstNode *block;
-            size_t len;
-            const char *name;
-        } test;
-
-        struct
-        {
-            struct AstNode *group;
-            Fmt fmt;
-        } write;
-
-        struct
-        {
-            size_t len;
-            size_t span;
-            const char *value;
-            const char *raw;
-            char *_id;
-        } string;
-
-    } data;
+    uint8_t kind;
+    uint8_t flags;
+    uint16_t aux;
+    uint32_t tok;
+    NodeId a, b, c;
+    NodeId next; // next sibling in the list this node belongs to
 } AstNode;
 
-MVEC_IMPL(ast, AstNode)
-static const _mvec_constructor_ast astvec = {
-    .init = mvec_init_ast,
-    .push = mvec_push_ast,
-    .free = mvec_free_ast,
-    .pop = mvec_pop_ast,
-    .release = mvec_release_ast,
-};
-
-// Iterate over children of a BLOCK or PAREN_GROUP node.
-// Usage: AST_EACH(block_node, child) { /* use child */ }
-#define AST_EACH(block, child)                                                                     \
-    for (size_t _i = 0; _i < (block)->data.block_or_group.count &&                                 \
-                        ((child) = (block)->data.block_or_group.stmts[_i], 1);                     \
-         _i++)
+_Static_assert(sizeof(AstNode) == 24, "AstNode must stay 24 bytes");
 
 typedef struct
 {
-    AstNode *(*string)(Token tok);
-    AstNode *(*ident)(Token tok);
-    AstNode *(*binop)(Token op_tok, AstNode *left, AstNode *right);
-    AstNode *(*group)(Token open_brace, AstNode **stmts, size_t count);
-    AstNode *(*block)(Token open_brace, AstNode **stmts, size_t count);
-    AstNode *(*test)(Token token, AstNode *block);
-    AstNode *(*write)(AstNode *n, Fmt fmt);
-    AstNode *(*assertFn)(AstNode *expr);
-    AstNode *(*number)(Token tok, long long val);
-    AstNode *(*expr)(Token tok, AstNode *lhs, AstNode *rhs);
+    AstNode *data;
+    size_t size;
+    size_t cap;
+} NodeVec;
+
+#define NODE(u, id) (&(u)->nodes.data[(id)])
+#define TOK(u, i) (&(u)->tokens.data[(i)])
+
+// Which of a/b/c hold child nodes, per kind (bit 0 = a, bit 1 = b, bit 2 = c).
+extern const uint8_t ast_child_mask[AST__COUNT];
+
+typedef struct
+{
+    NodeId (*node)(Unit *u, AstNodeKind kind, uint32_t tok, NodeId a, NodeId b, NodeId c);
 } AstConstructor;
 
 typedef struct
 {
     AstConstructor new;
-    void (*print)(AstNode *tree);
-    void (*free)(struct AstNode *node);
+    void (*print)(Unit *u);
+    const char *(*kind_name)(AstNodeKind kind);
+    // Renders a type node as source-like text into buf; returns buf.
+    char *(*type_str)(const Unit *u, NodeId type, char *buf, size_t cap);
+    // Renders the signature of a method declaration or function binding; returns buf.
+    char *(*sig_str)(const Unit *u, NodeId decl, char *buf, size_t cap);
 } AstImpl;
 
 extern const AstImpl ast;
 
-#endif
+// If `expr` is an import chain (import(x), import(x).a.b, import(x).*, import(x).(a, b)),
+// returns its AST_IMPORT node; otherwise 0.
+NodeId ast_import_root(const Unit *u, NodeId expr);
+
+static inline int is_self_token(const char *s, int len)
+{
+    return len == 4 && s[0] == 's' && s[1] == 'e' && s[2] == 'l' && s[3] == 'f';
+}
+
+#endif // MODAL_V2_AST_H

@@ -1,1 +1,6 @@
-write("aatest")
+-- write("('('')('')('')')")
+-- write("write('write('write('aa')')')")
+-- write("aa")
+print("this are a invoke\n")
+write("this invoke compile too")
+-- aadada.print("this are a selector invoke, should not compile")
