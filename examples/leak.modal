@@ -1,26 +1,21 @@
--- the same rules hold however a module path is written
-ex := import("../example")
+ex := import("./")
 
--- member access on a binding is checked like a direct import
 a := ex.secret
 b := ex.john.john_nested_class.my_name
 c := ex.john.print_file_name
 
--- so is an alias of a binding
+
 j := ex.john
 d := j.john_nested_class.check
 
--- and an import or a member access inside a body
 main(): u8 {
-    s := import("../example/secret").vault
+    s := import("secret").vault
     t := ex.john.john_nested_class.my_name
     return 0
 }
 
--- a path that does not resolve is an error, with or without a leading ./
 e := import("example/secret")
 
--- a bare name that resolves to nothing is an error too; only `std` is external
 f := import("example").secret.vault
 g := import(nowhere)
 ok := import("std").io
