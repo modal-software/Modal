@@ -7,6 +7,7 @@
 #include "v2/compiler/sema/types.h"
 #include "v2/compiler/syntax/scanner.h"
 #include <stdarg.h>
+#include <stdio.h>
 #include <stdint.h>
 
 // Compiler phases, for `--time` (the same idea as `go tool compile -bench`).
@@ -44,6 +45,8 @@ typedef enum
     REGION_SCOPES, // cx.scopes
     REGION_NAMES,  // cx.names: the interned names
     REGION_SYMNAMES, // cx.sym_names: the name of each symbol, parallel to cx.syms
+    REGION_CODE,   // machine code being generated (backend native)
+    REGION_MIR,    // the MIR of the function being generated: emptied for each function
     REGION__COUNT,
 } RegionId;
 
@@ -116,6 +119,7 @@ typedef struct
     uint8_t eager;  // parse every body up front and keep the whole tree (--eager, --ast)
     uint8_t timing; // --time: measure the per-function phases too
     uint8_t cache;  // --cache: skip checking the bodies of files that have not changed
+    uint8_t show_mir; // --mir: print each function's MIR as it is generated
 } context;
 
 extern context cx;
@@ -134,6 +138,7 @@ void *region_room(RegionId r, size_t bytes);
 void *region_grow_array(RegionId r, void *data, size_t elem, size_t *cap, size_t need);
 size_t regions_used(void);    // bytes handed out, all regions
 size_t regions_touched(void); // pages the system has supplied at peak, in bytes
+void regions_print(FILE *out); // per region (--stats)
 
 // Everything the compiler allocates without its own region comes from the arena and is
 // freed at once at the end. Allocations never move, so pointers into it stay valid.
@@ -189,6 +194,8 @@ static inline uint64_t phase_end(Phase phase, uint64_t start)
 // level "error" also bumps the unit's and the global error counters.
 void diag_vat(Unit *u, uint32_t tok, const char *level, const char *fmt, va_list ap);
 void diag_at(Unit *u, uint32_t tok, const char *level, const char *fmt, ...);
+void diag_tok(Unit *u, const Token *t, const char *level, const char *fmt, ...);
+void diag_vtok(Unit *u, const Token *t, const char *level, const char *fmt, va_list ap);
 
 // ---- pipeline ------------------------------------------------------------------------------
 
@@ -201,6 +208,7 @@ void module_body_nodes(Unit *u, NodeId from);
 // Module-path checks over the nodes [from, to) of a file.
 void module_check_paths(Unit *u, NodeId from, NodeId to);
 void contract_print(void); // derived public signatures of every loaded domain
+SymId module_member(Unit *u, NodeId base, uint32_t name_tok); // `base.name` through imports
 const char *domain_name(uint16_t domain);
 
 // What a mod.modal says for a domain; `fallback` when it does not say.
@@ -222,10 +230,21 @@ NodeId sema_callable_params(const Unit *u, NodeId decl);
 
 // backend/registry.c: code generation is streamed, one checked function at a time.
 struct Backend;
-void codegen_start(const struct Backend *backend, void *out_file);
+void codegen_start(const struct Backend *backend, void *out_file, const char *path);
 void codegen_begin(Unit *u);              // declarations are checked: types, prototypes
 void codegen_function(Unit *u, SymId fn); // one function is checked and still in memory
 int codegen_finish(void);                 // returns the number of errors the backend reported
+// Why `fn` could not be generated, if it could not: reported when the program needs it.
+typedef struct
+{
+    Unit *unit;
+    Token at;         // where (a copy: the body it came from may be gone)
+    const char *what; // what cannot be generated yet
+    const char *name; // the function's name, into the source
+    int name_len;
+} CodegenFailure;
+const CodegenFailure *codegen_failure(SymId fn);
+void codegen_failure_clear(SymId fn);
 
 // check.c
 // What a backend asks about a declaration, beyond the per-node tables.
@@ -235,6 +254,10 @@ TypeId sema_value_type(Unit *u, SymId field_or_const);
 NodeId sema_fn_params(const Unit *u, SymId fn);      // its parameters after `self`
 int sema_is_std_print(const Unit *u, SymId binding); // `x := import("std").io.print`
 void sema_check(Unit *u);
+// Clauses (literal patterns: `u8 fact(u8 0): 1`).
+int sema_pattern(Unit *u, NodeId param, SymId owner, uint64_t *value, int loud);
+SymId sema_next_clause(Unit *u, SymId fn); // tried when fn's patterns do not match; 0: none
+int sema_clause_index(Unit *u, SymId fn);  // 0 for the first clause, which calls go to
 void sema_syntax_only(Unit *u); // for a file that is not checked: parse its bodies for errors //
                                 // every name and invocation in a body leads to a declaration
 

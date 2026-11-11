@@ -25,12 +25,13 @@ static const size_t region_reserve[REGION__COUNT] = {
     [REGION_NODES] = (size_t)1 << 30,  [REGION_SYMS] = (size_t)1 << 28,
     [REGION_TYPES] = (size_t)1 << 28,  [REGION_SCOPES] = (size_t)1 << 28,
     [REGION_NAMES] = (size_t)1 << 30,  [REGION_SYMNAMES] = (size_t)1 << 28,
+    [REGION_CODE] = (size_t)1 << 30,   [REGION_MIR] = (size_t)1 << 30,
 };
 #define REGION_MIN ((size_t)1 << 22)
 
 static const char *const region_names[REGION__COUNT] = {"arena", "tokens", "nodes",
                                                         "symbols", "types", "scopes",
-                                                        "names",  "symbol names"};
+                                                        "names",  "symbol names", "code", "mir"};
 
 #ifndef MAP_NORESERVE
 #define MAP_NORESERVE 0
@@ -181,6 +182,35 @@ size_t regions_touched(void)
     return touched;
 }
 
+// Each region's peak and the pages it touched, for --stats.
+void regions_print(FILE *out)
+{
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    unsigned char vec[4096];
+    for (int i = 0; i < REGION__COUNT; i++)
+    {
+        const Region *r = &cx.regions[i];
+        if (!r->peak)
+        {
+            continue;
+        }
+        size_t pages = (r->peak + page - 1) / page, touched = 0;
+        for (size_t first = 0; first < pages; first += sizeof(vec))
+        {
+            size_t n = pages - first < sizeof(vec) ? pages - first : sizeof(vec);
+            if (mincore(r->base + first * page, n * page, (void *)vec) == 0)
+            {
+                for (size_t k = 0; k < n; k++)
+                {
+                    touched += (vec[k] & 1) ? page : 0;
+                }
+            }
+        }
+        fprintf(out, "  %-13s %9.1f KB peak  %9.1f KB resident\n", region_names[i],
+                (double)r->peak / 1024.0, (double)touched / 1024.0);
+    }
+}
+
 // ---- arena -----------------------------------------------------------------------------------
 
 void *arena_alloc(size_t sz)
@@ -265,7 +295,21 @@ uint64_t clock_ns(void)
 
 void diag_vat(Unit *u, uint32_t tok, const char *level, const char *fmt, va_list ap)
 {
-    const Token *t = TOK(u, tok);
+    diag_vtok(u, TOK(u, tok), level, fmt, ap);
+}
+
+// The same, at a token held by value: for a report made after the token's body was freed (the
+// token points into the source, which lives to the end).
+void diag_tok(Unit *u, const Token *t, const char *level, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    diag_vtok(u, t, level, fmt, ap);
+    va_end(ap);
+}
+
+void diag_vtok(Unit *u, const Token *t, const char *level, const char *fmt, va_list ap)
+{
 
     // After MAX_REPORTED errors the rest are counted but not printed: a mistake repeated
     // across a large file should not bury the first reports or cost seconds of output.
@@ -278,19 +322,19 @@ void diag_vat(Unit *u, uint32_t tok, const char *level, const char *fmt, va_list
     }
 
     int line, col;
-    source_pos(u->src, t->start, &line, &col);
+    source_pos(u->src, TSTART(t), &line, &col);
 
     fprintf(stderr, "\n%s [%s:%d:%d]: ", level, u->path, line, col);
     vfprintf(stderr, fmt, ap);
     fputc('\n', stderr);
 
     // Whole source line for context: the token points straight into the source buffer.
-    const char *line_start = t->start;
+    const char *line_start = TSTART(t);
     while (line_start > u->src && line_start[-1] != '\n')
     {
         line_start--;
     }
-    const char *line_end = t->start;
+    const char *line_end = TSTART(t);
     while (*line_end && *line_end != '\n')
     {
         line_end++;
@@ -299,7 +343,7 @@ void diag_vat(Unit *u, uint32_t tok, const char *level, const char *fmt, va_list
     char caret[256];
     size_t n = 0;
     fprintf(stderr, "%4d | %.*s\n     | ", line, (int)(line_end - line_start), line_start);
-    for (const char *c = line_start; c < t->start; c++)
+    for (const char *c = line_start; c < TSTART(t); c++)
     {
         if (n == sizeof(caret) - 2) // a very long line: write what is built and go on
         {

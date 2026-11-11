@@ -110,7 +110,7 @@ NameId token_name(const Token *t)
     {
         return t->match;
     }
-    return name_intern(t->start, t->len);
+    return name_intern(TSTART(t), t->len);
 }
 
 Scope *scope_new(Scope *parent, SymId owner, uint32_t nbuckets)
@@ -179,7 +179,7 @@ const char *symbol_name(SymId id, int *len)
     const Symbol *s = SYM(id);
     const Token *t = TOK(&cx.units[s->unit], s->tok);
     *len = t->len;
-    return t->start;
+    return TSTART(t);
 }
 
 void scope_insert(Scope *s, SymId id)
@@ -277,7 +277,7 @@ void symbols_print(const Unit *u)
     for (SymId id = 1; id < cx.syms.size; id++)
     {
         const Symbol *s = SYM(id);
-        if (s->unit != u->id)
+        if (s->unit != u->id || (s->flags & SYM_F_LITERAL))
         {
             continue;
         }

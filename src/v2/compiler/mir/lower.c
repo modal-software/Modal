@@ -496,7 +496,7 @@ static uint64_t literal_value(const Token *t)
     uint64_t v = 0;
     for (uint32_t i = 0; i < t->len; i++)
     {
-        v = v * 10 + (uint64_t)(t->start[i] - '0');
+        v = v * 10 + (uint64_t)(TSTART(t)[i] - '0');
     }
     return v;
 }
@@ -565,7 +565,7 @@ static BinPlan plan_binop(NodeId id)
     BinPlan p = {-1, -1, -1};
     for (size_t i = 0; i < sizeof(binops) / sizeof(binops[0]); i++)
     {
-        if (strlen(binops[i].text) == t->len && memcmp(binops[i].text, t->start, t->len) == 0)
+        if (strlen(binops[i].text) == t->len && memcmp(binops[i].text, TSTART(t), t->len) == 0)
         {
             p.index = (int)i;
         }
@@ -648,7 +648,7 @@ static int const_value(NodeId id, uint64_t *out)
     case AST_NUMBER_LIT:
     {
         const Token *t = TOK(u, n->tok);
-        if (memchr(t->start, '.', t->len))
+        if (memchr(TSTART(t), '.', t->len))
         {
             return 0;
         }
@@ -679,7 +679,7 @@ static int const_value(NodeId id, uint64_t *out)
             return 0;
         }
         const Token *lit = TOK(home, NODE(home, init)->tok);
-        if (memchr(lit->start, '.', lit->len))
+        if (memchr(TSTART(lit), '.', lit->len))
         {
             return 0;
         }
@@ -725,7 +725,7 @@ static int is_self_ident(NodeId id)
 {
     const AstNode *n = NODE(L.u, id);
     const Token *t = TOK(L.u, n->tok);
-    return n->kind == AST_IDENT && is_self_token(t->start, (int)t->len);
+    return n->kind == AST_IDENT && is_self_token(TSTART(t), (int)t->len);
 }
 
 // Does evaluating this expression call anything? (A call reuses the window.)
@@ -795,10 +795,10 @@ static MirSlot lower_string(const Token *t)
     size_t n = 0;
     for (uint32_t i = 1; i + 1 < t->len; i++)
     {
-        char ch = t->start[i];
+        char ch = TSTART(t)[i];
         if (ch == '\\' && i + 2 < t->len)
         {
-            char e = t->start[++i];
+            char e = TSTART(t)[++i];
             ch = e == 'n' ? '\n' : e == 't' ? '\t' : e == 'r' ? '\r' : e == '0' ? '\0' : e;
         }
         bytes[n++] = (uint8_t)ch;
@@ -873,10 +873,10 @@ static int constant_text(NodeId a)
     {
         for (uint32_t i = 1; i + 1 < t->len; i++)
         {
-            char ch = t->start[i];
+            char ch = TSTART(t)[i];
             if (ch == '\\' && i + 2 < t->len)
             {
-                char e = t->start[++i];
+                char e = TSTART(t)[++i];
                 ch = e == 'n' ? '\n' : e == 't' ? '\t' : e == 'r' ? '\r' : e == '0' ? '\0' : e;
             }
             add_pending(&ch, 1);
@@ -884,10 +884,10 @@ static int constant_text(NodeId a)
         return 1;
     }
     if (type == T_BOOL && n->kind == AST_IDENT && !u->refs[a] &&
-        ((t->len == 4 && memcmp(t->start, "true", 4) == 0) ||
-         (t->len == 5 && memcmp(t->start, "false", 5) == 0)))
+        ((t->len == 4 && memcmp(TSTART(t), "true", 4) == 0) ||
+         (t->len == 5 && memcmp(TSTART(t), "false", 5) == 0)))
     {
-        add_pending(t->start, t->len);
+        add_pending(TSTART(t), t->len);
         return 1;
     }
     uint64_t v;
@@ -1288,11 +1288,11 @@ static MirSlot lower_expr(NodeId id)
             unsupported(n->tok, "using a function, a type or an import as a value");
             return temp();
         }
-        if (type == T_BOOL && t->len == 4 && memcmp(t->start, "true", 4) == 0)
+        if (type == T_BOOL && t->len == 4 && memcmp(TSTART(t), "true", 4) == 0)
         {
             return emit_const(1);
         }
-        if (type == T_BOOL && t->len == 5 && memcmp(t->start, "false", 5) == 0)
+        if (type == T_BOOL && t->len == 5 && memcmp(TSTART(t), "false", 5) == 0)
         {
             return emit_const(0);
         }
@@ -1548,7 +1548,7 @@ static void init_globals(void)
         {
             const AstNode *n = NODE(home, init);
             const Token *t = TOK(home, n->tok);
-            if (n->kind != AST_NUMBER_LIT || memchr(t->start, '.', t->len))
+            if (n->kind != AST_NUMBER_LIT || memchr(TSTART(t), '.', t->len))
             {
                 continue; // not a literal: not given a place, so a use of it is reported
             }

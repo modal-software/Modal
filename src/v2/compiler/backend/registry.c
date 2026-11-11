@@ -1,4 +1,5 @@
 #include "v2/compiler/backend/backend.h"
+#include "v2/compiler/mir/mir.h"
 #include <string.h>
 
 // name -> Init. Several names may share one Init (Go maps both "mips" and "mipsle" to
@@ -9,6 +10,9 @@ static const struct
     void (*init)(Backend *b);
 } backend_inits[] = {
     {"c", backend_c_init},
+    {"native", backend_native_init},
+    {"arm64", backend_native_init},
+    {"x86_64", backend_native_init},
 };
 
 #define BACKEND_COUNT (sizeof(backend_inits) / sizeof(backend_inits[0]))
@@ -61,10 +65,11 @@ static struct
     int begun;
 } codegen;
 
-void codegen_start(const struct Backend *backend, void *out_file)
+void codegen_start(const struct Backend *backend, void *out_file, const char *path)
 {
     codegen.backend = backend;
     codegen.job.out = (FILE *)out_file;
+    codegen.job.path = path;
     codegen.begun = 0;
 }
 
@@ -84,16 +89,70 @@ void codegen_begin(Unit *u)
     }
 }
 
+// Functions the backend could not get, and why: reported only if the program calls them.
+static CodegenFailure *failures;
+static size_t failures_cap;
+
+const CodegenFailure *codegen_failure(SymId fn)
+{
+    return fn < failures_cap && failures[fn].what ? &failures[fn] : NULL;
+}
+
+void codegen_failure_clear(SymId fn) // reported once
+{
+    if (fn < failures_cap)
+    {
+        failures[fn].what = NULL;
+    }
+}
+
+// A machine-code backend gets the functions of every file (the program is linked as a whole and
+// its unreachable functions dropped); the C backend, those of the entry file.
 void codegen_function(Unit *u, SymId fn)
 {
-    if (codegen.begun && u->id == 0)
+    if (!codegen.begun || (u->id != 0 && !codegen.backend->function_mir))
     {
-        uint64_t t = cx.timing ? clock_ns() : 0;
-        codegen.backend->function(&codegen.job, fn);
-        if (cx.timing)
+        return;
+    }
+    uint64_t t = cx.timing ? clock_ns() : 0;
+    if (codegen.backend->function_mir)
+    {
+        // After an error nothing is written: lowering more would only add follow-on reports.
+        MirFunc f;
+        if (!cx.errors && mir_lower(u, fn, &f))
         {
-            phase_end(PHASE_EMIT, t);
+            if (cx.show_mir)
+            {
+                mir_print(&f, stdout);
+            }
+            codegen.backend->function_mir(&codegen.job, &f);
         }
+        else if (!cx.errors && f.fail_what)
+        {
+            if (failures_cap < cx.syms.cap)
+            {
+                size_t cap = cx.syms.cap;
+                void *grown = arena_alloc(cap * sizeof(*failures));
+                memset(grown, 0, cap * sizeof(*failures));
+                if (failures_cap)
+                {
+                    memcpy(grown, failures, failures_cap * sizeof(*failures));
+                }
+                failures = grown;
+                failures_cap = cap;
+            }
+            int len;
+            const char *name = symbol_name(fn, &len);
+            failures[fn] = (CodegenFailure){u, *TOK(u, f.fail_tok), f.fail_what, name, len};
+        }
+    }
+    else
+    {
+        codegen.backend->function(&codegen.job, fn);
+    }
+    if (cx.timing)
+    {
+        phase_end(PHASE_EMIT, t);
     }
 }
 

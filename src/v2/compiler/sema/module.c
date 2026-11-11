@@ -300,12 +300,12 @@ Unit *unit_load(const char *path)
 static Unit *import_target(Unit *u, NodeId import)
 {
     const Token *arg = TOK(u, NODE(u, import)->tok);
-    const char *name = arg->start;
+    const char *name = TSTART(arg);
     int len = arg->len;
     if (arg->kind == TOK_STRING)
     {
         name++;
-        len -= (len >= 2 && arg->start[len - 1] == '"') ? 2 : 1;
+        len -= (len >= 2 && TSTART(arg)[len - 1] == '"') ? 2 : 1;
     }
     if (len <= 0)
     {
@@ -381,13 +381,13 @@ static Unit *import_target(Unit *u, NodeId import)
     if (has_ext)
     {
         diag_at(u, NODE(u, import)->tok, "error", "cannot find module %.*s (looked for %.*s/%.*s)",
-                arg->len, arg->start, dir_len, dir, rel_len, rel);
+                arg->len, TSTART(arg), dir_len, dir, rel_len, rel);
     }
     else
     {
         diag_at(u, NODE(u, import)->tok, "error",
                 "cannot find module %.*s (looked for %.*s/%.*s.modal and %.*s/%.*s/mod.modal%s)",
-                arg->len, arg->start, dir_len, dir, rel_len, rel, dir_len, dir, rel_len, rel,
+                arg->len, TSTART(arg), dir_len, dir, rel_len, rel, dir_len, dir, rel_len, rel,
                 bare ? ", and in the folders above" : "");
     }
     return NULL;
@@ -487,8 +487,8 @@ static int may_see(Unit *u, uint32_t tok, SymId id)
             diag_at(u, tok, "error",
                     "'%.*s' is a field of '%.*s', and fields are never visible outside their "
                     "struct. Add an accessor below it: `T %.*s(self: %.*s): self.%.*s`",
-                    name->len, name->start, tlen, type, name->len, name->start, tlen, type,
-                    name->len, name->start);
+                    name->len, TSTART(name), tlen, type, name->len, TSTART(name), tlen, type,
+                    name->len, TSTART(name));
             return 0;
         }
         if (!(s->flags & SYM_F_EXPOSED))
@@ -496,7 +496,7 @@ static int may_see(Unit *u, uint32_t tok, SymId id)
             diag_at(u, tok, "error",
                     "'%.*s' is inside '%.*s'. To use it here, move it below the closing brace "
                     "of the struct",
-                    name->len, name->start, tlen, type);
+                    name->len, TSTART(name), tlen, type);
             return 0;
         }
         return 1;
@@ -511,7 +511,7 @@ static int may_see(Unit *u, uint32_t tok, SymId id)
         if (s->kind == SYM_CONST)
         {
             diag_at(u, tok, "error", "'%.*s' is configuration of domain '%s', not part of its face",
-                    name->len, name->start, domain_name(owner->domain));
+                    name->len, TSTART(name), domain_name(owner->domain));
             return 0;
         }
         return 1; // what mod.modal binds or defines is the domain's face
@@ -521,7 +521,7 @@ static int may_see(Unit *u, uint32_t tok, SymId id)
         diag_at(u, tok, "error",
                 "'%.*s' is inside module '%.*s', private to domain '%s'. To share it, define "
                 "it in %s/mod.modal",
-                name->len, name->start, owner->name_len, owner->name, domain_name(owner->domain),
+                name->len, TSTART(name), owner->name_len, owner->name, domain_name(owner->domain),
                 domain_name(owner->domain));
         return 0;
     }
@@ -546,7 +546,7 @@ static Target chain_step(Unit *u, uint32_t tok, Target cur, ChainMode mode, int 
         if (mode == CHAIN_CHECK)
         {
             diag_at(u, tok, "error", "'%.*s' has no member '%.*s'", container_len, container,
-                    name->len, name->start);
+                    name->len, TSTART(name));
         }
         return (Target){0};
     }
@@ -766,17 +766,17 @@ static void check_config(Unit *u, NodeId decl)
     for (size_t i = 0; i < sizeof(config_keys) / sizeof(config_keys[0]); i++)
     {
         if (strlen(config_keys[i].name) != (size_t)name->len ||
-            memcmp(config_keys[i].name, name->start, (size_t)name->len) != 0)
+            memcmp(config_keys[i].name, TSTART(name), (size_t)name->len) != 0)
         {
             continue;
         }
         int is_bool =
-            value->kind == AST_IDENT && ((vt->len == 4 && !memcmp(vt->start, "true", 4)) ||
-                                         (vt->len == 5 && !memcmp(vt->start, "false", 5)));
+            value->kind == AST_IDENT && ((vt->len == 4 && !memcmp(TSTART(vt), "true", 4)) ||
+                                         (vt->len == 5 && !memcmp(TSTART(vt), "false", 5)));
         int ok = config_keys[i].kind == CONFIG_BOOL ? is_bool : value->kind == AST_STRING_LIT;
         if (!ok)
         {
-            diag_at(u, value->tok, "error", "'%.*s' expects %s", name->len, name->start,
+            diag_at(u, value->tok, "error", "'%.*s' expects %s", name->len, TSTART(name),
                     config_keys[i].kind == CONFIG_BOOL ? "true or false" : "a string");
         }
         return;
@@ -784,7 +784,7 @@ static void check_config(Unit *u, NodeId decl)
     diag_at(u, NODE(u, decl)->tok, "error",
             "'%.*s' is not a known configuration of a domain (known: implicit_self, nil_return, "
             "profile, version)",
-            name->len, name->start);
+            name->len, TSTART(name));
 }
 
 // Reads one mod.modal: validates its configuration and marks the modules it binds.
@@ -819,10 +819,10 @@ int domain_config_bool(uint16_t domain, const char *key, int fallback)
         for (NodeId d = NODE(m, m->root)->a; d; d = NODE(m, d)->next)
         {
             const Token *name = TOK(m, NODE(m, d)->tok);
-            if (is_config(m, d) && name->len == klen && memcmp(name->start, key, klen) == 0)
+            if (is_config(m, d) && name->len == klen && memcmp(TSTART(name), key, klen) == 0)
             {
                 const Token *v = TOK(m, NODE(m, NODE(m, d)->a)->tok);
-                return v->len == 4 && memcmp(v->start, "true", 4) == 0;
+                return v->len == 4 && memcmp(TSTART(v), "true", 4) == 0;
             }
         }
     }
@@ -871,7 +871,7 @@ void contract_print(void)
             if (is_config(m, d))
             {
                 const Token *k = TOK(m, n->tok), *v = TOK(m, NODE(m, n->a)->tok);
-                printf("config %.*s = %.*s\n", k->len, k->start, v->len, v->start);
+                printf("config %.*s = %.*s\n", k->len, TSTART(k), v->len, TSTART(v));
             }
             else if (n->kind == AST_METHOD_DECL || (n->kind == AST_DEFINE && !decl_chain(m, d)))
             {
@@ -892,7 +892,7 @@ void contract_print(void)
                 const Symbol *s = SYM(id);
                 int len;
                 const char *name = symbol_name(id, &len);
-                if (s->unit != u->id)
+                if (s->unit != u->id || (s->flags & SYM_F_LITERAL))
                 {
                     continue;
                 }
@@ -949,6 +949,18 @@ static void link_new_units(void)
                                    (cx.phase_ns[PHASE_SCAN] + cx.phase_ns[PHASE_PARSE] +
                                     cx.phase_ns[PHASE_DECLARE] - loading);
     }
+}
+
+// What `base.name` names when `base` leads to a module (an import binding, or a path through
+// them): its declaration there, or 0. Visibility is checked separately (module_check_paths).
+SymId module_member(Unit *u, NodeId base, uint32_t name_tok)
+{
+    Target t = chain_eval(u, base, CHAIN_SILENT, 0);
+    if (!t.known || !t.scope)
+    {
+        return 0;
+    }
+    return scope_find_token(t.scope, TOK(u, name_tok));
 }
 
 void module_body_nodes(Unit *u, NodeId from)

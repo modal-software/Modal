@@ -31,6 +31,10 @@ enum
 {
     SYM_F_MUT = 1u << 0,     // mutable field, or overloadable (type-first) method
     SYM_F_EXPOSED = 1u << 1, // the struct's face: a method declared outside its braces
+    // A function literal inside a body: anonymous, and its declaration lives only while that
+    // body is in memory (it is generated then). Listings and contracts skip it.
+    SYM_F_LITERAL = 1u << 2,
+    SYM_F_CAPTURES = 1u << 3, // a literal that reads a local of the function around it
 };
 
 typedef struct Symbol

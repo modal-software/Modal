@@ -56,6 +56,12 @@ enum
     // The body has not been parsed yet: `c` holds the TOKEN index of its '{', not a node.
     // It is parsed, checked, emitted and discarded one function at a time (see check.c).
     AST_F_LAZY = 1u << 3,
+    // A parameter named exactly like its struct type (`arena: arena`): a context parameter,
+    // a reference that calls fill in by themselves from the caller's value of that name.
+    AST_F_CONTEXT = 1u << 4,
+    // A type-first parameter with a literal where its name would be (`u8 fact(u8 0): 1`): a
+    // pattern. Its token is the literal; aux = 1 for a negative number.
+    AST_F_PATTERN = 1u << 5,
 };
 
 typedef struct AstNode

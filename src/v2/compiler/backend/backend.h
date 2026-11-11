@@ -15,10 +15,13 @@
 #include "v2/compiler/cx.h"
 #include <stdio.h>
 
+struct MirFunc; // mir/mir.h
+
 typedef struct
 {
     Unit *entry; // the checked file to generate code for
     FILE *out;
+    const char *path; // where `out` is being written
 } BackendJob;
 
 // Code generation is streamed. The compiler keeps the body of one function in memory at a
@@ -32,12 +35,18 @@ typedef struct Backend
     // Command that turns the output into an executable, or NULL if the output is final.
     // Used by `--run` as: <toolchain> -o <executable> <output>
     const char *toolchain;
+    // The output is an object file: `-o` links it into an executable with the toolchain.
+    int object;
+    // The output is an executable itself: no toolchain is involved, `--run` runs it.
+    int executable;
 
     // The declarations of job->entry are checked: emit whatever needs only those (types,
     // globals, prototypes).
     void (*begin)(const BackendJob *job);
     // `fn` is checked and its body is in memory until this returns.
     void (*function)(const BackendJob *job, SymId fn);
+    // Or, for a machine-code backend: the function already lowered to MIR (mir/mir.h).
+    void (*function_mir)(const BackendJob *job, const struct MirFunc *f);
     // Every function has been handed over: emit the entry point and finish the output.
     // Returns the number of errors reported with diag_at for constructs it cannot translate.
     int (*end)(const BackendJob *job);
@@ -49,6 +58,7 @@ const Backend *backend_default(void);
 void backend_list(FILE *out);
 
 // One Init per backend, each in its own directory.
-void backend_c_init(Backend *b); // backend/c/emit.c
+void backend_c_init(Backend *b);      // backend/c/emit.c
+void backend_native_init(Backend *b); // backend/native/emit.c
 
 #endif // MODAL_V2_BACKEND_H

@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -27,6 +28,7 @@ static int usage(const char *argv0)
             "  --time           print the time spent in each phase\n"
             "  --eager          parse every body up front and keep the whole tree\n"
             "  --repeat N       compile N times in one process; --time shows the fastest run\n"
+            "  --mir            print the MIR of every function generated (machine-code backends)\n"
             "  --cache          skip checking files that did not change (in .modal-cache, or\n"
             "                   $MODAL_CACHE); check-only runs\n",
             MODAL_VERSION, argv0, backend_default()->name);
@@ -116,6 +118,10 @@ int main(int argc, char **argv)
                 return usage(argv[0]);
             }
         }
+        else if (strcmp(argv[i], "--mir") == 0)
+        {
+            cx.show_mir = 1;
+        }
         else if (strcmp(argv[i], "--cache") == 0)
         {
             use_cache = 1;
@@ -167,26 +173,33 @@ int main(int argc, char **argv)
         if (run && !out_path)
         {
             const char *tmp = getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp";
-            if (!backend->toolchain)
+            if (!backend->toolchain && !backend->executable)
             {
                 fprintf(stderr, "fatal: backend '%s' has no toolchain to build with\n",
                         backend->name);
                 return 1;
             }
             snprintf(exe_path, sizeof(exe_path), "%s/modal-run-%ld", tmp, (long)getpid());
-            snprintf(gen_path, sizeof(gen_path), "%s%s", exe_path, backend->extension);
+            snprintf(gen_path, sizeof(gen_path), "%s%s", exe_path,
+                     backend->executable ? "" : backend->extension);
+        }
+        else if (backend->object)
+        {
+            // An object file is an intermediate: it goes next to the executable and is linked
+            // into it at the end.
+            snprintf(gen_path, sizeof(gen_path), "%s%s", out_path, backend->extension);
         }
         else
         {
             snprintf(gen_path, sizeof(gen_path), "%s", out_path);
         }
-        gen = fopen(gen_path, "w");
+        gen = fopen(gen_path, "wb");
         if (!gen)
         {
             fprintf(stderr, "fatal: cannot write '%s'\n", gen_path);
             return 1;
         }
-        codegen_start(backend, gen);
+        codegen_start(backend, gen, gen_path);
     }
 
     // --repeat: earlier runs only measure. Each starts from a clean context but keeps the
@@ -286,16 +299,55 @@ int main(int argc, char **argv)
                source, tokens, nodes, cx.syms.size - 1);
         printf("memory: %.1f KB in use, %.1f KB taken from the system at peak\n",
                (double)regions_used() / 1024.0, (double)regions_touched() / 1024.0);
+        regions_print(stdout);
     }
 
     int status = cx.errors > 0;
 
     if (!status && run && !out_path)
     {
-        status = build_and_run(backend, gen_path, exe_path); // the program's output and status
+        if (backend->executable)
+        {
+            // The backend wrote the program itself: it only has to be started.
+            chmod(gen_path, 0755);
+            fflush(stdout);
+            fflush(stderr);
+            char cmd[1100];
+            snprintf(cmd, sizeof(cmd), "'%s'", gen_path);
+            int ran = system(cmd);
+            remove(gen_path);
+            status = WIFEXITED(ran) ? WEXITSTATUS(ran) : 1;
+        }
+        else
+        {
+            status = build_and_run(backend, gen_path, exe_path); // the program's output and status
+        }
+    }
+    else if (!status && out_path && backend->object)
+    {
+        const char *toolchain = getenv("CC") ? getenv("CC") : backend->toolchain;
+        char cmd[1600];
+        snprintf(cmd, sizeof(cmd), "%s -o '%s' '%s'", toolchain, out_path, gen_path);
+        fflush(stdout);
+        fflush(stderr);
+        status = system(cmd) != 0;
+        remove(gen_path);
+        if (status)
+        {
+            fprintf(stderr, "fatal: '%s' could not link %s\n", toolchain, out_path);
+        }
+        else
+        {
+            printf("ok: %s -> %s (backend %s)\n", entry, out_path, backend->name);
+        }
     }
     else if (!status && out_path)
     {
+        size_t n = strlen(out_path);
+        if (backend->executable && !(n > 2 && strcmp(out_path + n - 2, ".o") == 0))
+        {
+            chmod(out_path, 0755);
+        }
         printf("ok: %s -> %s (backend %s)\n", entry, out_path, backend->name);
     }
     else if (!status)

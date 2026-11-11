@@ -93,7 +93,9 @@ typedef enum
 // from `start` at that moment (see source_pos).
 typedef struct
 {
-    const char *start;   // into the source buffer, never copied
+    // Where the text is: an offset from token_base, not a pointer. Every source file lives in
+    // the arena, so one base covers them all and 4 bytes do the work of 8 (12-byte tokens).
+    uint32_t off;
     uint32_t len : 24;   // a token is at most 16 MB long
     uint32_t kind : 8;   // TokenKind
     // For ( [ { and their closers: index of the partner, 0 if unbalanced.
@@ -102,7 +104,11 @@ typedef struct
     uint32_t nl : 1;     // first token on its line: this is how statements end without ';'
 } Token;
 
-_Static_assert(sizeof(Token) == 16, "Token must stay 16 bytes");
+_Static_assert(sizeof(Token) == 12, "Token must stay 12 bytes");
+
+// The base every token offset counts from (the start of the arena, where sources are read).
+extern const char *token_base;
+#define TSTART(t) (token_base + (t)->off) // the token's text
 
 typedef struct
 {

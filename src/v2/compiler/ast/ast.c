@@ -135,7 +135,7 @@ static void str_type(Str *s, const Unit *u, NodeId type)
         {
             const Token *first = TOK(u, n->tok);
             const Token *last = TOK(u, n->tok + 2u * n->aux);
-            str_put(s, first->start, (size_t)((last->start + last->len) - first->start));
+            str_put(s, TSTART(first), (size_t)((TSTART(last) + last->len) - TSTART(first)));
             return;
         }
         default:
@@ -164,7 +164,14 @@ static void str_params(Str *s, const Unit *u, NodeId param)
         {
             str_puts(s, ", ");
         }
-        str_put(s, name->start, (size_t)name->len);
+        if (n->flags & AST_F_MUT) // type first: a mutable parameter
+        {
+            str_type(s, u, n->a);
+            str_puts(s, " ");
+            str_put(s, TSTART(name), (size_t)name->len);
+            continue;
+        }
+        str_put(s, TSTART(name), (size_t)name->len);
         if (n->a)
         {
             str_puts(s, ": ");
@@ -189,7 +196,7 @@ static char *ast_sig_str(const Unit *u, NodeId decl, char *buf, size_t cap)
         str_type(&s, u, fn->b);
         str_puts(&s, " ");
     }
-    str_put(&s, name->start, (size_t)name->len);
+    str_put(&s, TSTART(name), (size_t)name->len);
     str_params(&s, u, fn->a);
     if (!type_first && fn->b)
     {
@@ -221,7 +228,7 @@ static int print_visit(Unit *u, NodeId id, uint32_t depth, void *ctx)
     case AST_FIELD_DECL:
     case AST_PARAM:
         str_type(&s, u, n->a);
-        printf(" %.*s: %s", t->len, t->start, text);
+        printf(" %.*s: %s", t->len, TSTART(t), text);
         // An inline struct type keeps its members as children; plain types are fully shown.
         if (!n->a || NODE(u, n->a)->kind != AST_TYPE_STRUCT)
         {
@@ -235,7 +242,7 @@ static int print_visit(Unit *u, NodeId id, uint32_t depth, void *ctx)
             str_puts(&s, ": ");
             str_type(&s, u, n->b);
         }
-        printf(" %.*s%s", t->len, t->start, text);
+        printf(" %.*s%s", t->len, TSTART(t), text);
         skip = VISIT_SKIP_A | VISIT_SKIP_B;
         break;
     case AST_FN_LIT:
@@ -256,15 +263,15 @@ static int print_visit(Unit *u, NodeId id, uint32_t depth, void *ctx)
         skip = VISIT_SKIP;
         break;
     case AST_IMPORT_ITEM:
-        printf(" %.*s", t->len, t->start);
+        printf(" %.*s", t->len, TSTART(t));
         if (n->c)
         {
             const Token *alias = TOK(u, n->c);
-            printf(" as %.*s", alias->len, alias->start);
+            printf(" as %.*s", alias->len, TSTART(alias));
         }
         break;
     case AST_IMPORT:
-        printf(" %.*s", t->len, t->start);
+        printf(" %.*s", t->len, TSTART(t));
         if (n->aux)
         {
             printf("  -> %s", cx.units[n->aux - 1].path);
@@ -277,10 +284,10 @@ static int print_visit(Unit *u, NodeId id, uint32_t depth, void *ctx)
     case AST_STRING_LIT:
     case AST_BIN_OP:
     case AST_UNARY_OP:
-        printf(" %.*s", t->len, t->start);
+        printf(" %.*s", t->len, TSTART(t));
         break;
     case AST_SELECTOR:
-        printf(" .%.*s", t->len, t->start);
+        printf(" .%.*s", t->len, TSTART(t));
         break;
     default:
         break;

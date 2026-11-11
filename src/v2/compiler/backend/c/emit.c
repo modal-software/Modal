@@ -95,7 +95,7 @@ static void out_indent(Emit *e)
 static void out_tok(Emit *e, uint32_t tok)
 {
     const Token *t = TOK(e->u, tok);
-    put_n(e, t->start, t->len);
+    put_n(e, TSTART(t), t->len);
 }
 
 static void unsupported(Emit *e, uint32_t tok, const char *what)
@@ -116,7 +116,14 @@ static void out_sym_name(Emit *e, SymId s)
 // modal_<struct>_<name>, with __<parameter count> for the overloadable (type-first) form.
 static void out_fn_name(Emit *e, SymId fn)
 {
-    PUT(e, "modal_");
+    if (SYM(fn)->flags & SYM_F_LITERAL) // anonymous: named by its symbol
+    {
+        char name[32];
+        snprintf(name, sizeof(name), "m__lit%u", (unsigned)fn);
+        put(e, name);
+        return;
+    }
+    PUT(e, "m_");
     if (SYM(fn)->owner)
     {
         out_sym_name(e, SYM(fn)->owner);
@@ -142,16 +149,47 @@ static void out_fn_name(Emit *e, SymId fn)
         {
             put_c(e, digits[--n]);
         }
+        // a later clause of the same arity: _2, _3, ... (calls go to the first)
+        int clause = sema_clause_index(e->u, fn);
+        if (clause > 0)
+        {
+            put_c(e, '_');
+            clause++;
+            n = 0;
+            do
+            {
+                digits[n++] = (char)('0' + clause % 10);
+                clause /= 10;
+            } while (clause);
+            while (n)
+            {
+                put_c(e, digits[--n]);
+            }
+        }
     }
+}
+
+// A parameter's C name: v_<name>, or v__<index> for a pattern, which has no name.
+static void out_param_name(Emit *e, NodeId param, int index)
+{
+    if (NODE(e->u, param)->flags & AST_F_PATTERN)
+    {
+        PUT(e, "v__");
+        put_c(e, (char)('0' + index / 10 % 10));
+        put_c(e, (char)('0' + index % 10));
+        return;
+    }
+    PUT(e, "v_");
+    out_tok(e, NODE(e->u, param)->tok);
 }
 
 static void out_type(Emit *e, TypeId t, uint32_t at)
 {
     static const char *const prims[T__PRIM_COUNT] = {
-        [T_VOID] = "void",     [T_BOOL] = "bool",    [T_U8] = "uint8_t", [T_U16] = "uint16_t",
-        [T_U32] = "uint32_t",  [T_U64] = "uint64_t", [T_I8] = "int8_t",  [T_I16] = "int16_t",
-        [T_I32] = "int32_t",   [T_I64] = "int64_t",  [T_INT] = "int",    [T_INT_LIT] = "int",
-        [T_STR] = "modal_str",
+        [T_VOID] = "void",    [T_BOOL] = "bool",    [T_U8] = "uint8_t", [T_U16] = "uint16_t",
+        [T_U32] = "uint32_t", [T_U64] = "uint64_t", [T_I8] = "int8_t",  [T_I16] = "int16_t",
+        [T_I32] = "int32_t",  [T_I64] = "int64_t",  [T_INT] = "int",    [T_INT_LIT] = "int",
+        [T_STR] = "m_str",
     };
     TypeKind k = type_kind(t);
 
@@ -161,7 +199,7 @@ static void out_type(Emit *e, TypeId t, uint32_t at)
     }
     else if (k == T_STRUCT)
     {
-        PUT(e, "modal_");
+        PUT(e, "m_");
         out_sym_name(e, type_ref(t));
     }
     else if (k == T_PTR)
@@ -183,7 +221,7 @@ static int is_self_ident(const Unit *u, NodeId id)
 {
     const AstNode *n = NODE(u, id);
     const Token *t = TOK(u, n->tok);
-    return n->kind == AST_IDENT && is_self_token(t->start, (int)t->len);
+    return n->kind == AST_IDENT && is_self_token(TSTART(t), (int)t->len);
 }
 
 // ---- expressions -----------------------------------------------------------------------------
@@ -218,33 +256,33 @@ static void emit_output(Emit *e, NodeId args, int newline)
         TypeId t = e->u->types[a];
         if (newline && a != args)
         {
-            PUT(e, "modal_write_str(MODAL_STR(\" \")), "); // print separates its arguments
+            PUT(e, "m_write_str(M_STR(\" \")), "); // print separates its arguments
         }
         if (t == T_STR)
         {
-            PUT(e, "modal_write_str(");
+            PUT(e, "m_write_str(");
         }
         else if (t == T_BOOL)
         {
-            PUT(e, "modal_write_bool(");
+            PUT(e, "m_write_bool(");
         }
         else if (t == T_U64)
         {
-            PUT(e, "modal_write_uint(");
+            PUT(e, "m_write_uint(");
         }
         else if (type_is_int(t))
         {
-            PUT(e, "modal_write_int((long long)");
+            PUT(e, "m_write_int((long long)");
         }
         else
         {
             unsupported(e, NODE(e->u, a)->tok, "printing a value of this type");
-            PUT(e, "modal_write_int((long long)");
+            PUT(e, "m_write_int((long long)");
         }
         emit_expr(e, a);
         PUT(e, "), ");
     }
-    put(e, newline ? "modal_write_str(MODAL_STR(\"\\n\")))" : "(void)0)");
+    put(e, newline ? "m_write_str(M_STR(\"\\n\")))" : "(void)0)");
 }
 
 static void emit_call(Emit *e, NodeId id)
@@ -282,7 +320,7 @@ static void emit_call(Emit *e, NodeId id)
             TypeId base = u->types[callee->a];
             if (type_kind(base) == T_TYPE) // T.m(...): a fresh zero value
             {
-                PUT(e, "&(modal_");
+                PUT(e, "&(m_");
                 out_sym_name(e, type_ref(base));
                 PUT(e, "){0}");
             }
@@ -318,17 +356,17 @@ static void emit_expr(Emit *e, NodeId id)
     switch (n->kind)
     {
     case AST_NUMBER_LIT:
-        if (memchr(t->start, '.', t->len))
+        if (memchr(TSTART(t), '.', t->len))
         {
             unsupported(e, n->tok, "a fractional number");
         }
         out_tok(e, n->tok);
         break;
     case AST_STRING_LIT:
-        PUT(e, "MODAL_STR(");
+        PUT(e, "M_STR(");
         for (uint32_t i = 0; i < t->len; i++) // a Modal string may span lines; a C one may not
         {
-            char ch = t->start[i];
+            char ch = TSTART(t)[i];
             if (ch == '\n')
             {
                 PUT(e, "\\n");
@@ -367,7 +405,7 @@ static void emit_expr(Emit *e, NodeId id)
             PUT(e, "0");
         }
         else if (type == T_BOOL && (t->len == 4 || t->len == 5) &&
-                 (!memcmp(t->start, "true", 4) || !memcmp(t->start, "false", 5)))
+                 (!memcmp(TSTART(t), "true", 4) || !memcmp(TSTART(t), "false", 5)))
         {
             out_tok(e, n->tok);
         }
@@ -394,7 +432,7 @@ static void emit_expr(Emit *e, NodeId id)
             break;
         }
         put_c(e, '(');
-        put_c(e, *t->start);
+        put_c(e, *TSTART(t));
         emit_expr(e, n->a);
         PUT(e, ")");
         break;
@@ -425,7 +463,7 @@ static void emit_expr(Emit *e, NodeId id)
         }
         else
         {
-            put_n(e, t->start, t->len);
+            put_n(e, TSTART(t), t->len);
         }
         put_c(e, ' ');
         emit_expr(e, n->b);
@@ -499,13 +537,11 @@ static void emit_stmt(Emit *e, NodeId id, TypeId ret)
         PUT(e, "}\n");
         return;
     case AST_DEFINE:
-        out_indent(e);
         if (NODE(u, n->a)->kind == AST_FN_LIT)
         {
-            unsupported(e, n->tok, "a function literal inside another function");
-            PUT(e, ";\n");
-            return;
+            return; // the literal was emitted as a function of its own; calls name it directly
         }
+        out_indent(e);
         out_type(e, u->types[id], n->tok);
         PUT(e, " v_");
         out_tok(e, n->tok);
@@ -552,20 +588,70 @@ static void emit_signature(Emit *e, SymId fn)
     PUT(e, "(");
     if (SYM(fn)->owner)
     {
-        PUT(e, "modal_");
+        PUT(e, "m_");
         out_sym_name(e, SYM(fn)->owner);
         PUT(e, " *self");
         first = 0;
     }
-    for (NodeId p = sema_fn_params(u, fn); p; p = NODE(u, p)->next)
+    int index = 0;
+    for (NodeId p = sema_fn_params(u, fn); p; p = NODE(u, p)->next, index++)
     {
         put(e, first ? "" : ", ");
         out_type(e, sema_param_type(u, fn, p), NODE(u, p)->tok);
-        PUT(e, " v_");
-        out_tok(e, NODE(u, p)->tok);
+        put_c(e, ' ');
+        out_param_name(e, p, index);
         first = 0;
     }
     put(e, first ? "void)" : ")");
+}
+
+// A clause with patterns starts by testing them; when they do not match, the same arguments
+// go to the next clause.
+static void emit_clause_test(Emit *e, SymId fn, TypeId ret)
+{
+    Unit *u = e->u;
+    SymId next = sema_next_clause(u, fn);
+    if (!next)
+    {
+        return;
+    }
+    PUT(e, "    if (!(");
+    int index = 0, first = 1;
+    for (NodeId p = sema_fn_params(u, fn); p; p = NODE(u, p)->next, index++)
+    {
+        uint64_t value;
+        if (!sema_pattern(u, p, SYM(fn)->owner, &value, 0))
+        {
+            continue;
+        }
+        put(e, first ? "" : " && ");
+        out_param_name(e, p, index);
+        char num[32];
+        snprintf(num, sizeof(num), " == (");
+        put(e, num);
+        out_type(e, sema_param_type(u, fn, p), NODE(u, p)->tok);
+        snprintf(num, sizeof(num), ")%lluull", (unsigned long long)value);
+        put(e, num);
+        first = 0;
+    }
+    PUT(e, "))\n    {\n        ");
+    put(e, ret == T_VOID ? "" : "return ");
+    out_fn_name(e, next);
+    PUT(e, "(");
+    first = 1;
+    if (SYM(fn)->owner)
+    {
+        PUT(e, "self");
+        first = 0;
+    }
+    index = 0;
+    for (NodeId p = sema_fn_params(u, fn); p; p = NODE(u, p)->next, index++)
+    {
+        put(e, first ? "" : ", ");
+        out_param_name(e, p, index);
+        first = 0;
+    }
+    put(e, ret == T_VOID ? ");\n        return;\n    }\n" : ");\n    }\n");
 }
 
 static void emit_function(Emit *e, SymId fn)
@@ -581,6 +667,7 @@ static void emit_function(Emit *e, SymId fn)
     {
         PUT(e, "    (void)self;\n");
     }
+    emit_clause_test(e, fn, ret);
     if (n->flags & AST_F_ONELINE)
     {
         out_indent(e);
@@ -622,8 +709,8 @@ static void emit_struct(Emit *e, NodeId decl)
     SymId self = scope_find_token(u->scope, name);
     int fields = 0;
 
-    PUT(e, "struct modal_");
-    put_n(e, name->start, name->len);
+    PUT(e, "struct m_");
+    put_n(e, TSTART(name), name->len);
     PUT(e, "\n{\n");
     for (NodeId m = n->a; m; m = NODE(u, m)->next)
     {
@@ -637,7 +724,7 @@ static void emit_struct(Emit *e, NodeId decl)
             continue;
         }
         const Token *field = TOK(u, member->tok);
-        SymId s = scope_find(scope_at(SYM(self)->scope_ref), field->start, field->len);
+        SymId s = scope_find(scope_at(SYM(self)->scope_ref), TSTART(field), field->len);
         while (s && SYM(s)->kind != SYM_FIELD)
         {
             s = SYM(s)->next; // skip an accessor that shares the field's name
@@ -645,13 +732,13 @@ static void emit_struct(Emit *e, NodeId decl)
         PUT(e, "    ");
         out_type(e, s ? sema_value_type(u, s) : T_NONE, member->tok);
         put_c(e, ' ');
-        put_n(e, field->start, field->len);
+        put_n(e, TSTART(field), field->len);
         PUT(e, ";\n");
         fields++;
     }
     if (!fields)
     {
-        PUT(e, "    char modal_empty;\n"); // C has no empty structs
+        PUT(e, "    char m_empty;\n"); // C has no empty structs
     }
     PUT(e, "};\n\n");
 }
@@ -667,19 +754,19 @@ static const char *const prelude =
     "{\n"
     "    const uint8_t *ptr;\n"
     "    size_t len;\n"
-    "} modal_str;\n"
+    "} m_str;\n"
     "\n"
-    "#define MODAL_STR(s) ((modal_str){(const uint8_t *)(s), sizeof(s) - 1})\n"
+    "#define M_STR(s) ((m_str){(const uint8_t *)(s), sizeof(s) - 1})\n"
     "#if defined(__GNUC__) || defined(__clang__)\n"
-    "#define MODAL_RT static inline __attribute__((unused))\n"
+    "#define M_RT static inline __attribute__((unused))\n"
     "#else\n"
-    "#define MODAL_RT static inline\n"
+    "#define M_RT static inline\n"
     "#endif\n"
     "\n"
-    "MODAL_RT void modal_write_str(modal_str s) { fwrite(s.ptr, 1, s.len, stdout); }\n"
-    "MODAL_RT void modal_write_int(long long n) { printf(\"%lld\", n); }\n"
-    "MODAL_RT void modal_write_uint(unsigned long long n) { printf(\"%llu\", n); }\n"
-    "MODAL_RT void modal_write_bool(bool b) { fputs(b ? \"true\" : \"false\", stdout); }\n"
+    "M_RT void m_write_str(m_str s) { fwrite(s.ptr, 1, s.len, stdout); }\n"
+    "M_RT void m_write_int(long long n) { printf(\"%lld\", n); }\n"
+    "M_RT void m_write_uint(unsigned long long n) { printf(\"%llu\", n); }\n"
+    "M_RT void m_write_bool(bool b) { fputs(b ? \"true\" : \"false\", stdout); }\n"
     "\n";
 
 // One Emit for the whole job: it holds the output buffer between the three calls.
@@ -710,10 +797,10 @@ static void backend_c_begin(const BackendJob *job)
         if (NODE(u, d)->kind == AST_STRUCT_DECL)
         {
             const Token *name = TOK(u, NODE(u, d)->tok);
-            PUT(e, "typedef struct modal_");
-            put_n(e, name->start, name->len);
-            PUT(e, " modal_");
-            put_n(e, name->start, name->len);
+            PUT(e, "typedef struct m_");
+            put_n(e, TSTART(name), name->len);
+            PUT(e, " m_");
+            put_n(e, TSTART(name), name->len);
             PUT(e, ";\n");
         }
     }
@@ -744,7 +831,7 @@ static void backend_c_begin(const BackendJob *job)
         put(e, (n->kind == AST_DEFINE || !(n->flags & AST_F_MUT)) ? "static const " : "static ");
         out_type(e, type, n->tok);
         PUT(e, " g_");
-        put_n(e, name->start, name->len);
+        put_n(e, TSTART(name), name->len);
         if (init)
         {
             PUT(e, " = ");
@@ -771,6 +858,12 @@ static void backend_c_begin(const BackendJob *job)
 static void backend_c_function(const BackendJob *job, SymId fn)
 {
     (void)job;
+    if ((SYM(fn)->flags & SYM_F_CAPTURES))
+    {
+        unsupported(&emit_state, SYM(fn)->tok,
+                    "a function literal that uses a local of the function around it (a closure)");
+        return;
+    }
     if (emittable(&emit_state, fn, 0))
     {
         emit_function(&emit_state, fn);

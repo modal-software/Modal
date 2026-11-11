@@ -93,8 +93,10 @@ NodeId parse_type(Parser *p)
     return type;
 }
 
-// params := '(' [ param (',' param)* ] ')'      param := IDENT [ ':' type ]
+// params := '(' [ param (',' param)* ] ')'      param := IDENT [ ':' type ] | type IDENT
 //
+// The same rule as fields: where the type is written decides mutability.
+//   a: u8     immutable parameter       u8 a     mutable parameter (it can be assigned to)
 // A type applies backwards to the untyped names before it: (n3, n4: u8).
 // `self` is the only parameter that may stay untyped, and it never joins a group:
 // (self, n3: u8) leaves self as the owner.
@@ -114,6 +116,88 @@ NodeId parse_params(Parser *p, int *has_self)
 
     while (p->current->kind != TOK_RPAREN && p->current->kind != TOK_EOF)
     {
+        // Type first: a name cannot be followed by another name, a '.' or start with '*' / '[]'.
+        const Token *t = p->current;
+        // A literal after the type is a pattern (`u8 fact(u8 0): 1`).
+        int type_first =
+            (t->kind == TOK_IDENTIFIER && !t[1].nl &&
+             (t[1].kind == TOK_IDENTIFIER || t[1].kind == TOK_DOT || t[1].kind == TOK_NUMBER ||
+              t[1].kind == TOK_STRING || (t[1].kind == TOK_MINUS && t[2].kind == TOK_NUMBER))) ||
+            t->kind == TOK_STAR || (t->kind == TOK_LBRACKET && t[1].kind == TOK_RBRACKET);
+        if (type_first)
+        {
+            if (pending)
+            {
+                const Token *wait = TOK(u, NODE(u, pending)->tok);
+                parser_error_at(p, wait,
+                                "parameter '%.*s' needs its type before a type-first parameter",
+                                wait->len, TSTART(wait));
+                break;
+            }
+            NodeId type = parse_type(p);
+            if (!type)
+            {
+                break;
+            }
+            // A pattern: a literal where the name would be. It binds nothing.
+            int negative = p->current->kind == TOK_MINUS && p->current[1].kind == TOK_NUMBER;
+            const Token *lit = negative ? p->current + 1 : p->current;
+            int is_bool = lit->kind == TOK_IDENTIFIER &&
+                          ((lit->len == 4 && memcmp(TSTART(lit), "true", 4) == 0) ||
+                           (lit->len == 5 && memcmp(TSTART(lit), "false", 5) == 0));
+            if (lit->kind == TOK_STRING)
+            {
+                parser_error_at(p, lit, "a string pattern is not supported yet");
+                break;
+            }
+            if (lit->kind == TOK_NUMBER || is_bool)
+            {
+                if (negative)
+                {
+                    parser_advance(p);
+                }
+                parser_advance(p);
+                NodeId param = node_new(u, AST_PARAM, tok_idx(p, lit), type, 0, 0);
+                NODE(u, param)->flags = AST_F_MUT | AST_F_PATTERN;
+                NODE(u, param)->aux = (uint16_t)negative;
+                node_list_push(u, &params, param);
+                index++;
+                if (!parser_match(p, TOK_COMMA))
+                {
+                    break;
+                }
+                continue;
+            }
+            const Token *name = p->current;
+            if (!parser_consume(p, TOK_IDENTIFIER, "expected a parameter name after its type"))
+            {
+                break;
+            }
+            if (is_self_token(TSTART(name), name->len))
+            {
+                parser_error_at(p, name, "'self' has no type-first form: write `self` or `self: T`");
+                break;
+            }
+            const Token *tt = TOK(u, NODE(u, type)->tok);
+            if (NODE(u, type)->kind == AST_TYPE_NAME && !NODE(u, type)->aux && tt->len == name->len &&
+                memcmp(TSTART(tt), TSTART(name), name->len) == 0)
+            {
+                parser_error_at(p, name,
+                                "a context parameter is immutable: write `%.*s: %.*s` (type last)",
+                                name->len, TSTART(name), name->len, TSTART(name));
+                break;
+            }
+            NodeId param = node_new(u, AST_PARAM, tok_idx(p, name), type, 0, 0);
+            NODE(u, param)->flags = AST_F_MUT;
+            node_list_push(u, &params, param);
+            index++;
+            if (!parser_match(p, TOK_COMMA))
+            {
+                break;
+            }
+            continue;
+        }
+
         const Token *name = p->current;
         if (!parser_consume(p, TOK_IDENTIFIER, "expected a parameter name"))
         {
@@ -121,7 +205,7 @@ NodeId parse_params(Parser *p, int *has_self)
         }
 
         NodeId param = node_new(u, AST_PARAM, tok_idx(p, name), 0, 0, 0);
-        int is_self = is_self_token(name->start, name->len);
+        int is_self = is_self_token(TSTART(name), name->len);
         node_list_push(u, &params, param);
 
         if (is_self)
@@ -168,10 +252,24 @@ NodeId parse_params(Parser *p, int *has_self)
     if (pending)
     {
         const Token *name = TOK(u, NODE(u, pending)->tok);
-        parser_error_at(p, name, "parameter '%.*s' needs a type", name->len, name->start);
+        parser_error_at(p, name, "parameter '%.*s' needs a type", name->len, TSTART(name));
         return 0;
     }
     parser_consume(p, TOK_RPAREN, "expected ')' after the parameters");
+    // A parameter named exactly like its (simple) type is a context parameter.
+    for (NodeId id = params.head; id; id = NODE(u, id)->next)
+    {
+        AstNode *n = NODE(u, id);
+        if (n->a && !(n->flags & AST_F_MUT) && NODE(u, n->a)->kind == AST_TYPE_NAME &&
+            !NODE(u, n->a)->aux)
+        {
+            const Token *name = TOK(u, n->tok), *type = TOK(u, NODE(u, n->a)->tok);
+            if (name->len == type->len && memcmp(TSTART(name), TSTART(type), name->len) == 0)
+            {
+                n->flags |= AST_F_CONTEXT;
+            }
+        }
+    }
     return params.head;
 }
 
@@ -205,7 +303,7 @@ static NodeId parse_method(Parser *p, const Token *name, NodeId ret, uint8_t fla
         {
             parser_error_at(p, p->current,
                             "expected '{' or ': expression' after the parameters of '%.*s'",
-                            name->len, name->start);
+                            name->len, TSTART(name));
         }
     }
     else
@@ -229,7 +327,7 @@ static NodeId parse_method(Parser *p, const Token *name, NodeId ret, uint8_t fla
             parser_error_at(p, p->current,
                             "expected '{' to open the body of '%.*s' (a one-line body needs the "
                             "type-first form: `T %.*s(...): expression`)",
-                            name->len, name->start, name->len, name->start);
+                            name->len, TSTART(name), name->len, TSTART(name));
         }
         if (!p->panic)
         {

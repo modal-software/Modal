@@ -16,8 +16,8 @@ static void redeclared(Unit *u, uint32_t tok, SymId previous, const char *hint)
 {
     const Token *t = TOK(u, tok);
     int line, col;
-    source_pos(u->src, TOK(u, SYM(previous)->tok)->start, &line, &col);
-    diag_at(u, tok, "error", "'%.*s' is already declared at line %d%s", t->len, t->start, line,
+    source_pos(u->src, TSTART(TOK(u, SYM(previous)->tok)), &line, &col);
+    diag_at(u, tok, "error", "'%.*s' is already declared at line %d%s", t->len, TSTART(t), line,
             hint);
 }
 
@@ -47,9 +47,9 @@ static int type_equal(const Unit *u, NodeId a, NodeId b)
         {
             const Token *xf = TOK(u, x->tok), *xl = TOK(u, x->tok + 2u * x->aux);
             const Token *yf = TOK(u, y->tok), *yl = TOK(u, y->tok + 2u * y->aux);
-            size_t xn = (size_t)((xl->start + xl->len) - xf->start);
-            size_t yn = (size_t)((yl->start + yl->len) - yf->start);
-            return xn == yn && memcmp(xf->start, yf->start, xn) == 0;
+            size_t xn = (size_t)((TSTART(xl) + xl->len) - TSTART(xf));
+            size_t yn = (size_t)((TSTART(yl) + yl->len) - TSTART(yf));
+            return xn == yn && memcmp(TSTART(xf), TSTART(yf), xn) == 0;
         }
         if (x->kind == AST_TYPE_STRUCT)
         {
@@ -66,7 +66,7 @@ static NodeId skip_self(const Unit *u, NodeId param)
     if (param)
     {
         const Token *t = TOK(u, NODE(u, param)->tok);
-        if (is_self_token(t->start, t->len))
+        if (is_self_token(TSTART(t), t->len))
         {
             return NODE(u, param)->next;
         }
@@ -75,13 +75,48 @@ static NodeId skip_self(const Unit *u, NodeId param)
 }
 
 // Two overloads collide when their parameter types match one by one (self aside).
+// Two parameters match the same arguments: both bind a name, or both are the same literal.
+static int same_pattern(const Unit *u, NodeId pa, NodeId pb)
+{
+    const AstNode *a = NODE(u, pa), *b = NODE(u, pb);
+    int pat_a = (a->flags & AST_F_PATTERN) != 0, pat_b = (b->flags & AST_F_PATTERN) != 0;
+    if (!pat_a || !pat_b)
+    {
+        return pat_a == pat_b;
+    }
+    const Token *ta = TOK(u, a->tok), *tb = TOK(u, b->tok);
+    return a->aux == b->aux && ta->len == tb->len && memcmp(TSTART(ta), TSTART(tb), ta->len) == 0;
+}
+
+static int has_patterns(const Unit *u, NodeId params)
+{
+    for (NodeId p = params; p; p = NODE(u, p)->next)
+    {
+        if (NODE(u, p)->flags & AST_F_PATTERN)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int arity(const Unit *u, NodeId params)
+{
+    int n = 0;
+    for (NodeId p = skip_self(u, params); p; p = NODE(u, p)->next)
+    {
+        n++;
+    }
+    return n;
+}
+
 static int same_signature(const Unit *u, NodeId pa, NodeId pb)
 {
     pa = skip_self(u, pa);
     pb = skip_self(u, pb);
     while (pa && pb)
     {
-        if (!type_equal(u, NODE(u, pa)->a, NODE(u, pb)->a))
+        if (!type_equal(u, NODE(u, pa)->a, NODE(u, pb)->a) || !same_pattern(u, pa, pb))
         {
             return 0;
         }
@@ -141,12 +176,24 @@ static void declare_callable(Unit *u, Scope *scope, SymId owner, uint32_t tok, N
         return;
     }
 
+    // Clauses: definitions with as many parameters are tried in order, so one without
+    // patterns catches everything and must come last.
+    NodeId mine = sema_callable_params(u, decl);
     SymId last = first;
     for (SymId s = first; s; s = SYM(s)->next_overload)
     {
-        if (same_signature(u, sema_callable_params(u, SYM(s)->decl), sema_callable_params(u, decl)))
+        NodeId theirs = sema_callable_params(u, SYM(s)->decl);
+        if (same_signature(u, theirs, mine))
         {
-            redeclared(u, tok, s, " with the same parameter types");
+            redeclared(u, tok, s,
+                       has_patterns(u, mine) ? " with the same patterns" : " with the same parameter types");
+            return;
+        }
+        if (arity(u, theirs) == arity(u, mine) && !has_patterns(u, theirs))
+        {
+            redeclared(u, tok, s,
+                       ": that definition takes every value, so this clause would never run. Clauses "
+                       "are tried in order: put the ones with patterns first");
             return;
         }
         last = s;
@@ -167,7 +214,7 @@ static Scope *callable_home(Unit *u, NodeId params, SymId *owner)
 
     const AstNode *first = NODE(u, params);
     const Token *name = TOK(u, first->tok);
-    if (!is_self_token(name->start, name->len) || !first->a)
+    if (!is_self_token(TSTART(name), name->len) || !first->a)
     {
         return u->scope; // no self, or a bare `self`: the module owns it
     }
@@ -187,9 +234,9 @@ static Scope *callable_home(Unit *u, NodeId params, SymId *owner)
             return scope_at(SYM(target)->scope_ref);
         }
 
-        if (is_self_token(t->start, t->len) ||
-            (t->len == u->name_len && memcmp(t->start, u->name, (size_t)t->len) == 0) ||
-            (strlen(domain) == (size_t)t->len && memcmp(t->start, domain, (size_t)t->len) == 0))
+        if (is_self_token(TSTART(t), t->len) ||
+            (t->len == u->name_len && memcmp(TSTART(t), u->name, (size_t)t->len) == 0) ||
+            (strlen(domain) == (size_t)t->len && memcmp(TSTART(t), domain, (size_t)t->len) == 0))
         {
             return u->scope; // `self: <module>` spelled out
         }
@@ -210,7 +257,7 @@ static void check_member_self(Unit *u, SymId owner, NodeId params)
     }
     const AstNode *first = NODE(u, params);
     const Token *name = TOK(u, first->tok);
-    if (!is_self_token(name->start, name->len))
+    if (!is_self_token(TSTART(name), name->len))
     {
         return;
     }
@@ -220,8 +267,8 @@ static void check_member_self(Unit *u, SymId owner, NodeId params)
     int olen;
     const char *oname = symbol_name(owner, &olen);
     if (type->kind == AST_TYPE_NAME && type->aux == 0 &&
-        (is_self_token(t->start, t->len) ||
-         (t->len == olen && memcmp(t->start, oname, (size_t)olen) == 0)))
+        (is_self_token(TSTART(t), t->len) ||
+         (t->len == olen && memcmp(TSTART(t), oname, (size_t)olen) == 0)))
     {
         return;
     }
@@ -371,6 +418,34 @@ void sema_declare(Unit *u)
             break;
         default:
             break;
+        }
+    }
+
+    // Every group of clauses ends with one that takes every value: a call always finds one.
+    for (SymId s = 1; s < cx.syms.size; s++)
+    {
+        const Symbol *sym = SYM(s);
+        if (sym->unit != u->id || sym->kind != SYM_METHOD || !(sym->flags & SYM_F_MUT))
+        {
+            continue;
+        }
+        NodeId params = sema_callable_params(u, sym->decl);
+        if (!has_patterns(u, params))
+        {
+            continue;
+        }
+        int n = arity(u, params), later = 0;
+        for (SymId t = sym->next_overload; t && !later; t = SYM(t)->next_overload)
+        {
+            later = arity(u, sema_callable_params(u, SYM(t)->decl)) == n;
+        }
+        if (!later)
+        {
+            const Token *name = TOK(u, sym->tok);
+            diag_at(u, sym->tok, "error",
+                    "'%.*s' with %d argument%s has clauses with patterns but none after them that "
+                    "takes every value: add one last, e.g. `T %.*s(T n): ...`",
+                    name->len, TSTART(name), n, n == 1 ? "" : "s", name->len, TSTART(name));
         }
     }
 }

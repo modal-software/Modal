@@ -344,7 +344,7 @@ static int scan_into(const char *filename, const char *src, const char *from, co
 
         if (!*c || (end && c >= end))
         {
-            toks[count++] = (Token){.start = start, .kind = TOK_EOF, .nl = 1};
+            toks[count++] = (Token){.off = (uint32_t)(start - token_base), .kind = TOK_EOF, .nl = 1};
             break;
         }
 
@@ -587,7 +587,7 @@ static int scan_into(const char *filename, const char *src, const char *from, co
         }
 
         toks[count++] = (Token){
-            .start = start,
+            .off = (uint32_t)(start - token_base),
             .len = (uint32_t)(c - start),
             .kind = kind,
             .match = match,
@@ -599,7 +599,7 @@ static int scan_into(const char *filename, const char *src, const char *from, co
     while (sp > 0 && !too_deep)
     {
         const Token *open = &toks[open_stack[--sp]];
-        scan_error(filename, src, open->start, "'%c' is never closed", *open->start);
+        scan_error(filename, src, TSTART(open), "'%c' is never closed", *TSTART(open));
         errors++;
     }
 
@@ -609,9 +609,18 @@ static int scan_into(const char *filename, const char *src, const char *from, co
     return errors;
 }
 
+const char *token_base;
+
 int scan_all(const char *filename, const char *src, size_t len, int eager, TokenVec *out,
              size_t *max_body)
 {
+    // Sources are read into the arena: its start is where every token offset counts from.
+    token_base = cx.regions[REGION_ARENA].base;
+    if (src < token_base || (uint64_t)(src + len - token_base) > UINT32_MAX)
+    {
+        fprintf(stderr, "fatal: %s: the sources are larger than 4 GB together\n", filename);
+        exit(2);
+    }
     // Every token but the EOF takes at least one byte of source, so len + 2 slots can never
     // overflow: the scanning loop needs no growth path. They are the free end of the token
     // region, which costs address space only; the caller claims what was written.
@@ -624,7 +633,7 @@ int scan_all(const char *filename, const char *src, size_t len, int eager, Token
 
 int scan_body(const char *filename, const char *src, const Token *body, TokenVec *out)
 {
-    return scan_into(filename, src, body->start, body->start + body->len, out, 0, NULL);
+    return scan_into(filename, src, TSTART(body), TSTART(body) + body->len, out, 0, NULL);
 }
 
 const char *token_kind_name(TokenKind kind)

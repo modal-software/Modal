@@ -74,8 +74,8 @@ void cache_unit_loaded(Unit *u)
         const Token *t = &u->tokens.data[i];
         if (t->kind == TOK_BODY)
         {
-            h = hash_bytes(from, (size_t)(t->start - from), h);
-            from = t->start + t->len;
+            h = hash_bytes(from, (size_t)(TSTART(t) - from), h);
+            from = TSTART(t) + t->len;
         }
     }
     h = hash_bytes(from, (size_t)(u->src + u->len - from), h);
