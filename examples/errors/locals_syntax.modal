@@ -1,0 +1,7 @@
+-- errors in the form of local declarations: one report each
+main(): u8 {
+    k: u8
+    x, y: u8 = 1
+    p: struct { u8 x, }
+    return 0
+}

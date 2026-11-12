@@ -1,0 +1,15 @@
+assert := import("std").debug.assert
+sizeof := import("std").mem.sizeof
+
+header: struct {
+    u8 kind,
+    u32 len,
+}
+i32 neg(i32 n): 0 - n
+checks() {
+    assert(neg(3) > 0)
+}
+
+assert(sizeof(header) == 12)
+assert(neg(5) >= 0)
+checks()

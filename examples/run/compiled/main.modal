@@ -1,0 +1,12 @@
+print := import("std").io.print
+
+table := sum_squares(10)    -- 385, computed by mod.modal's functions
+mode := build(1)
+u32 left = square(9)        -- a variable: its first value came from the compiler
+
+main(): u8 {
+    print(table, mode, left)
+    left = left - table
+    print(left)
+    return 0
+}

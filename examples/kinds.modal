@@ -1,0 +1,32 @@
+-- function kinds (docs/comptime.md §2): `--sig` says where each function can run, and why
+print := import("std").io.print
+u8 hits
+
+twice(n: u8): u8 {             -- both: it needs nothing of the running program
+    return n * 2
+}
+
+log(n: u8) {                   -- run time: it prints
+    print("n", n)
+}
+
+step(n: u8): u8 {              -- run time, through log
+    log(n)
+    return n + 1
+}
+
+count(): u8 {                  -- run time: a mutable module variable
+    hits = hits + 1
+    return hits
+}
+
+u8 down(u8 0): 0               -- a cycle: down calls back, and through `back` reaches log
+u8 down(u8 n): back(n - 1)
+u8 back(u8 n) {
+    log(n)
+    return down(n)
+}
+
+main(): u8 {
+    return step(twice(3)) + count() + down(2)
+}

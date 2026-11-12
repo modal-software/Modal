@@ -1,0 +1,20 @@
+-- what the compiler cannot run: each is an error at the declaration, saying why
+print := import("std").io.print
+u8 hits
+log(n: u8): u8 {
+    print("n", n)
+    return n
+}
+count(): u8 {
+    return hits + 1
+}
+u64 deep(u64 0): 0
+u64 deep(u64 n): deep(n - 1) + 1
+u8 half(u8 n): 10 / n
+a: u8 = log(3)
+b: u8 = count()
+c: u64 = deep(5000)
+d: u8 = half(0)
+main(): u8 {
+    return 0
+}
