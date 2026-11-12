@@ -78,7 +78,7 @@ static int is_self_node(const Unit *u, NodeId id)
 static int count_list(const Unit *u, NodeId id)
 {
     int n = 0;
-    for (; id; id = NODE(u, id)->next)
+    for (; id; id = NEXT(u, id))
     {
         n++;
     }
@@ -130,16 +130,13 @@ static int exact_value(const Unit *u, NodeId id, Exact *out)
     {
     case AST_NUMBER_LIT:
     {
-        Exact v = 0;
-        for (uint32_t i = 0; i < t->len; i++)
+        uint64_t v;
+        int overflow;
+        if (!number_value(TSTART(t), t->len, &v, &overflow))
         {
-            if (TSTART(t)[i] < '0' || TSTART(t)[i] > '9' || v > ((Exact)1 << 100))
-            {
-                return 0;
-            }
-            v = v * 10 + (TSTART(t)[i] - '0');
+            return 0;
         }
-        *out = v;
+        *out = overflow ? (Exact)UINT64_MAX + 1 : (Exact)v; // too large for any type
         return 1;
     }
     case AST_PAREN_GROUP:
@@ -354,7 +351,9 @@ static const AstNode *callable_node(const Unit *u, NodeId decl)
 static TypeId fn_ret_type(Unit *u, SymId fn)
 {
     u = &cx.units[SYM(fn)->unit];
-    return resolve_type(u, callable_node(u, SYM(fn)->decl)->b, SYM(fn)->owner, 0);
+    NodeId decl = SYM(fn)->decl;
+    NodeId callable = NODE(u, decl)->kind == AST_DEFINE ? NODE(u, decl)->a : decl;
+    return resolve_type(u, fn_ret_node(u, callable), SYM(fn)->owner, 0);
 }
 
 // The parameters a caller supplies: everything after `self`.
@@ -365,7 +364,7 @@ static NodeId fn_params(const Unit *u, SymId fn)
     if (params &&
         is_self_token(TSTART(TOK(u, NODE(u, params)->tok)), (int)TOK(u, NODE(u, params)->tok)->len))
     {
-        return NODE(u, params)->next;
+        return NEXT(u, params);
     }
     return params;
 }
@@ -399,7 +398,7 @@ static int count_contexts(const Unit *u, SymId fn)
 {
     u = &cx.units[SYM(fn)->unit];
     int n = 0;
-    for (NodeId p = fn_params(u, fn); p; p = NODE(u, p)->next)
+    for (NodeId p = fn_params(u, fn); p; p = NEXT(u, p))
     {
         n += (NODE(u, p)->flags & AST_F_CONTEXT) != 0;
     }
@@ -413,7 +412,9 @@ static TypeId value_type(Unit *u, SymId s)
     const AstNode *decl = NODE(u, SYM(s)->decl);
     if (decl->kind == AST_FIELD_DECL)
     {
-        return resolve_type(u, decl->a, SYM(s)->owner, 0);
+        TypeId t = resolve_type(u, decl->a, SYM(s)->owner, 0);
+        // a device (`uart0: pl011 @ address`) is a reference to the registers at that address
+        return (decl->flags & AST_F_PLACED) && !SYM(s)->owner ? type_make(T_PTR, t) : t;
     }
     if (decl->kind == AST_DEFINE)
     {
@@ -577,13 +578,13 @@ static void report_missing(Check *c, uint32_t tok, int is_call)
 
 // `print := import("std").io.print`: the one std function the compiler knows. It prints its
 // arguments and returns nothing.
-int sema_is_std_print(const Unit *u, SymId s)
+static int is_std_path(const Unit *u, SymId s, const char *member, const char *module)
 {
     if (!s || SYM(s)->kind != SYM_IMPORT || NODE(u, SYM(s)->decl)->kind != AST_DEFINE)
     {
         return 0;
     }
-    static const char *const path[] = {"print", "io"};
+    const char *const path[] = {member, module};
     NodeId id = NODE(u, SYM(s)->decl)->a;
     for (int i = 0; i < 2; i++)
     {
@@ -600,6 +601,18 @@ int sema_is_std_print(const Unit *u, SymId s)
     return NODE(u, id)->kind == AST_IMPORT &&
            ((arg->len == 3 && memcmp(TSTART(arg), "std", 3) == 0) ||
             (arg->len == 5 && memcmp(TSTART(arg), "\"std\"", 5) == 0));
+}
+
+int sema_std_member(const Unit *u, SymId s)
+{
+    return is_std_path(u, s, "print", "io") ? STD_PRINT
+           : is_std_path(u, s, "put", "sys") ? STD_SYS_PUT
+                                             : STD_NONE;
+}
+
+int sema_is_std_print(const Unit *u, SymId s)
+{
+    return sema_std_member(u, s) == STD_PRINT;
 }
 
 // ---- invocations -----------------------------------------------------------------------------
@@ -658,7 +671,7 @@ static void check_args(Check *c, NodeId args, SymId fn)
     NodeId param = fn ? fn_params(u, fn) : 0;
     int index = 1;
 
-    for (NodeId a = args; a; a = NODE(u, a)->next, index++)
+    for (NodeId a = args; a; a = NEXT(u, a), index++)
     {
         TypeId at = check_expr(c, a);
         if (at == T_VOID)
@@ -672,7 +685,7 @@ static void check_args(Check *c, NodeId args, SymId fn)
         TypeId pt = param_type(&cx.units[SYM(fn)->unit], param, SYM(fn)->owner, 0);
         if (fits(at, pt) && !check_bounds(c, a, pt))
         {
-            param = NODE(home, param)->next;
+            param = NEXT(home, param);
             continue;
         }
         if (!fits(at, pt))
@@ -686,46 +699,34 @@ static void check_args(Check *c, NodeId args, SymId fn)
                     type_str(at, got, sizeof(got)), pn->len, TSTART(pn),
                     type_str(pt, want, sizeof(want)));
         }
-        param = NODE(home, param)->next;
+        param = NEXT(home, param);
     }
 }
 
 // Calls `first` (a function or an overload set) with the arguments of call node `id`.
 static void side_tables(Unit *u, NodeId from);
 
-static NodeId push_back(Unit *u, NodeId *head, NodeId tail, NodeId item)
-{
-    NODE(u, item)->next = 0;
-    if (tail)
-    {
-        NODE(u, tail)->next = item;
-    }
-    else
-    {
-        *head = item;
-    }
-    return item;
-}
-
 // A call that leaves its context arguments out gets them here: each is the caller's own value
 // of that name (a local or a parameter), as a plain name, so every backend sees a full call.
+// The whole argument list is laid out again as consecutive nodes (the old ones are left inert).
 static void fill_contexts(Check *c, NodeId id, SymId fn, uint32_t at)
 {
     Unit *u = c->u;
     const Unit *home = &cx.units[SYM(fn)->unit];
     NodeId explicit_arg = NODE(u, id)->b;
-    NodeId head = 0, tail = 0;
-    NodeId first_new = (NodeId)u->nodes.size;
-    for (NodeId p = fn_params(home, fn); p; p = NODE(home, p)->next)
+    AstNode args[256];
+    int n = 0;
+    for (NodeId p = fn_params(home, fn); p && n < 256; p = NEXT(home, p))
     {
         if (!(NODE(home, p)->flags & AST_F_CONTEXT))
         {
-            NodeId next = explicit_arg ? NODE(u, explicit_arg)->next : 0;
             if (explicit_arg)
             {
-                tail = push_back(u, &head, tail, explicit_arg);
+                NodeId next = NEXT(u, explicit_arg);
+                args[n++] = *NODE(u, explicit_arg);
+                NODE(u, explicit_arg)->kind = AST_NONE;
+                explicit_arg = next;
             }
-            explicit_arg = next;
             continue;
         }
         const Token *name = TOK(home, NODE(home, p)->tok);
@@ -746,11 +747,142 @@ static void fill_contexts(Check *c, NodeId id, SymId fn, uint32_t at)
                     TSTART(name), name->len, TSTART(name));
             return;
         }
-        uint32_t tok = found->tok;
-        tail = push_back(u, &head, tail, node_new(u, AST_IDENT, tok, 0, 0, 0));
+        args[n++] = (AstNode){.kind = AST_IDENT, .tok = found->tok};
     }
-    NODE(u, id)->b = head;
-    side_tables(u, first_new); // the new names get their entries
+    NodeId first = (NodeId)u->nodes.size;
+    for (int i = 0; i < n; i++)
+    {
+        args[i].flags = (uint8_t)((args[i].flags & ~AST_F_LAST) | (i + 1 == n ? AST_F_LAST : 0));
+        node_append(u, args[i]);
+    }
+    NODE(u, id)->b = n ? first : 0;
+    side_tables(u, first); // the new nodes get their entries
+}
+
+// ---- output: print and write go to the `out` in scope --------------------------------------------
+//
+// The runtime is made of context parameters. A program may declare its own output: a struct
+// named `out` with `put(self: out, b: u8)`. print and write then send every byte, in order, to
+// the `out` in scope (a local, or the context parameter `out: out`, which every call fills in
+// from its caller); a file that declares an `out` and prints where none is in scope is told so.
+// Without one, bytes go to the target's system output, if it has one (TCAP_SYSOUT): on a board
+// without, `out.put` is the way out (a UART). The call is rewritten with that `out` as its first
+// argument and marked AST_F_SINK, and its ref is the `put` method: a backend sees an ordinary
+// value and an ordinary method call.
+
+// The `put(self: out, b: u8)` of type t (a struct `out` or a reference to one), or 0.
+static SymId out_put_method(TypeId t)
+{
+    TypeId s = type_kind(t) == T_PTR ? type_ref(t) : t;
+    if (type_kind(s) != T_STRUCT)
+    {
+        return 0;
+    }
+    SymId st = type_ref(s);
+    int len;
+    const char *name = symbol_name(st, &len);
+    if (len != 3 || memcmp(name, "out", 3) != 0)
+    {
+        return 0;
+    }
+    for (SymId m = scope_find(scope_at(SYM(st)->scope_ref), "put", 3); m;
+         m = SYM(m)->kind == SYM_METHOD ? SYM(m)->next_overload : 0)
+    {
+        if (SYM(m)->kind == SYM_METHOD && arity_of(m) == 1)
+        {
+            return m;
+        }
+    }
+    return 0;
+}
+
+static void route_output(Check *c, NodeId id, uint32_t at)
+{
+    Unit *u = c->u;
+    NameId want = name_intern("out", 3);
+    const Local *found = NULL;
+    for (int i = c->nlocals - 1; i >= 0 && !found; i--)
+    {
+        found = c->locals[i].name == want ? &c->locals[i] : NULL;
+    }
+    SymId declared = scope_find(u->scope, "out", 3);
+    int file_has_out = declared && SYM(declared)->kind == SYM_STRUCT;
+    if (!found)
+    {
+        if (file_has_out)
+        {
+            diag_at(u, at, "error",
+                    "this file declares its own `out`, and output goes to the `out` in scope: "
+                    "there is none here. Take the context parameter `out: out`, or declare "
+                    "`out := out.new()`");
+        }
+        else if (!(target_get()->caps & TCAP_SYSOUT))
+        {
+            diag_at(u, at, "error",
+                    "target %s has no system output: declare `out: struct` with "
+                    "`put(self: out, b: u8)` and print through it",
+                    target_get()->name);
+        }
+        return;
+    }
+    SymId put = out_put_method(found->type);
+    if (!put)
+    {
+        TypeId s = type_kind(found->type) == T_PTR ? type_ref(found->type) : found->type;
+        if (file_has_out && type_kind(s) == T_STRUCT && type_ref(s) == declared)
+        {
+            diag_at(u, at, "error", "`out` needs a method `put(self: out, b: u8)` to be printed to");
+        }
+        return; // a local that happens to be called `out`: the system output
+    }
+    // [out, args...], laid out again as consecutive nodes (the old ones are left inert)
+    AstNode args[257];
+    int n = 0;
+    args[n++] = (AstNode){.kind = AST_IDENT, .tok = found->tok};
+    for (NodeId a = NODE(u, id)->b; a && n < 257;)
+    {
+        NodeId next = NEXT(u, a);
+        args[n++] = *NODE(u, a);
+        NODE(u, a)->kind = AST_NONE;
+        a = next;
+    }
+    NodeId first = (NodeId)u->nodes.size;
+    for (int i = 0; i < n; i++)
+    {
+        args[i].flags = (uint8_t)((args[i].flags & ~AST_F_LAST) | (i + 1 == n ? AST_F_LAST : 0));
+        node_append(u, args[i]);
+    }
+    NODE(u, id)->b = first;
+    NODE(u, id)->flags |= AST_F_SINK;
+    side_tables(u, first);
+    u->refs[id] = put;
+}
+
+// put(b): one byte, a u8, to the system output.
+static void check_sys_put(Check *c, NodeId id, uint32_t at)
+{
+    Unit *u = c->u;
+    NodeId args = NODE(u, id)->b;
+    if (!(target_get()->caps & TCAP_SYSOUT))
+    {
+        diag_at(u, at, "error", "target %s has no system output for std.sys.put",
+                target_get()->name);
+    }
+    if (!args || NEXT(u, args))
+    {
+        diag_at(u, at, "error", "std.sys.put takes one byte: put(b: u8)");
+        check_args(c, args, 0);
+        return;
+    }
+    TypeId t = check_expr(c, args);
+    if (!fits(t, T_U8))
+    {
+        char buf[64];
+        diag_at(u, NODE(u, args)->tok, "error", "std.sys.put takes a u8, not %s",
+                type_str(t, buf, sizeof(buf)));
+        return;
+    }
+    check_bounds(c, args, T_U8);
 }
 
 static TypeId call_function(Check *c, NodeId id, uint32_t at, SymId first)
@@ -894,9 +1026,20 @@ static TypeId check_call(Check *c, NodeId id)
             diag_at(u, cn->tok, "error", "'%.*s' is not a function", t->len, TSTART(t));
         }
         set_type(c, callee, T_EXTERN);
+        int member = kind == NAME_BUILTIN ? STD_NONE : sema_std_member(u, sym);
+        if (member == STD_SYS_PUT)
+        {
+            check_sys_put(c, id, cn->tok);
+            return T_VOID;
+        }
+        if (kind == NAME_BUILTIN || member == STD_PRINT) // write(...) and std's print
+        {
+            route_output(c, id, cn->tok);
+            check_args(c, NODE(u, id)->b, 0);
+            return T_VOID;
+        }
         check_args(c, args, 0);
-        // write(...) and std's print return nothing; anything else here is external
-        return (kind == NAME_BUILTIN || sema_is_std_print(u, sym)) ? T_VOID : T_EXTERN;
+        return T_EXTERN;
     }
 
     if (cn->kind == AST_SELECTOR)
@@ -1124,8 +1267,8 @@ static void check_callable(Check *c, NodeId fn, SymId owner, SymId sym)
     uint8_t flags = NODE(u, fn)->flags;
     uint8_t kind = NODE(u, fn)->kind;
     NodeId params = NODE(u, fn)->a;
-    NodeId ret_node = NODE(u, fn)->b;
-    NodeId body = NODE(u, fn)->c;
+    NodeId ret_node = fn_ret_node(u, fn);
+    NodeId body = fn_body(u, fn);
     uint32_t deferred_tok = body;
     size_t mark = u->nodes.size;
     size_t tok_mark = u->tokens.size;
@@ -1144,8 +1287,9 @@ static void check_callable(Check *c, NodeId fn, SymId owner, SymId sym)
             u->tokens.size = tok_mark;
             return;
         }
-        NODE(u, fn)->c = body;
+        fn_set_body(u, fn, body);
         NODE(u, fn)->flags = (uint8_t)(flags & ~AST_F_LAZY);
+        NODE(u, NODE(u, fn)->b)->flags &= (uint8_t)~AST_F_LAZY;
         side_tables(u, (NodeId)mark);
         module_body_nodes(u, (NodeId)mark);
     }
@@ -1167,7 +1311,7 @@ static void check_callable(Check *c, NodeId fn, SymId owner, SymId sym)
     c->ret = resolve_type(u, ret_node, owner, 1);
     c->block_base = c->nlocals;
 
-    for (NodeId p = params; p; p = NODE(u, p)->next)
+    for (NodeId p = params; p; p = NEXT(u, p))
     {
         const Token *name = TOK(u, NODE(u, p)->tok);
         if (NODE(u, p)->flags & AST_F_PATTERN)
@@ -1211,8 +1355,9 @@ static void check_callable(Check *c, NodeId fn, SymId owner, SymId sym)
     }
     if (flags & AST_F_LAZY)
     {
-        NODE(u, fn)->c = deferred_tok; // back to "not parsed": its tokens and nodes are gone
+        fn_set_body(u, fn, deferred_tok); // back to "not parsed": its tokens and nodes are gone
         NODE(u, fn)->flags = flags;
+        NODE(u, NODE(u, fn)->b)->flags |= AST_F_LAZY;
         u->nodes.size = mark;
         u->tokens.size = tok_mark;
     }
@@ -1426,7 +1571,7 @@ static TypeId check_expr(Check *c, NodeId id)
     {
         int saved_count = c->nlocals, saved_base = c->block_base;
         c->block_base = c->nlocals;
-        for (NodeId s = n->a; s; s = NODE(u, s)->next)
+        for (NodeId s = n->a; s; s = NEXT(u, s))
         {
             check_expr(c, s);
         }
@@ -1474,10 +1619,178 @@ static SymId attached_owner(const Unit *u, NodeId params)
     return (s && SYM(s)->kind == SYM_STRUCT) ? s : 0;
 }
 
+// ---- placement: register blocks and devices ------------------------------------------------------
+//
+// `u32 dr @ 0x00` gives a field its offset; a struct whose fields all have one is a register
+// block: its layout is exactly what it says, whatever the ABI, and every access to one of its
+// fields is a real load or store of that field's width (volatile). `uart0: pl011 @ 0x0900_0000`
+// places a register block at an address: a device. Mutability is the usual rule, so a read-only
+// register is a type-last field (`fr: u32 @ 0x18`) and cannot be assigned.
+
+static int place_value(const Unit *u, NodeId n, uint64_t *v)
+{
+    const Token *t = TOK(u, NODE(u, n)->tok);
+    int overflow = 0;
+    return number_value(TSTART(t), t->len, v, &overflow) && !overflow;
+}
+
+static void check_register(Check *c, NodeId decl, SymId owner, TypeId declared)
+{
+    Unit *u = c->u;
+    const AstNode *n = NODE(u, decl);
+    char buf[64];
+    // all or none: the fields of a register block each say where they are
+    NodeId body = NODE(&cx.units[SYM(owner)->unit], SYM(owner)->decl)->a;
+    int placed = 0, plain = 0;
+    for (NodeId m = body; m; m = NEXT(u, m))
+    {
+        if (NODE(u, m)->kind == AST_FIELD_DECL)
+        {
+            placed += (NODE(u, m)->flags & AST_F_PLACED) != 0;
+            plain += !(NODE(u, m)->flags & AST_F_PLACED);
+        }
+    }
+    if (!(n->flags & AST_F_PLACED))
+    {
+        if (placed)
+        {
+            const Token *fname = TOK(u, n->tok);
+            diag_at(u, n->tok, "error",
+                    "the other fields of this struct have offsets: give '%.*s' one too "
+                    "(`%.*s: T @ offset`)",
+                    fname->len, TSTART(fname), fname->len, TSTART(fname));
+        }
+        return;
+    }
+    if (!(type_is_int(declared) && declared != T_INT_LIT && declared != T_INT) && declared != T_BOOL)
+    {
+        diag_at(u, n->tok, "error", "a field with an offset is a register: a sized number or bool, not %s",
+                type_str(declared, buf, sizeof(buf)));
+        return;
+    }
+    (void)plain;
+    uint64_t off;
+    if (!place_value(u, n->b, &off) || off > 0xffffffffu)
+    {
+        diag_at(u, NODE(u, n->b)->tok, "error", "an offset is a whole number below 4 GB");
+        return;
+    }
+    Layout l = type_layout(declared);
+    if (off % l.align)
+    {
+        diag_at(u, NODE(u, n->b)->tok, "error", "offset %llu is not a multiple of %u, the alignment of %s",
+                (unsigned long long)off, l.align, type_str(declared, buf, sizeof(buf)));
+        return;
+    }
+    // in order, without overlap: where the field before this one ends
+    uint64_t end = 0;
+    for (NodeId m = body; m && m != decl; m = NEXT(u, m))
+    {
+        const AstNode *f = NODE(u, m);
+        uint64_t at;
+        if (f->kind == AST_FIELD_DECL && (f->flags & AST_F_PLACED) && place_value(u, f->b, &at))
+        {
+            Layout fl = type_layout(resolve_type(u, f->a, owner, 0));
+            end = at + fl.size;
+        }
+    }
+    if (off < end)
+    {
+        diag_at(u, NODE(u, n->b)->tok, "error",
+                "offset %llu overlaps the register before it, which ends at %llu (registers are "
+                "listed in the order of their offsets)",
+                (unsigned long long)off, (unsigned long long)end);
+    }
+}
+
+static void check_device(Check *c, NodeId decl, TypeId declared)
+{
+    Unit *u = c->u;
+    const AstNode *n = NODE(u, decl);
+    const Token *name = TOK(u, n->tok);
+    char buf[64];
+    if (n->flags & AST_F_MUT)
+    {
+        diag_at(u, n->tok, "error",
+                "a device stays at its address: declare it type-last, `%.*s: T @ address`",
+                name->len, TSTART(name));
+        return;
+    }
+    if (type_kind(declared) != T_STRUCT)
+    {
+        diag_at(u, n->tok, "error",
+                "only a register block can be placed at an address: a struct whose fields have "
+                "offsets, not %s",
+                type_str(declared, buf, sizeof(buf)));
+        return;
+    }
+    if (!sema_is_register_block(type_ref(declared)))
+    {
+        diag_at(u, n->tok, "error",
+                "'%s' is placed at an address, so it is a device: give each field of %s its "
+                "offset (`u32 dr @ 0x00`)",
+                type_str(declared, buf, sizeof(buf)), type_str(declared, buf, sizeof(buf)));
+        return;
+    }
+    uint64_t at;
+    Layout l = type_layout(declared);
+    if (!place_value(u, n->b, &at) || at == 0)
+    {
+        diag_at(u, NODE(u, n->b)->tok, "error", "a device's address is a whole number other than 0");
+    }
+    else if (at % l.align)
+    {
+        diag_at(u, NODE(u, n->b)->tok, "error", "address 0x%llx is not a multiple of %u, the alignment of %s",
+                (unsigned long long)at, l.align, type_str(declared, buf, sizeof(buf)));
+    }
+    else if (target_get()->ptr_size < 8 && at >> (8 * target_get()->ptr_size))
+    {
+        diag_at(u, NODE(u, n->b)->tok, "error", "address 0x%llx is beyond the %u-bit address space of %s",
+                (unsigned long long)at, 8 * target_get()->ptr_size, target_get()->name);
+    }
+}
+
+int sema_is_register_block(SymId s)
+{
+    const Unit *home = &cx.units[SYM(s)->unit];
+    for (NodeId m = NODE(home, SYM(s)->decl)->a; m; m = NEXT(home, m))
+    {
+        if (NODE(home, m)->kind == AST_FIELD_DECL && (NODE(home, m)->flags & AST_F_PLACED))
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+uint64_t sema_device_address(SymId s)
+{
+    const Unit *home = &cx.units[SYM(s)->unit];
+    const AstNode *decl = NODE(home, SYM(s)->decl);
+    uint64_t at = 0;
+    if (decl->kind == AST_FIELD_DECL && (decl->flags & AST_F_PLACED) && !SYM(s)->owner)
+    {
+        place_value(home, decl->b, &at);
+    }
+    return at;
+}
+
 static void check_field(Check *c, NodeId decl, SymId owner)
 {
     const AstNode *n = NODE(c->u, decl);
     TypeId declared = resolve_type(c->u, n->a, owner, 1);
+    if (owner)
+    {
+        check_register(c, decl, owner, declared);
+    }
+    if (n->flags & AST_F_PLACED)
+    {
+        if (!owner)
+        {
+            check_device(c, decl, declared);
+        }
+        return;
+    }
     if (n->b)
     {
         TypeId init = check_expr(c, n->b);
@@ -1573,7 +1886,7 @@ static void check_decl(Check *c, NodeId decl, Scope *scope, SymId enclosing, int
         SymId self = scope_find_token(scope, name);
         if (self && SYM(self)->kind == SYM_STRUCT)
         {
-            for (NodeId m = a; m; m = NODE(u, m)->next)
+            for (NodeId m = a; m; m = NEXT(u, m))
             {
                 check_decl(c, m, struct_scope(self), self, functions);
             }
@@ -1620,11 +1933,9 @@ int sema_pattern(Unit *u, NodeId param, SymId owner, uint64_t *value, int loud)
     }
     uint64_t v = 0;
     int overflow = 0;
-    for (uint32_t i = 0; i < t->len; i++)
+    if (!number_value(TSTART(t), t->len, &v, &overflow))
     {
-        uint64_t digit = (uint64_t)(TSTART(t)[i] - '0');
-        overflow |= TSTART(t)[i] < '0' || TSTART(t)[i] > '9' || v > (UINT64_MAX - digit) / 10;
-        v = v * 10 + digit;
+        overflow = 1;
     }
     static const struct
     {
@@ -1674,7 +1985,7 @@ static int clause_arity(const Unit *u, SymId fn)
 SymId sema_next_clause(Unit *u, SymId fn)
 {
     int patterns = 0;
-    for (NodeId p = fn_params(u, fn); p; p = NODE(u, p)->next)
+    for (NodeId p = fn_params(u, fn); p; p = NEXT(u, p))
     {
         patterns |= (NODE(u, p)->flags & AST_F_PATTERN) != 0;
     }
@@ -1717,6 +2028,11 @@ TypeId sema_param_type(Unit *u, SymId fn, NodeId param)
     return param_type(u, param, SYM(fn)->owner, 0);
 }
 
+TypeId sema_type_of(Unit *u, NodeId type_node, SymId owner)
+{
+    return resolve_type(u, type_node, owner, 0);
+}
+
 TypeId sema_value_type(Unit *u, SymId field_or_const)
 {
     return value_type(u, field_or_const);
@@ -1736,7 +2052,7 @@ void sema_syntax_only(Unit *u)
     {
         if (NODE(u, id)->flags & AST_F_LAZY)
         {
-            parse_function_body(u, NODE(u, id)->c);
+            parse_function_body(u, fn_body(u, id));
             u->nodes.size = decls;
             u->tokens.size = toks;
         }
@@ -1761,7 +2077,7 @@ void sema_check(Unit *u)
         {
             codegen_begin(u); // everything a signature can mention is checked by now
         }
-        for (NodeId d = NODE(u, u->root)->a; d; d = NODE(u, d)->next)
+        for (NodeId d = NODE(u, u->root)->a; d; d = NEXT(u, d))
         {
             c.nlocals = 0;
             c.block_base = 0;

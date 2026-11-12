@@ -11,8 +11,13 @@
 //   [ self, params ][ locals and temporaries ][ constructor values ][ call window ... )
 //   0                                          perm_base             frame_size
 //
-// A call puts its arguments at frame_size + i: that is the callee's frame, and its slot 0
-// holds the result when the call returns (register windows, as in Lua).
+// A call puts its arguments at frame_size + i: that is the callee's frame, and its slots from 0
+// hold the result when the call returns (register windows, as in Lua).
+//
+// A struct value takes ceil(size / 8) consecutive slots, holding its C layout (sema/layout.c);
+// a struct parameter or result takes as many window slots. Every struct object in memory is
+// such a block, so copying one is copying whole slots. Memory is read and written in the width
+// of the field (LOAD and STORE carry the variant), never as whole slots.
 #ifndef MODAL_V2_MIR_H
 #define MODAL_V2_MIR_H
 
@@ -26,10 +31,10 @@ typedef enum
 {
     MIR_CONST,  // d = imm
     MIR_COPY,   // d = a
-    MIR_ADDR,   // d = address of slot a
+    MIR_ADDR,   // d = address of slot a (imm: the slots of the block it points into)
     MIR_ZERO,   // slots a .. a + imm - 1 = 0
-    MIR_LOAD,   // d = 8 bytes at (a + imm)
-    MIR_STORE,  // 8 bytes at (a + imm) = b
+    MIR_LOAD,   // d = the `var` at (a + imm), extended to a slot
+    MIR_STORE,  // the `var` at (a + imm) = b
     MIR_BIN,    // d = a <sub> b, in variant `var`
     MIR_BINI,   // d = a <sub> imm, in variant `var` (imm fits in 16 bits)
     MIR_NEG,    // d = -a, in variant `var`
@@ -70,6 +75,7 @@ typedef enum
     MW_BOOL,
     MW_SPACE, // no operand
     MW_NL,    // no operand
+    MW_BYTE,  // one byte (std.sys.put)
 } MirWrite;
 
 // The integer variants: the C types the C backend's output computes in. A slot holds its value
@@ -113,9 +119,11 @@ typedef struct MirFunc
     uint32_t nlabels;
     uint32_t frame_size; // slots before the call window
     uint8_t returns;     // has a result in slot 0
+    uint32_t ret_slots;  // the slots the result takes (a struct: several; none: 0)
     // Why it could not be lowered (mir_lower returned 0): the token and what is missing.
     uint32_t fail_tok;
     const char *fail_what;
+    const char *label; // a function the compiler made (an output routine): its name for --mir
 } MirFunc;
 
 // Lowers a checked function whose body is in memory. Returns 0 after reporting what cannot be
@@ -129,6 +137,10 @@ int mir_lowerable(Unit *u, SymId fn, int report);
 uint64_t mir_normalize(uint64_t v, int variant);
 
 void mir_print(const MirFunc *f, FILE *out); // --mir
+
+// The output routines the program's calls need (one per `put` method and kind of value, made
+// when a call first needs it): lowers the next one into *out. Returns 0 when none is left.
+int mir_next_helper(MirFunc *out);
 
 // Module-level variables live at the bottom of the value stack: how many there are (for the
 // entry, which puts main's frame after them).

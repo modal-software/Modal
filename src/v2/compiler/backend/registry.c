@@ -163,8 +163,25 @@ int codegen_finish(void)
         return 0; // the entry file did not get as far as being checked: nothing was emitted
     }
     uint64_t t = clock_ns();
+    if (codegen.backend->function_mir && !cx.errors) // the routines the compiler made
+    {
+        MirFunc f;
+        while (mir_next_helper(&f))
+        {
+            if (cx.show_mir)
+            {
+                mir_print(&f, stdout);
+            }
+            codegen.backend->function_mir(&codegen.job, &f);
+        }
+    }
     int errors = codegen.backend->end(&codegen.job);
     phase_end(PHASE_EMIT, t);
     codegen.begun = 0;
     return errors;
+}
+
+int codegen_run(void)
+{
+    return codegen.backend->run ? codegen.backend->run(&codegen.job) : -1;
 }

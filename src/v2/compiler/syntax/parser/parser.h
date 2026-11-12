@@ -23,9 +23,12 @@ typedef struct Parser
     int paren_depth;      // > 0 inside ( ) or [ ]: newlines do not end the expression there
 } Parser;
 
+// A list being parsed. Its elements wait on a stage (nested lists stack on it) and are laid out
+// as consecutive nodes when the list is finished, so no node stores a link to its sibling.
 typedef struct
 {
-    NodeId head, tail;
+    uint32_t base;  // where its elements start on the stage
+    uint32_t count;
 } NodeList;
 
 typedef enum
@@ -44,7 +47,14 @@ void parser_synchronize(Parser *p);
 void parser_skip_one(Parser *p); // one token, or a whole ( ) [ ] { } group
 int parser_enter(Parser *p);     // returns 0 (and reports) when nesting is too deep
 void parser_leave(Parser *p);
+NodeList list_begin(void);
+// Moves node `id`, just made, onto the list. It is the list's element now: change it through
+// list_at, never through its old id.
 void node_list_push(Unit *u, NodeList *list, NodeId id);
+AstNode *list_at(NodeList *list, uint32_t index);
+NodeId list_finish(Unit *u, NodeList *list); // lays the elements out; the first one's id, or 0
+void list_abort(NodeList *list);              // drops what is staged (an error path)
+void list_truncate(NodeList *list, uint32_t count);
 NodeId parse_program(Parser *p);
 // Is this token where a function body starts: a '{', or a body the scanner deferred?
 static inline int is_body_start(const Token *t)
@@ -65,7 +75,9 @@ static inline uint32_t tok_idx(const Parser *p, const Token *t)
 }
 
 // parse_decl.c
-NodeId parse_declaration(Parser *p, DeclContext ctx);
+// Parses one declaration into `into` (grouped fields, `a, b: T`, are several). 0 on an error,
+// after which nothing of it is on the list.
+int parse_declaration(Parser *p, DeclContext ctx, NodeList *into);
 NodeId parse_define(Parser *p);
 NodeId parse_type(Parser *p);
 int type_starts_at(const Token *t);

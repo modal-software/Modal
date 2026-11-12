@@ -264,7 +264,7 @@ Unit *unit_load(const char *path)
     t = phase_end(PHASE_SCAN, t);
 
     // The node array starts small and doubles; slot 0 means "no node".
-    node_new(u, AST_NONE, 0, 0, 0, 0);
+    node_new(u, AST_NONE, 0, 0, 0);
 
     Parser parser;
     parser_init(&parser, u);
@@ -569,7 +569,7 @@ static Target chain_step(Unit *u, uint32_t tok, Target cur, ChainMode mode, int 
 
 static void chain_items(Unit *u, NodeId item, Target cur, ChainMode mode, int depth)
 {
-    for (; item; item = NODE(u, item)->next)
+    for (; item; item = NEXT(u, item))
     {
         chain_step(u, NODE(u, item)->tok, cur, mode, depth);
     }
@@ -735,6 +735,7 @@ typedef enum
 {
     CONFIG_BOOL,
     CONFIG_STRING,
+    CONFIG_INT, // a whole number of bytes
 } ConfigKind;
 
 // The closed set of behaviour switches. A name outside it is an error, so a typo never
@@ -748,6 +749,17 @@ static const struct
     {"nil_return", CONFIG_BOOL},    // the compiler adds the implicit nil to return types
     {"profile", CONFIG_STRING},     // which function declaration forms the domain accepts
     {"version", CONFIG_STRING},     // version of the domain's contract
+    // Memory budgets, checked when the program is compiled (native backend):
+    {"max_code", CONFIG_INT}, // bytes of machine code the program may take (flash)
+    {"max_ram", CONFIG_INT},  // bytes of memory it may use at run time: stacks and buffers
+    {"stack", CONFIG_INT},    // bytes of value stack for a program whose depth is not known
+    {"output_buffer", CONFIG_INT}, // bytes buffered before the system output is written
+    // The memory map of a bare-metal target (`--target arm64-none`): where the image goes and
+    // where the stack is. flash_size and ram_size are also the default max_code and max_ram.
+    {"flash_origin", CONFIG_INT},
+    {"flash_size", CONFIG_INT},
+    {"ram_origin", CONFIG_INT},
+    {"ram_size", CONFIG_INT},
 };
 
 // In a manifest, `name := <literal>` is configuration; `name := import(...)` binds a module.
@@ -773,24 +785,30 @@ static void check_config(Unit *u, NodeId decl)
         int is_bool =
             value->kind == AST_IDENT && ((vt->len == 4 && !memcmp(TSTART(vt), "true", 4)) ||
                                          (vt->len == 5 && !memcmp(TSTART(vt), "false", 5)));
-        int ok = config_keys[i].kind == CONFIG_BOOL ? is_bool : value->kind == AST_STRING_LIT;
+        int is_int = value->kind == AST_NUMBER_LIT && !memchr(TSTART(vt), '.', vt->len);
+        int ok = config_keys[i].kind == CONFIG_BOOL  ? is_bool
+                 : config_keys[i].kind == CONFIG_INT ? is_int
+                                                     : value->kind == AST_STRING_LIT;
         if (!ok)
         {
             diag_at(u, value->tok, "error", "'%.*s' expects %s", name->len, TSTART(name),
-                    config_keys[i].kind == CONFIG_BOOL ? "true or false" : "a string");
+                    config_keys[i].kind == CONFIG_BOOL  ? "true or false"
+                    : config_keys[i].kind == CONFIG_INT ? "a whole number of bytes"
+                                                        : "a string");
         }
         return;
     }
     diag_at(u, NODE(u, decl)->tok, "error",
             "'%.*s' is not a known configuration of a domain (known: implicit_self, nil_return, "
-            "profile, version)",
+            "profile, version, max_code, max_ram, stack, output_buffer, flash_origin, "
+            "flash_size, ram_origin, ram_size)",
             name->len, TSTART(name));
 }
 
 // Reads one mod.modal: validates its configuration and marks the modules it binds.
 static void read_manifest(Unit *m)
 {
-    for (NodeId d = NODE(m, m->root)->a; d; d = NODE(m, d)->next)
+    for (NodeId d = NODE(m, m->root)->a; d; d = NEXT(m, d))
     {
         if (is_config(m, d))
         {
@@ -816,7 +834,7 @@ int domain_config_bool(uint16_t domain, const char *key, int fallback)
         {
             continue;
         }
-        for (NodeId d = NODE(m, m->root)->a; d; d = NODE(m, d)->next)
+        for (NodeId d = NODE(m, m->root)->a; d; d = NEXT(m, d))
         {
             const Token *name = TOK(m, NODE(m, d)->tok);
             if (is_config(m, d) && name->len == klen && memcmp(TSTART(name), key, klen) == 0)
@@ -829,9 +847,36 @@ int domain_config_bool(uint16_t domain, const char *key, int fallback)
     return fallback;
 }
 
+uint64_t domain_config_int(uint16_t domain, const char *key, uint64_t fallback)
+{
+    size_t klen = strlen(key);
+    for (uint16_t i = 0; i < cx.nunits; i++)
+    {
+        const Unit *m = &cx.units[i];
+        if (!m->is_manifest || m->domain != domain || m->broken)
+        {
+            continue;
+        }
+        for (NodeId d = NODE(m, m->root)->a; d; d = NEXT(m, d))
+        {
+            const Token *name = TOK(m, NODE(m, d)->tok);
+            const AstNode *v = NODE(m, NODE(m, d)->a);
+            if (is_config(m, d) && name->len == klen && memcmp(TSTART(name), key, klen) == 0 &&
+                v->kind == AST_NUMBER_LIT)
+            {
+                const Token *t = TOK(m, v->tok);
+                uint64_t n = 0;
+                number_value(TSTART(t), t->len, &n, NULL);
+                return n;
+            }
+        }
+    }
+    return fallback;
+}
+
 int module_wildcard_provides(Unit *u, const char *name, size_t len)
 {
-    for (NodeId d = NODE(u, u->root)->a; d; d = NODE(u, d)->next)
+    for (NodeId d = NODE(u, u->root)->a; d; d = NEXT(u, d))
     {
         NodeId chain = decl_chain(u, d);
         if (!chain || NODE(u, chain)->kind != AST_IMPORT_ALL)
@@ -865,7 +910,7 @@ void contract_print(void)
         }
         printf("== contract: %s  (%s)\n", domain_name(m->domain), m->path);
 
-        for (NodeId d = NODE(m, m->root)->a; d; d = NODE(m, d)->next)
+        for (NodeId d = NODE(m, m->root)->a; d; d = NEXT(m, d))
         {
             const AstNode *n = NODE(m, d);
             if (is_config(m, d))

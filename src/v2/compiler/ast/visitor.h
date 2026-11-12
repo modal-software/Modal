@@ -48,11 +48,11 @@ static inline int walk_ast_iterative(Unit *u, NodeId root, VisitorFn visit, void
         WalkFrame f = stack[--sp];
         const AstNode *n = NODE(u, f.id);
         uint8_t mask = ast_child_mask[n->kind];
-        if (n->flags & AST_F_LAZY)
+        if (n->kind == AST_SIG && (n->flags & AST_F_LAZY))
         {
-            mask &= (uint8_t)~4u; // `c` is a token index while the body is unparsed
+            mask &= (uint8_t)~2u; // `b` is a token index while the body is unparsed
         }
-        NodeId a = n->a, b = n->b, c = n->c, next = n->next;
+        NodeId a = n->a, b = n->b, next = NEXT(u, f.id);
 
         int r = visit(u, f.id, f.depth, ctx);
         if (r < 0)
@@ -62,14 +62,10 @@ static inline int walk_ast_iterative(Unit *u, NodeId root, VisitorFn visit, void
         }
         mask &= (uint8_t)~r;
 
-        // Pushed in reverse so they pop as: a (and a's siblings), b, c, then our own sibling.
+        // Pushed in reverse so they pop as: a (and a's siblings), b, then our own sibling.
         if (next && f.id != root)
         {
             stack[sp++] = (WalkFrame){next, f.depth};
-        }
-        if ((mask & 4) && c)
-        {
-            stack[sp++] = (WalkFrame){c, f.depth + 1};
         }
         if ((mask & 2) && b)
         {

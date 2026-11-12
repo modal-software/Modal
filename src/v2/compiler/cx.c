@@ -26,12 +26,17 @@ static const size_t region_reserve[REGION__COUNT] = {
     [REGION_TYPES] = (size_t)1 << 28,  [REGION_SCOPES] = (size_t)1 << 28,
     [REGION_NAMES] = (size_t)1 << 30,  [REGION_SYMNAMES] = (size_t)1 << 28,
     [REGION_CODE] = (size_t)1 << 30,   [REGION_MIR] = (size_t)1 << 30,
+    [REGION_FNS] = (size_t)1 << 28,    [REGION_CALLS] = (size_t)1 << 28,
+    [REGION_RTCALLS] = (size_t)1 << 28, [REGION_EXTERNS] = (size_t)1 << 28,
+    [REGION_JUMPS] = (size_t)1 << 26,  [REGION_STAGE] = (size_t)1 << 28,
 };
 #define REGION_MIN ((size_t)1 << 22)
 
 static const char *const region_names[REGION__COUNT] = {"arena", "tokens", "nodes",
                                                         "symbols", "types", "scopes",
-                                                        "names",  "symbol names", "code", "mir"};
+                                                        "names",  "symbol names", "code", "mir",
+                                                        "fn ranges", "calls", "runtime calls",
+                                                        "lib calls", "branches", "list stage"};
 
 #ifndef MAP_NORESERVE
 #define MAP_NORESERVE 0
@@ -40,7 +45,78 @@ static const char *const region_names[REGION__COUNT] = {"arena", "tokens", "node
 #define MAP_ANONYMOUS MAP_ANON
 #endif
 
+// The regions that start in the shared page, and their slices of it (one 16 KB page in all).
+// Only these: every array in them is reached through a pointer region_grow_array reassigns, and
+// no caller keeps a pointer into them across a growth (backend/native/emit.c, mir/lower.c, the
+// parser's list stage).
+static const uint16_t region_share[REGION__COUNT] = {
+    [REGION_CODE] = 2048,    [REGION_MIR] = 2048,   [REGION_FNS] = 2048,
+    [REGION_CALLS] = 2048,   [REGION_RTCALLS] = 1024, [REGION_EXTERNS] = 1024,
+    [REGION_JUMPS] = 2048,   [REGION_STAGE] = 2048,
+};
+#define SHARED_PAGE 16384u
+
+// Built with -DREGION_SHARE_TEST=N: every shared region gets an N-byte slice on pages of its
+// own, made inaccessible when the region moves out, so any pointer kept into it across the move
+// faults. The suite and the fuzzers are run with several N. (Not the MIR: its strings are
+// several arrays, which may stay referenced in the slice for the rest of the function.)
+#ifdef REGION_SHARE_TEST
+#define SHARE_SIZE(id) ((size_t)(REGION_SHARE_TEST))
+#else
+#define SHARE_SIZE(id) ((size_t)region_share[id])
+#endif
+
+static char *shared_page;
+
+static int region_take_share(Region *r, RegionId id)
+{
+    if (!region_share[id])
+    {
+        return 0;
+    }
+#ifdef REGION_SHARE_TEST
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    void *p = mmap(NULL, (SHARE_SIZE(id) + page - 1) / page * page, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED)
+    {
+        return 0;
+    }
+    r->base = (char *)p;
+#else
+    if (!shared_page)
+    {
+        void *p = mmap(NULL, SHARED_PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED)
+        {
+            return 0;
+        }
+        shared_page = (char *)p;
+    }
+    size_t at = 0;
+    for (int i = 0; i < (int)id; i++)
+    {
+        at += region_share[i];
+    }
+    r->base = shared_page + at;
+#endif
+    r->reserved = SHARE_SIZE(id);
+    r->shared = 1;
+    return 1;
+}
+
+// Its own reservation; or, the first time a region is used, its slice of the shared page.
+static void region_reserve_own(Region *r, RegionId id);
+
 static void region_reserve_space(Region *r, RegionId id)
+{
+    if (!region_take_share(r, id))
+    {
+        region_reserve_own(r, id);
+    }
+}
+
+static void region_reserve_own(Region *r, RegionId id)
 {
     for (size_t size = region_reserve[id]; size >= REGION_MIN; size /= 2)
     {
@@ -50,11 +126,44 @@ static void region_reserve_space(Region *r, RegionId id)
         {
             r->base = (char *)p;
             r->reserved = size;
+            r->shared = 0;
             return;
         }
     }
     fprintf(stderr, "fatal: cannot reserve address space for the %s\n", region_names[id]);
     exit(2);
+}
+
+// A shared region that needs more than its slice moves to a reservation of its own. What was
+// handed out in the slice stays where it is (the slice is not given to anyone else); an array
+// still growing is copied out by region_grow_array.
+#ifdef REGION_SHARE_TEST
+static char *retired[REGION__COUNT]; // the slice left, made inaccessible once copied out of
+static size_t retired_size[REGION__COUNT];
+
+static void region_retire(RegionId id)
+{
+    if (retired[id] && id != REGION_MIR)
+    {
+        size_t page = (size_t)sysconf(_SC_PAGESIZE);
+        mprotect(retired[id], (retired_size[id] + page - 1) / page * page, PROT_NONE);
+    }
+    retired[id] = NULL;
+}
+#else
+#define region_retire(id) ((void)0)
+#endif
+
+static void region_leave_share(Region *r, RegionId id)
+{
+#ifdef REGION_SHARE_TEST
+    retired[id] = r->base;
+    retired_size[id] = r->reserved;
+#endif
+    r->base = NULL;
+    r->used = 0;
+    r->peak = 0;
+    region_reserve_own(r, id);
 }
 
 void *region_push(RegionId id, size_t bytes)
@@ -63,6 +172,10 @@ void *region_push(RegionId id, size_t bytes)
     if (!r->base)
     {
         region_reserve_space(r, id);
+    }
+    if (r->shared && bytes > r->reserved - r->used)
+    {
+        region_leave_share(r, id);
     }
     if (bytes > r->reserved - r->used)
     {
@@ -92,7 +205,12 @@ void *region_end(RegionId id)
 void *region_room(RegionId id, size_t bytes)
 {
     Region *r = &cx.regions[id];
-    char *end = (char *)region_end(id);
+    region_end(id);
+    if (r->shared && bytes > r->reserved - r->used)
+    {
+        region_leave_share(r, id);
+    }
+    char *end = r->base + r->used;
     if (bytes > r->reserved - r->used)
     {
         fprintf(stderr, "fatal: out of memory: the %s need more than %zu MB\n", region_names[id],
@@ -129,7 +247,9 @@ void *region_grow_array(RegionId id, void *data, size_t elem, size_t *cap, size_
     {
         new_cap = 64;
     }
-    if (data && (char *)data + *cap * elem == (char *)region_end(id))
+    Region *r = &cx.regions[id];
+    if (data && (char *)data + *cap * elem == (char *)region_end(id) &&
+        (new_cap - *cap) * elem <= r->reserved - r->used) // and the growth fits where it is
     {
         region_push(id, (new_cap - *cap) * elem); // the last array in its region: in place
         *cap = new_cap;
@@ -140,6 +260,7 @@ void *region_grow_array(RegionId id, void *data, size_t elem, size_t *cap, size_
     {
         memcpy(moved, data, *cap * elem);
     }
+    region_retire(id); // (REGION_SHARE_TEST) the slice it may have left, now copied out of
     *cap = new_cap;
     return moved;
 }
@@ -154,29 +275,39 @@ size_t regions_used(void)
     return used;
 }
 
-// Pages actually resident, asked of the system (mincore): reserved room that was never
-// written is not counted. Regions never give pages back, so this is also the peak.
-size_t regions_touched(void)
+// Bytes of [base, base + len) the system has supplied pages for (mincore).
+static size_t resident(const char *base, size_t len)
 {
     size_t page = (size_t)sysconf(_SC_PAGESIZE);
-    size_t touched = 0;
+    size_t pages = (len + page - 1) / page, touched = 0;
     unsigned char vec[4096];
+    for (size_t first = 0; first < pages; first += sizeof(vec))
+    {
+        size_t n = pages - first < sizeof(vec) ? pages - first : sizeof(vec);
+        if (mincore((void *)(base + first * page), n * page, (void *)vec) != 0)
+        {
+            touched += n * page; // cannot ask: count the whole range
+            continue;
+        }
+        for (size_t k = 0; k < n; k++)
+        {
+            touched += (vec[k] & 1) ? page : 0;
+        }
+    }
+    return touched;
+}
+
+// Pages actually resident: reserved room that was never written is not counted, and the
+// shared page once. Regions never give pages back, so this is also the peak.
+size_t regions_touched(void)
+{
+    size_t touched = shared_page ? resident(shared_page, SHARED_PAGE) : 0;
     for (int i = 0; i < REGION__COUNT; i++)
     {
         const Region *r = &cx.regions[i];
-        size_t pages = (r->peak + page - 1) / page;
-        for (size_t first = 0; first < pages; first += sizeof(vec))
+        if (r->base && !r->shared)
         {
-            size_t n = pages - first < sizeof(vec) ? pages - first : sizeof(vec);
-            if (mincore(r->base + first * page, n * page, (void *)vec) != 0)
-            {
-                touched += n * page; // cannot ask: count the whole range
-                continue;
-            }
-            for (size_t k = 0; k < n; k++)
-            {
-                touched += (vec[k] & 1) ? page : 0;
-            }
+            touched += resident(r->base, r->peak);
         }
     }
     return touched;
@@ -185,8 +316,6 @@ size_t regions_touched(void)
 // Each region's peak and the pages it touched, for --stats.
 void regions_print(FILE *out)
 {
-    size_t page = (size_t)sysconf(_SC_PAGESIZE);
-    unsigned char vec[4096];
     for (int i = 0; i < REGION__COUNT; i++)
     {
         const Region *r = &cx.regions[i];
@@ -194,20 +323,19 @@ void regions_print(FILE *out)
         {
             continue;
         }
-        size_t pages = (r->peak + page - 1) / page, touched = 0;
-        for (size_t first = 0; first < pages; first += sizeof(vec))
+        if (r->shared)
         {
-            size_t n = pages - first < sizeof(vec) ? pages - first : sizeof(vec);
-            if (mincore(r->base + first * page, n * page, (void *)vec) == 0)
-            {
-                for (size_t k = 0; k < n; k++)
-                {
-                    touched += (vec[k] & 1) ? page : 0;
-                }
-            }
+            fprintf(out, "  %-13s %9.1f KB peak  in the shared page\n", region_names[i],
+                    (double)r->peak / 1024.0);
+            continue;
         }
         fprintf(out, "  %-13s %9.1f KB peak  %9.1f KB resident\n", region_names[i],
-                (double)r->peak / 1024.0, (double)touched / 1024.0);
+                (double)r->peak / 1024.0, (double)resident(r->base, r->peak) / 1024.0);
+    }
+    if (shared_page)
+    {
+        fprintf(out, "  %-13s %9.1f KB size  %9.1f KB resident\n", "shared page",
+                SHARED_PAGE / 1024.0, (double)resident(shared_page, SHARED_PAGE) / 1024.0);
     }
 }
 
@@ -278,11 +406,16 @@ void arena_drop(void)
     for (int i = 0; i < REGION__COUNT; i++)
     {
         Region *r = &cx.regions[i];
-        if (r->base)
+        if (r->base && !r->shared)
         {
-            munmap(r->base, r->reserved);
+            munmap(r->base, r->reserved); // (a slice of the shared page goes with the page)
         }
         *r = (Region){0};
+    }
+    if (shared_page)
+    {
+        munmap(shared_page, SHARED_PAGE);
+        shared_page = NULL;
     }
 }
 

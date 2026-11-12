@@ -25,7 +25,7 @@ NodeId parse_statement(Parser *p)
                 return 0;
             }
         }
-        return node_new(p->unit, AST_RETURN, tok_idx(p, t), value, 0, 0);
+        return node_new(p->unit, AST_RETURN, tok_idx(p, t), value, 0);
     }
     case TOK_LBRACE:
         return parse_block(p);
@@ -44,12 +44,12 @@ NodeId parse_block(Parser *p)
 {
     Unit *u = p->unit;
     const Token *open = p->current;
-    NodeList stmts = {0};
 
     if (!parser_consume(p, TOK_LBRACE, "expected '{' to start a block") || !parser_enter(p))
     {
         return 0;
     }
+    NodeList stmts = list_begin();
     int saved_paren_depth = p->paren_depth; // a block inside ( ) gets newline rules back
     p->paren_depth = 0;
 
@@ -79,7 +79,9 @@ NodeId parse_block(Parser *p)
     parser_leave(p);
     if (!parser_consume(p, TOK_RBRACE, "expected '}' at the end of the block"))
     {
+        list_abort(&stmts);
         return 0;
     }
-    return node_new(u, AST_BLOCK, tok_idx(p, open), stmts.head, 0, 0);
+    NodeId head = list_finish(u, &stmts);
+    return node_new(u, AST_BLOCK, tok_idx(p, open), head, 0);
 }

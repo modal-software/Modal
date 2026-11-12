@@ -24,12 +24,12 @@
 // would need data relocations), no static data. stencilgen rejects what it cannot patch.
 #include <stdint.h>
 
-#define OUT_SIZE 4096
-
+// The runtime context. Its buffer and the value stack are sized when the program is compiled
+// (backend/native/emit.c, memory budgets): exactly what the program needs when that is known.
 typedef struct Ctx
 {
-    uint32_t len;
-    uint8_t buf[OUT_SIZE];
+    uint32_t len, cap; // bytes waiting in buf, and its size
+    uint8_t *buf;
     uint64_t *globals; // module-level variables: the bottom of the value stack
 } Ctx;
 
@@ -72,11 +72,11 @@ RUNTIME void rt_put(Ctx *c, const uint8_t *p, u64 n)
 {
     while (n)
     {
-        if (c->len == OUT_SIZE)
+        if (c->len == c->cap)
         {
             rt_flush(c);
         }
-        u64 room = OUT_SIZE - c->len;
+        u64 room = c->cap - c->len;
         u64 k = n < room ? n : room;
         for (u64 i = 0; i < k; i++)
         {
@@ -130,14 +130,18 @@ RUNTIME void rt_write_bool(Ctx *c, u64 b)
 
 // ---- entry: the C `main` of the program ---------------------------------------------------------
 
-#define VALUE_STACK (1 << 16) // slots: 512 KB, on the native stack
-
 // The value stack starts with the module-level variables (A of them); main's frame follows.
+// B: the value stack's slots; C: the output buffer's bytes (both on the native stack).
 int st_entry(void)
 {
     Ctx ctx;
-    u64 stack[VALUE_STACK];
+    u64 slots = B, bytes = C;
+    __asm__("" : "+r"(slots), "+r"(bytes)); // the holes stay plain values (no addend)
+    u64 stack[slots];
+    uint8_t out[bytes];
     ctx.len = 0;
+    ctx.cap = (uint32_t)bytes;
+    ctx.buf = out;
     ctx.globals = stack;
     stack[A] = 0;
     CALLEE(stack + A, &ctx, 0);
@@ -148,8 +152,13 @@ int st_entry(void)
 int st_entry_void(void)
 {
     Ctx ctx;
-    u64 stack[VALUE_STACK];
+    u64 slots = B, bytes = C;
+    __asm__("" : "+r"(slots), "+r"(bytes)); // the holes stay plain values (no addend)
+    u64 stack[slots];
+    uint8_t out[bytes];
     ctx.len = 0;
+    ctx.cap = (uint32_t)bytes;
+    ctx.buf = out;
     ctx.globals = stack;
     CALLEE(stack + A, &ctx, 0);
     rt_flush(&ctx);
@@ -166,6 +175,11 @@ int st_entry_void(void)
 //
 // and the backend uses _r when the very next instruction is the only one to read the value, which
 // then takes it in its _a form: one store, one load and one slot number less each time.
+#define FOR_EACH_INT_EARLY(X)                                                                      \
+    X(u8, uint8_t, u64) X(u16, uint16_t, u64) X(u32, uint32_t, u64) X(u64, uint64_t, u64)         \
+    X(i8, int8_t, int64_t) X(i16, int16_t, int64_t) X(i32, int32_t, int64_t)                       \
+    X(i64, int64_t, int64_t)
+
 #define FOUR(name, EXPR)                                                                           \
     STENCIL(name) { u64 x = f[B]; f[A] = (EXPR); NEXT; }                                           \
     STENCIL(name##_r) { u64 x = f[B]; acc = (EXPR); NEXT; }                                        \
@@ -192,8 +206,20 @@ STENCIL(const64) // f[A] = B | C << 32: a constant wider than a hole (x86-64 hol
     NEXT;
 }
 
-FOUR(copy, x)                                   // f[A] = f[B]
-FOUR(load_field, *(const u64 *)(uintptr_t)(x + C)) // f[A] = *(f[B] + C)
+FOUR(copy, x) // f[A] = f[B]
+
+// Memory is read and written in the width of the field: f[A] = *(T *)(f[B] + C), extended to 64
+// bits as the slot rule says; *(T *)(f[A] + B) = f[C], truncated. A struct is its C layout.
+#define LOAD_STENCILS(t, T, S) FOUR(load_##t, (u64)(S)(*(const T *)(uintptr_t)(x + C)))
+FOR_EACH_INT_EARLY(LOAD_STENCILS)
+
+#define STORE_STENCILS(n, T)                                                                       \
+    STENCIL(store_##n) { *(T *)(uintptr_t)(f[A] + B) = (T)f[C]; NEXT; }                            \
+    STENCIL(store_##n##_a) { *(T *)(uintptr_t)(f[A] + B) = (T)acc; NEXT; }
+STORE_STENCILS(8, uint8_t)
+STORE_STENCILS(16, uint16_t)
+STORE_STENCILS(32, uint32_t)
+STORE_STENCILS(64, uint64_t)
 
 // ---- module-level variables ----------------------------------------------------------------------
 
@@ -236,18 +262,6 @@ STENCIL(zero) // B slots from A set to 0
     NEXT;
 }
 
-STENCIL(store_field) // *(f[A] + B) = f[C]
-{
-    *(u64 *)(uintptr_t)(f[A] + B) = f[C];
-    NEXT;
-}
-
-STENCIL(store_field_a) // *(f[A] + B) = acc
-{
-    *(u64 *)(uintptr_t)(f[A] + B) = acc;
-    NEXT;
-}
-
 // ---- arithmetic, one variant per type ---------------------------------------------------------
 //
 // A slot holds a value zero-extended (unsigned types) or sign-extended (signed types) to 64
@@ -255,10 +269,7 @@ STENCIL(store_field_a) // *(f[A] + B) = acc
 // The first operand is `x` (a slot or the accumulator); the second a slot (C) or, in the
 // immediate forms, the constant C itself.
 
-#define FOR_EACH_INT(X)                                                                            \
-    X(u8, uint8_t, u64) X(u16, uint16_t, u64) X(u32, uint32_t, u64) X(u64, uint64_t, u64)         \
-    X(i8, int8_t, int64_t) X(i16, int16_t, int64_t) X(i32, int32_t, int64_t)                       \
-    X(i64, int64_t, int64_t)
+#define FOR_EACH_INT FOR_EACH_INT_EARLY
 
 #define WRAP(T, S, op, y) (u64)(S)(T)((u64)(T)x op (u64)(T)(y))
 #define EXACT(T, S, op, y) (u64)(S)(T)((T)x op (T)(y))
@@ -353,6 +364,8 @@ WRITE(str, rt_write_str(c, (const uint8_t *)(uintptr_t)x))
 WRITE(int, rt_write_int(c, (int64_t)x))
 WRITE(uint, rt_write_uint(c, x))
 WRITE(bool, rt_write_bool(c, x))
+
+WRITE(byte, { uint8_t ch = (uint8_t)x; rt_put(c, &ch, 1); })
 
 STENCIL(write_space)
 {

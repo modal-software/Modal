@@ -369,10 +369,20 @@ static int scan_into(const char *filename, const char *src, const char *from, co
         }
         else if (cls & C_DIGIT)
         {
+            // 0x hex digits; `_` may separate digits (0x4000_0000, 1_000_000)
+            int hex = c[0] == '0' && (c[1] == 'x' || c[1] == 'X') &&
+                      ((CLASS(c[2]) & C_DIGIT) || ((c[2] | 0x20) >= 'a' && (c[2] | 0x20) <= 'f'));
+            if (hex)
+            {
+                c += 2;
+            }
             do
             {
                 c++;
-            } while (CLASS(*c) & C_DIGIT);
+            } while ((CLASS(*c) & C_DIGIT) ||
+                     (hex && (*c | 0x20) >= 'a' && (*c | 0x20) <= 'f') ||
+                     (*c == '_' && ((CLASS(c[1]) & C_DIGIT) ||
+                                    (hex && (c[1] | 0x20) >= 'a' && (c[1] | 0x20) <= 'f'))));
             if (c[0] == '.' && (CLASS(c[1]) & C_DIGIT))
             {
                 do
@@ -460,6 +470,9 @@ static int scan_into(const char *filename, const char *src, const char *from, co
                 break;
             case '&':
                 kind = TOK_AMP;
+                break;
+            case '@':
+                kind = TOK_AT;
                 break;
             case '|':
                 kind = TOK_PIPE;

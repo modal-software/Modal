@@ -7,9 +7,13 @@
 // by dyld through classic bind opcodes, against libSystem), a 12-byte stub per import that jumps
 // through its slot, LC_MAIN for the entry, and an ad-hoc code signature: arm64 macOS runs nothing
 // unsigned. The signature is a CodeDirectory with the SHA-256 of every 4 KB page before it.
+#if !defined(__APPLE__)
+#define _POSIX_C_SOURCE 200809L // fileno, write (glibc hides them under -std=c17)
+#endif
 #include "v2/compiler/backend/native/macho.h"
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 // ---- SHA-256 (FIPS 180-4) -----------------------------------------------------------------------
 
@@ -37,7 +41,7 @@ static uint32_t rotr(uint32_t x, int n)
     return (x >> n) | (x << (32 - n));
 }
 
-static void sha_block(Sha256 *s, const uint8_t *p)
+static void sha_block_portable(uint32_t *hs, const uint8_t *p)
 {
     uint32_t w[64];
     for (int i = 0; i < 16; i++)
@@ -51,8 +55,8 @@ static void sha_block(Sha256 *s, const uint8_t *p)
         uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
         w[i] = w[i - 16] + s0 + w[i - 7] + s1;
     }
-    uint32_t a = s->h[0], b = s->h[1], c = s->h[2], d = s->h[3];
-    uint32_t e = s->h[4], f = s->h[5], g = s->h[6], h = s->h[7];
+    uint32_t a = hs[0], b = hs[1], c = hs[2], d = hs[3];
+    uint32_t e = hs[4], f = hs[5], g = hs[6], h = hs[7];
     for (int i = 0; i < 64; i++)
     {
         uint32_t t1 = h + (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) + ((e & f) ^ (~e & g)) + sha_k[i] + w[i];
@@ -66,15 +70,100 @@ static void sha_block(Sha256 *s, const uint8_t *p)
         b = a;
         a = t1 + t2;
     }
-    s->h[0] += a;
-    s->h[1] += b;
-    s->h[2] += c;
-    s->h[3] += d;
-    s->h[4] += e;
-    s->h[5] += f;
-    s->h[6] += g;
-    s->h[7] += h;
+    hs[0] += a;
+    hs[1] += b;
+    hs[2] += c;
+    hs[3] += d;
+    hs[4] += e;
+    hs[5] += f;
+    hs[6] += g;
+    hs[7] += h;
 }
+
+static void sha_blocks_portable(uint32_t *h, const uint8_t *p, size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+    {
+        sha_block_portable(h, p + 64 * i);
+    }
+}
+
+// The CPU's SHA-256 instructions (ARMv8 FEAT_SHA256: sha256h, sha256h2, sha256su0, sha256su1),
+// ~6x faster than the portable rounds. Chosen at run time, so a CPU without them still works.
+// (x86-64's SHA-NI would be the same; it is not here because it cannot be tested on this
+// machine: Rosetta does not provide it.)
+#if defined(__aarch64__) || defined(__arm64__)
+#include <arm_neon.h>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#elif defined(__linux__)
+#include <sys/auxv.h>
+#endif
+
+__attribute__((target("sha2"))) static void sha_blocks_arm(uint32_t *h, const uint8_t *p, size_t n)
+{
+    uint32x4_t s0 = vld1q_u32(h), s1 = vld1q_u32(h + 4);
+    for (size_t b = 0; b < n; b++, p += 64)
+    {
+        uint32x4_t a0 = s0, a1 = s1, m[4];
+        for (int i = 0; i < 4; i++)
+        {
+            m[i] = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p + 16 * i))); // big-endian words
+        }
+        for (int i = 0; i < 16; i++) // four rounds each
+        {
+            uint32x4_t wk = vaddq_u32(m[i & 3], vld1q_u32(sha_k + 4 * i));
+            uint32x4_t t = a0;
+            a0 = vsha256hq_u32(a0, a1, wk);
+            a1 = vsha256h2q_u32(a1, t, wk);
+            if (i < 12) // the next four message words
+            {
+                m[i & 3] = vsha256su1q_u32(vsha256su0q_u32(m[i & 3], m[(i + 1) & 3]), m[(i + 2) & 3],
+                                           m[(i + 3) & 3]);
+            }
+        }
+        s0 = vaddq_u32(s0, a0);
+        s1 = vaddq_u32(s1, a1);
+    }
+    vst1q_u32(h, s0);
+    vst1q_u32(h + 4, s1);
+}
+
+static int sha_hw(void)
+{
+    static int known = -1;
+    if (known < 0)
+    {
+#if defined(__APPLE__)
+        int v = 0;
+        size_t n = sizeof(v);
+        known = sysctlbyname("hw.optional.arm.FEAT_SHA256", &v, &n, NULL, 0) == 0 && v;
+#elif defined(__linux__)
+        known = (getauxval(AT_HWCAP) & (1ul << 6)) != 0; // HWCAP_SHA2
+#else
+        known = 0;
+#endif
+    }
+    return known;
+}
+
+static void sha_blocks(uint32_t *h, const uint8_t *p, size_t n)
+{
+    if (sha_hw())
+    {
+        sha_blocks_arm(h, p, n);
+    }
+    else
+    {
+        sha_blocks_portable(h, p, n);
+    }
+}
+#else
+static void sha_blocks(uint32_t *h, const uint8_t *p, size_t n)
+{
+    sha_blocks_portable(h, p, n);
+}
+#endif
 
 static void sha256(const uint8_t *data, size_t len, uint8_t out[32])
 {
@@ -83,11 +172,8 @@ static void sha256(const uint8_t *data, size_t len, uint8_t out[32])
                 0,
                 {0},
                 0};
-    size_t i = 0;
-    for (; i + 64 <= len; i += 64)
-    {
-        sha_block(&s, data + i);
-    }
+    size_t i = len / 64 * 64;
+    sha_blocks(s.h, data, len / 64);
     uint8_t tail[128] = {0};
     size_t rest = len - i;
     memcpy(tail, data + i, rest);
@@ -98,10 +184,7 @@ static void sha256(const uint8_t *data, size_t len, uint8_t out[32])
     {
         tail[blocks * 64 - 1 - k] = (uint8_t)(bits >> (8 * k));
     }
-    for (size_t b = 0; b < blocks; b++)
-    {
-        sha_block(&s, tail + 64 * b);
-    }
+    sha_blocks(s.h, tail, blocks);
     for (int k = 0; k < 8; k++)
     {
         out[4 * k] = (uint8_t)(s.h[k] >> 24);
@@ -112,12 +195,28 @@ static void sha256(const uint8_t *data, size_t len, uint8_t out[32])
 }
 
 // ---- a growable byte buffer ------------------------------------------------------------------------
+//
+// Its memory beyond `len` is always zero, so padding is skipped over, not written (skip_to).
+// The executable is sized before it is written and allocated once (Buf with that capacity).
 
 typedef struct
 {
     uint8_t *p;
     size_t len, cap;
 } Buf;
+
+static void reserve(Buf *b, size_t cap)
+{
+    uint8_t *p = (uint8_t *)realloc(b->p, cap);
+    if (!p)
+    {
+        fprintf(stderr, "fatal: out of memory while writing the executable\n");
+        exit(2);
+    }
+    memset(p + b->cap, 0, cap - b->cap);
+    b->p = p;
+    b->cap = cap;
+}
 
 static void need(Buf *b, size_t n)
 {
@@ -128,13 +227,16 @@ static void need(Buf *b, size_t n)
         {
             cap *= 2;
         }
-        b->p = (uint8_t *)realloc(b->p, cap);
-        if (!b->p)
-        {
-            fprintf(stderr, "fatal: out of memory while writing the executable\n");
-            exit(2);
-        }
-        b->cap = cap;
+        reserve(b, cap);
+    }
+}
+
+static void skip_to(Buf *b, size_t at) // the bytes up to `at` stay zero
+{
+    if (at > b->len)
+    {
+        need(b, at - b->len);
+        b->len = at;
     }
 }
 
@@ -172,10 +274,7 @@ static void name16(Buf *b, const char *s)
 
 static void pad_to(Buf *b, size_t align)
 {
-    while (b->len % align)
-    {
-        le(b, 0, 1);
-    }
+    skip_to(b, (b->len + align - 1) / align * align);
 }
 
 static void uleb(Buf *b, uint64_t v)
@@ -204,6 +303,28 @@ static void branch26(uint8_t *code, size_t at, size_t target)
 {
     int64_t delta = ((int64_t)target - (int64_t)at) / 4;
     set32(code + at, (get32(code + at) & 0xfc000000u) | ((uint32_t)delta & 0x03ffffffu));
+}
+
+// The file in one write(2), past stdio: fwrite of a buffer this size copies it through the
+// FILE's buffer and writes it in two calls.
+static int write_all(FILE *out, const uint8_t *p, size_t n)
+{
+    if (fflush(out) != 0)
+    {
+        return 0;
+    }
+    int fd = fileno(out);
+    while (n)
+    {
+        ssize_t k = write(fd, p, n);
+        if (k <= 0)
+        {
+            return 0;
+        }
+        p += k;
+        n -= (size_t)k;
+    }
+    return 1;
 }
 
 static size_t count_imports(const char *const *imports)
@@ -263,6 +384,13 @@ static void build_version(Buf *b)
 
 #define BASE 0x100000000ull
 #define SIG_PAGE 4096u
+
+// SHA-256 of SIG_PAGE zero bytes (`head -c 4096 /dev/zero | shasum -a 256`): the hash of every
+// page of padding between the code and __LINKEDIT, most of the file on arm64's 16 KB pages.
+static const uint8_t zero_page_sha256[32] = {
+    0xad, 0x7f, 0xac, 0xb2, 0x58, 0x6f, 0xc6, 0xe9, 0x66, 0xc0, 0x04, 0xd7, 0xd1, 0xd1, 0x6b, 0x02,
+    0x4f, 0x58, 0x05, 0xff, 0x7c, 0xb4, 0x7c, 0x7a, 0x85, 0xda, 0xbd, 0x8b, 0x48, 0x89, 0x2c, 0xa7,
+};
 
 static size_t round_up(size_t v, size_t a)
 {
@@ -327,6 +455,7 @@ int macho_write_executable(FILE *out, MachoCpu cpu, const uint8_t *code, size_t 
     size_t link_size = sig_off + sig_size - link_off;
 
     Buf b = {0};
+    reserve(&b, sig_off + sig_size); // the whole file, zero: written once, never grown
     // mach_header_64
     le(&b, 0xfeedfacf, 4);
     le(&b, arm ? 0x0100000c : 0x01000007, 4); // CPU_TYPE_ARM64 / CPU_TYPE_X86_64
@@ -377,10 +506,7 @@ int macho_write_executable(FILE *out, MachoCpu cpu, const uint8_t *code, size_t 
     le(&b, 12, 4);
     size_t start = b.len;
     bytes(&b, dylinker, strlen(dylinker) + 1);
-    while (b.len - start < dylinker_cmd - 12)
-    {
-        le(&b, 0, 1);
-    }
+    skip_to(&b, start + dylinker_cmd - 12);
 
     le(&b, 0x1b, 4); // LC_UUID: derived from the code, so a build is reproducible
     le(&b, 24, 4);
@@ -405,10 +531,7 @@ int macho_write_executable(FILE *out, MachoCpu cpu, const uint8_t *code, size_t 
     le(&b, 0x00010000, 4); // compatibility version 1.0
     start = b.len;
     bytes(&b, libsystem, strlen(libsystem) + 1);
-    while (b.len - start < dylib_cmd - 24)
-    {
-        le(&b, 0, 1);
-    }
+    skip_to(&b, start + dylib_cmd - 24);
 
     le(&b, 0x1d, 4); // LC_CODE_SIGNATURE
     le(&b, 16, 4);
@@ -423,11 +546,7 @@ int macho_write_executable(FILE *out, MachoCpu cpu, const uint8_t *code, size_t 
     }
 
     // __TEXT contents: the code, its calls into the C library sent to the stubs, the stubs.
-    pad_to(&b, 16);
-    while (b.len < text_off)
-    {
-        le(&b, 0, 1);
-    }
+    skip_to(&b, text_off);
     bytes(&b, code, len);
     pad_to(&b, 4);
     for (size_t i = 0; i < ncalls; i++)
@@ -461,70 +580,61 @@ int macho_write_executable(FILE *out, MachoCpu cpu, const uint8_t *code, size_t 
         le(&b, 0xf9400000u | ((lo / 8) << 10) | (16u << 5) | 16u, 4); // ldr x16, [x16, slot@pageoff]
         le(&b, 0xd61f0200u, 4);                               // br x16
     }
-    while (b.len < link_off) // __TEXT is padded to its page; __DATA has no file bytes
-    {
-        le(&b, 0, 1);
-    }
+    size_t text_end = b.len; // from here to link_off: zero padding
+    skip_to(&b, link_off);   // __TEXT is padded to its page; __DATA has no file bytes
     // __LINKEDIT
     bytes(&b, bind.p, bind.len);
     le(&b, ' ', 1);
-    while (b.len < str_off + str_size)
-    {
-        le(&b, 0, 1);
-    }
-    while (b.len < sig_off)
-    {
-        le(&b, 0, 1);
-    }
+    skip_to(&b, sig_off);
 
-    // The ad-hoc signature: a SuperBlob holding one CodeDirectory (all fields big-endian).
+    // The ad-hoc signature: a SuperBlob holding one CodeDirectory (all fields big-endian),
+    // written in place after the bytes it hashes.
     size_t code_limit = sig_off;
-    Buf sig = {0};
-    be(&sig, 0xfade0cc0, 4); // CSMAGIC_EMBEDDED_SIGNATURE
-    be(&sig, sig_size, 4);
-    be(&sig, 1, 4);
-    be(&sig, 0, 4); // CSSLOT_CODEDIRECTORY
-    be(&sig, 20, 4);
-    be(&sig, 0xfade0c02, 4); // CSMAGIC_CODEDIRECTORY
-    be(&sig, cd_size, 4);
-    be(&sig, 0x20400, 4);                    // version: with exec segment fields
-    be(&sig, 0x20002, 4);                    // CS_ADHOC | CS_LINKER_SIGNED
-    be(&sig, cd_header + ident_len, 4);      // hashOffset
-    be(&sig, cd_header, 4);                  // identOffset
-    be(&sig, 0, 4);                          // nSpecialSlots
-    be(&sig, ncode, 4);                      // nCodeSlots
-    be(&sig, code_limit, 4);                 // codeLimit
-    be(&sig, 32, 1);                         // hashSize
-    be(&sig, 2, 1);                          // hashType: SHA-256
-    be(&sig, 0, 1);                          // platform
-    be(&sig, 12, 1);                         // pageSize: 2^12
-    be(&sig, 0, 4);                          // spare2
-    be(&sig, 0, 4);                          // scatterOffset
-    be(&sig, 0, 4);                          // teamOffset
-    be(&sig, 0, 4);                          // spare3
-    be(&sig, 0, 8);                          // codeLimit64
-    be(&sig, 0, 8);                          // execSegBase
-    be(&sig, text_seg, 8);                   // execSegLimit
-    be(&sig, 1, 8);                          // CS_EXECSEG_MAIN_BINARY
-    bytes(&sig, ident, ident_len);
+    be(&b, 0xfade0cc0, 4); // CSMAGIC_EMBEDDED_SIGNATURE
+    be(&b, sig_size, 4);
+    be(&b, 1, 4);
+    be(&b, 0, 4); // CSSLOT_CODEDIRECTORY
+    be(&b, 20, 4);
+    be(&b, 0xfade0c02, 4); // CSMAGIC_CODEDIRECTORY
+    be(&b, cd_size, 4);
+    be(&b, 0x20400, 4);                    // version: with exec segment fields
+    be(&b, 0x20002, 4);                    // CS_ADHOC | CS_LINKER_SIGNED
+    be(&b, cd_header + ident_len, 4);      // hashOffset
+    be(&b, cd_header, 4);                  // identOffset
+    be(&b, 0, 4);                          // nSpecialSlots
+    be(&b, ncode, 4);                      // nCodeSlots
+    be(&b, code_limit, 4);                 // codeLimit
+    be(&b, 32, 1);                         // hashSize
+    be(&b, 2, 1);                          // hashType: SHA-256
+    be(&b, 0, 1);                          // platform
+    be(&b, 12, 1);                         // pageSize: 2^12
+    be(&b, 0, 4);                          // spare2
+    be(&b, 0, 4);                          // scatterOffset
+    be(&b, 0, 4);                          // teamOffset
+    be(&b, 0, 4);                          // spare3
+    be(&b, 0, 8);                          // codeLimit64
+    be(&b, 0, 8);                          // execSegBase
+    be(&b, text_seg, 8);                   // execSegLimit
+    be(&b, 1, 8);                          // CS_EXECSEG_MAIN_BINARY
+    bytes(&b, ident, ident_len);
     for (size_t i = 0; i < ncode; i++)
     {
         size_t from = i * SIG_PAGE;
         size_t n = code_limit - from < SIG_PAGE ? code_limit - from : SIG_PAGE;
+        if (n == SIG_PAGE && from >= text_end && from + SIG_PAGE <= link_off)
+        {
+            bytes(&b, zero_page_sha256, 32); // padding: its hash is a constant
+            continue;
+        }
         uint8_t h[32];
         sha256(b.p + from, n, h);
-        bytes(&sig, h, 32);
+        bytes(&b, h, 32);
     }
-    while (sig.len < sig_size)
-    {
-        le(&sig, 0, 1);
-    }
-    bytes(&b, sig.p, sig.len);
+    skip_to(&b, sig_off + sig_size);
 
-    int ok = fwrite(b.p, 1, b.len, out) == b.len;
+    int ok = write_all(out, b.p, b.len);
     free(b.p);
     free(bind.p);
-    free(sig.p);
     return ok ? 0 : 1;
 }
 
@@ -585,15 +695,9 @@ int macho_write_object(FILE *out, MachoCpu cpu, const uint8_t *code, size_t len,
     {
         le(&b, 0, 4);
     }
-    while (b.len < text_off)
-    {
-        le(&b, 0, 1);
-    }
+    skip_to(&b, text_off);
     bytes(&b, code, len);
-    while (b.len < reloc_off)
-    {
-        le(&b, 0, 1);
-    }
+    skip_to(&b, reloc_off);
     for (size_t i = 0; i < ncalls; i++)
     {
         // ARM64_RELOC_BRANCH26 / X86_64_RELOC_BRANCH (both 2), pc-relative, 4 bytes, external
@@ -614,7 +718,7 @@ int macho_write_object(FILE *out, MachoCpu cpu, const uint8_t *code, size_t len,
         le(&b, 0, 8);
     }
     bytes(&b, str.p, str.len);
-    int ok = fwrite(b.p, 1, b.len, out) == b.len;
+    int ok = write_all(out, b.p, b.len);
     free(b.p);
     free(str.p);
     free(undef_str);

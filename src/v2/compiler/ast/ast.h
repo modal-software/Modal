@@ -20,7 +20,7 @@ typedef enum
     AST_MODULE,      // -            decls
     AST_STRUCT_DECL, // name         members
     AST_FIELD_DECL,  // name         type         init
-    AST_METHOD_DECL, // name         params       return type  body
+    AST_METHOD_DECL, // name         params       signature (AST_SIG: return type, body)
     AST_PARAM,       // name         type
     AST_DEFINE,      // name         value                               name := value
     AST_VAL_DECL,    // 'val'        items        source                 val (a as b): import(x)
@@ -28,7 +28,7 @@ typedef enum
     AST_TYPE_SLICE,  // '['          element
     AST_TYPE_PTR,    // '*'          pointee
     AST_TYPE_STRUCT, // 'struct'     members
-    AST_FN_LIT,      // '('          params       return type  body
+    AST_FN_LIT,      // '('          params       signature (AST_SIG: return type, body)
     AST_BLOCK,       // '{'          statements
     AST_RETURN,      // 'return'     value
     AST_ASSIGN,      // '='          target       value
@@ -45,6 +45,7 @@ typedef enum
     AST_IMPORT_ALL,  // '*'          chain                               import(x).*
     AST_IMPORT_PICK, // '('          chain        items                  import(x).(a, b as c)
     AST_IMPORT_ITEM, // name                                   alias TOKEN index (0 = none)
+    AST_SIG, // return type, body (a node, or the TOK_BODY token of a body not parsed yet)
     AST__COUNT,
 } AstNodeKind;
 
@@ -62,6 +63,15 @@ enum
     // A type-first parameter with a literal where its name would be (`u8 fact(u8 0): 1`): a
     // pattern. Its token is the literal; aux = 1 for a negative number.
     AST_F_PATTERN = 1u << 5,
+    // The last element of the list it belongs to. A list's elements are consecutive nodes, so
+    // the next sibling of `id` is `id + 1` unless this is set: no link is stored (16-byte nodes).
+    AST_F_LAST = 1u << 6,
+    // A print or write call whose bytes go to the program's `out` (sema/check.c,
+    // route_output): its first argument is that `out`, and its ref is the `put` method.
+    AST_F_SINK = 1u << 7,
+    // On an AST_FIELD_DECL: `b` is where it is placed (`@ n`), not an initializer. In a struct,
+    // its offset; at module level, the address of a device (memory-mapped registers).
+    AST_F_PLACED = 1u << 7,
 };
 
 typedef struct AstNode
@@ -70,11 +80,10 @@ typedef struct AstNode
     uint8_t flags;
     uint16_t aux;
     uint32_t tok;
-    NodeId a, b, c;
-    NodeId next; // next sibling in the list this node belongs to
+    NodeId a, b; // children; a list child is the id of its first element
 } AstNode;
 
-_Static_assert(sizeof(AstNode) == 24, "AstNode must stay 24 bytes");
+_Static_assert(sizeof(AstNode) == 16, "AstNode must stay 16 bytes");
 
 typedef struct
 {
@@ -85,13 +94,15 @@ typedef struct
 
 #define NODE(u, id) (&(u)->nodes.data[(id)])
 #define TOK(u, i) (&(u)->tokens.data[(i)])
+// The next element of the list `id` is in, or 0 after the last.
+#define NEXT(u, id) ((NODE(u, (id))->flags & AST_F_LAST) ? (NodeId)0 : (NodeId)((id) + 1))
 
 // Which of a/b/c hold child nodes, per kind (bit 0 = a, bit 1 = b, bit 2 = c).
 extern const uint8_t ast_child_mask[AST__COUNT];
 
 typedef struct
 {
-    NodeId (*node)(Unit *u, AstNodeKind kind, uint32_t tok, NodeId a, NodeId b, NodeId c);
+    NodeId (*node)(Unit *u, AstNodeKind kind, uint32_t tok, NodeId a, NodeId b);
 } AstConstructor;
 
 typedef struct

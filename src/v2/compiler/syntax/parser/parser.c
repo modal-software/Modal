@@ -1,5 +1,7 @@
 #include "v2/compiler/syntax/parser/parser.h"
 #include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 void parser_init(Parser *p, Unit *u)
 {
@@ -137,33 +139,79 @@ void parser_leave(Parser *p)
     p->depth--;
 }
 
-// Appends `id` (or a ready-made chain starting at `id`) to the list.
+static AstNode *stage;
+static size_t stage_top, stage_cap;
+
+NodeList list_begin(void)
+{
+    return (NodeList){(uint32_t)stage_top, 0};
+}
+
 void node_list_push(Unit *u, NodeList *list, NodeId id)
 {
     if (!id)
     {
         return;
     }
-    if (list->tail)
+    if (list->base + list->count != stage_top)
     {
-        NODE(u, list->tail)->next = id;
+        fprintf(stderr, "fatal: parser: a list was pushed to while another was open\n");
+        exit(2);
+    }
+    if (stage_top == stage_cap)
+    {
+        stage = (AstNode *)region_grow_array(REGION_STAGE, stage, sizeof(AstNode), &stage_cap,
+                                             stage_top + 1);
+    }
+    stage[stage_top++] = *NODE(u, id);
+    list->count++;
+    if (id == u->nodes.size - 1)
+    {
+        u->nodes.size--; // the element was the last node made: its slot is free again
     }
     else
     {
-        list->head = id;
+        NODE(u, id)->kind = AST_NONE; // left behind, inert
     }
-    while (NODE(u, id)->next)
+}
+
+AstNode *list_at(NodeList *list, uint32_t index)
+{
+    return &stage[list->base + index];
+}
+
+NodeId list_finish(Unit *u, NodeList *list)
+{
+    NodeId first = (NodeId)u->nodes.size;
+    for (uint32_t i = 0; i < list->count; i++)
     {
-        id = NODE(u, id)->next;
+        AstNode n = stage[list->base + i];
+        n.flags = (uint8_t)((n.flags & ~AST_F_LAST) | (i + 1 == list->count ? AST_F_LAST : 0));
+        node_append(u, n);
     }
-    list->tail = id;
+    stage_top = list->base;
+    NodeId head = list->count ? first : 0;
+    list->count = 0;
+    return head;
+}
+
+void list_abort(NodeList *list)
+{
+    stage_top = list->base;
+    list->count = 0;
+}
+
+void list_truncate(NodeList *list, uint32_t count)
+{
+    stage_top = list->base + count;
+    list->count = count;
 }
 
 NodeId parse_program(Parser *p)
 {
     Unit *u = p->unit;
-    NodeId root = node_new(u, AST_MODULE, 0, 0, 0, 0);
-    NodeList decls = {0};
+    NodeId root = node_new(u, AST_MODULE, 0, 0, 0);
+    NodeList decls = list_begin();
 
     while (p->current->kind != TOK_EOF)
     {
@@ -179,13 +227,12 @@ NodeId parse_program(Parser *p)
             continue;
         }
 
-        NodeId decl = parse_declaration(p, DECL_TOP);
+        parse_declaration(p, DECL_TOP, &decls);
         if (p->panic)
         {
             parser_synchronize(p);
             continue;
         }
-        node_list_push(u, &decls, decl);
 
         if (p->current->kind != TOK_EOF && p->current->kind != TOK_SEMICOLON && !(p->current->nl))
         {
@@ -194,6 +241,7 @@ NodeId parse_program(Parser *p)
         }
     }
 
-    NODE(u, root)->a = decls.head;
+    NodeId head = list_finish(u, &decls);
+    NODE(u, root)->a = head;
     return root;
 }

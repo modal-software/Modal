@@ -85,6 +85,7 @@ typedef enum
     // to its '}'. The scanner produces it in place of the body's own tokens, which are made
     // only when that function is compiled (see scan_body).
     TOK_BODY,
+    TOK_AT, // `@`: where a field or a device is placed (`u32 dr @ 0x00`, `uart: pl011 @ 0x0900_0000`)
     TOK__COUNT,
 } TokenKind;
 

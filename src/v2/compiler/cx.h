@@ -27,12 +27,19 @@ typedef enum
 // first written, so a small program touches a few pages and a large one never pays for a
 // realloc copy. An array that is the last thing in its region grows in place and never moves.
 // (The technique of Zig's and Jai's allocators, the RAD debugger, and Go's heap arenas.)
+//
+// A small program would still touch one page per region (16 pages of 16 KB on arm64 macOS)
+// for a few KB of data. So the regions whose users already expect their arrays to move (every
+// array in them is reached through a pointer that region_grow_array reassigns) start in a slice
+// of one shared page, and move once, to their own reservation, when they outgrow it: at most
+// one copy of at most the slice. The others never move: code keeps pointers into them.
 typedef struct
 {
     char *base;      // NULL until first used
     size_t used;     // bytes handed out, from base
-    size_t peak;     // the most ever handed out
-    size_t reserved; // size of the reservation
+    size_t peak;     // the most ever handed out (since base was set)
+    size_t reserved; // size of the reservation (of the slice, while shared)
+    int shared;      // base is a slice of the shared page
 } Region;
 
 typedef enum
@@ -47,6 +54,14 @@ typedef enum
     REGION_SYMNAMES, // cx.sym_names: the name of each symbol, parallel to cx.syms
     REGION_CODE,   // machine code being generated (backend native)
     REGION_MIR,    // the MIR of the function being generated: emptied for each function
+    // The native backend's lists, each growing in place (doubling in the arena would leave
+    // every old copy behind): functions, calls, runtime calls, C library calls, branches.
+    REGION_FNS,
+    REGION_CALLS,
+    REGION_RTCALLS,
+    REGION_EXTERNS,
+    REGION_JUMPS,
+    REGION_STAGE, // list elements being parsed, before they are laid out consecutively
     REGION__COUNT,
 } RegionId;
 
@@ -90,6 +105,49 @@ struct Unit
     int errors;
 };
 
+// The machine the program is compiled for. Every size, alignment and byte order the compiler
+// needs is read from here (sema/layout.c), never assumed from the host.
+typedef enum
+{
+    TCPU_ARM64,
+    TCPU_X86_64,
+} TargetCpu;
+
+typedef enum
+{
+    TOS_MACOS, // Mach-O, the C library for system calls
+    TOS_LINUX, // static ELF, system calls made directly
+    TOS_NONE,  // bare metal: an ELF image at the memory map's flash, no system at all
+} TargetOs;
+
+typedef struct
+{
+    const char *name;
+    uint8_t cpu;        // TargetCpu
+    uint8_t os;         // TargetOs
+    uint8_t ptr_size;   // bytes in a pointer
+    uint8_t word_size;  // bytes in a general register
+    uint8_t align_i64;  // alignment of u64/i64 (4 on some 32-bit ABIs)
+    uint8_t big_endian;
+    uint8_t has_64;     // 64-bit arithmetic is native (otherwise done in pairs of registers)
+    uint8_t caps;       // TargetCaps: what the system gives the program
+} MachineTarget;
+
+// What a target's system provides (revo's comptime Caps, Zig's builtin.os): known when the
+// program is compiled, so a program that needs what the target lacks is an error at the line
+// that needs it, never at run time.
+typedef enum
+{
+    TCAP_SYSOUT = 1u << 0, // a byte output (stdout): print without an `out`, std.sys.put
+    TCAP_EXIT = 1u << 1,   // a process that ends with a status (main's result)
+} TargetCaps;
+
+typedef struct
+{
+    uint32_t size; // 0: the type has no layout (yet)
+    uint32_t align;
+} Layout;
+
 typedef struct
 {
     Region regions[REGION__COUNT];
@@ -120,6 +178,9 @@ typedef struct
     uint8_t timing; // --time: measure the per-function phases too
     uint8_t cache;  // --cache: skip checking the bodies of files that have not changed
     uint8_t show_mir; // --mir: print each function's MIR as it is generated
+    uint8_t stats;    // --stats: backends report what they produced (sizes, memory)
+    const MachineTarget *target; // see target_get()
+    uint8_t target_given;        // --target named it
 } context;
 
 extern context cx;
@@ -164,15 +225,93 @@ static inline int arena_mark_equal(ArenaMark a, ArenaMark b)
 void node_array_grow(Unit *u); // the rare case, out of line
 
 // Appends a node: inlined into the parser (a call through the `ast` table cannot be).
-static inline NodeId node_new(Unit *u, AstNodeKind kind, uint32_t tok, NodeId a, NodeId b,
-                              NodeId c)
+static inline NodeId node_new(Unit *u, AstNodeKind kind, uint32_t tok, NodeId a, NodeId b)
 {
     if (u->nodes.size == u->nodes.cap)
     {
         node_array_grow(u);
     }
-    u->nodes.data[u->nodes.size] = (AstNode){.kind = (uint8_t)kind, .tok = tok, .a = a, .b = b, .c = c};
+    // A node is a list of one until a list lays it out with others (see list_finish).
+    u->nodes.data[u->nodes.size] =
+        (AstNode){.kind = (uint8_t)kind, .flags = AST_F_LAST, .tok = tok, .a = a, .b = b};
     return (NodeId)u->nodes.size++;
+}
+
+// Appends a whole node (a list element being laid out, see list_finish).
+// The value of an integer literal: decimal, or hexadecimal after 0x, with `_` allowed between
+// digits (0x4000_0000, 1_000_000). Returns 0 if the text is not one (a fraction); *overflow is
+// set when it does not fit 64 bits (the value is then meaningless).
+static inline int number_value(const char *s, uint32_t len, uint64_t *out, int *overflow)
+{
+    uint64_t v = 0;
+    int over = 0, base = 10, any = 0;
+    uint32_t i = 0;
+    if (len > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))
+    {
+        base = 16;
+        i = 2;
+    }
+    for (; i < len; i++)
+    {
+        char ch = s[i];
+        int d = ch >= '0' && ch <= '9'   ? ch - '0'
+                : base == 16 && ch >= 'a' && ch <= 'f' ? ch - 'a' + 10
+                : base == 16 && ch >= 'A' && ch <= 'F' ? ch - 'A' + 10
+                                                       : -1;
+        if (ch == '_')
+        {
+            continue;
+        }
+        if (d < 0)
+        {
+            return 0;
+        }
+        over |= v > (UINT64_MAX - (uint64_t)d) / (uint64_t)base;
+        v = v * (uint64_t)base + (uint64_t)d;
+        any = 1;
+    }
+    *out = v;
+    if (overflow)
+    {
+        *overflow = over;
+    }
+    return any;
+}
+
+static inline NodeId node_append(Unit *u, AstNode n)
+{
+    if (u->nodes.size == u->nodes.cap)
+    {
+        node_array_grow(u);
+    }
+    u->nodes.data[u->nodes.size] = n;
+    return (NodeId)u->nodes.size++;
+}
+
+// A function (AST_METHOD_DECL or AST_FN_LIT) has three parts but a node two children: its
+// parameters, and a signature node holding the return type and the body.
+static inline NodeId node_new_fn(Unit *u, AstNodeKind kind, uint32_t tok, NodeId params,
+                                 NodeId ret, NodeId body)
+{
+    NodeId sig = node_new(u, AST_SIG, tok, ret, body);
+    return node_new(u, kind, tok, params, sig);
+}
+
+static inline NodeId fn_ret_node(const Unit *u, NodeId fn) // 0: no return type
+{
+    NodeId sig = u->nodes.data[fn].b;
+    return sig ? u->nodes.data[sig].a : 0;
+}
+
+static inline NodeId fn_body(const Unit *u, NodeId fn) // or the TOK_BODY token, if AST_F_LAZY
+{
+    NodeId sig = u->nodes.data[fn].b;
+    return sig ? u->nodes.data[sig].b : 0;
+}
+
+static inline void fn_set_body(Unit *u, NodeId fn, NodeId body)
+{
+    u->nodes.data[u->nodes.data[fn].b].b = body;
 }
 
 // ---- timing ----------------------------------------------------------------------------------
@@ -213,6 +352,7 @@ const char *domain_name(uint16_t domain);
 
 // What a mod.modal says for a domain; `fallback` when it does not say.
 int domain_config_bool(uint16_t domain, const char *key, int fallback);
+uint64_t domain_config_int(uint16_t domain, const char *key, uint64_t fallback);
 // Could a wildcard import of this file (`import(x).*`) supply `name`?
 int module_wildcard_provides(Unit *u, const char *name, size_t len);
 
@@ -234,6 +374,7 @@ void codegen_start(const struct Backend *backend, void *out_file, const char *pa
 void codegen_begin(Unit *u);              // declarations are checked: types, prototypes
 void codegen_function(Unit *u, SymId fn); // one function is checked and still in memory
 int codegen_finish(void);                 // returns the number of errors the backend reported
+int codegen_run(void); // started with no output: run the program in memory (Backend.run)
 // Why `fn` could not be generated, if it could not: reported when the program needs it.
 typedef struct
 {
@@ -253,12 +394,31 @@ TypeId sema_param_type(Unit *u, SymId fn, NodeId param); // type of one of its p
 TypeId sema_value_type(Unit *u, SymId field_or_const);
 NodeId sema_fn_params(const Unit *u, SymId fn);      // its parameters after `self`
 int sema_is_std_print(const Unit *u, SymId binding); // `x := import("std").io.print`
+// Which std function a binding names: `import("std").io.print`, `import("std").sys.put`.
+typedef enum
+{
+    STD_NONE,
+    STD_PRINT,
+    STD_SYS_PUT, // one byte to the system output
+} StdMember;
+int sema_std_member(const Unit *u, SymId binding);
 void sema_check(Unit *u);
 // Clauses (literal patterns: `u8 fact(u8 0): 1`).
 int sema_pattern(Unit *u, NodeId param, SymId owner, uint64_t *value, int loud);
 SymId sema_next_clause(Unit *u, SymId fn); // tried when fn's patterns do not match; 0: none
 int sema_clause_index(Unit *u, SymId fn);  // 0 for the first clause, which calls go to
+TypeId sema_type_of(Unit *u, NodeId type_node, SymId owner); // a written type, quietly
+int sema_is_register_block(SymId s);  // a struct whose fields have offsets (`u32 dr @ 0x00`)
+uint64_t sema_device_address(SymId s); // `uart0: pl011 @ address`: the address; 0 if not a device
 void sema_syntax_only(Unit *u); // for a file that is not checked: parse its bodies for errors //
                                 // every name and invocation in a body leads to a declaration
+
+// layout.c
+extern const MachineTarget *const targets[]; // NULL-terminated
+const MachineTarget *target_find(const char *name); // NULL if unknown
+void target_set(const MachineTarget *t);
+const MachineTarget *target_get(void);  // the target set, or the host's
+Layout type_layout(TypeId t);    // C's layout on the target
+uint32_t field_offset_of(SymId field);
 
 #endif // MODAL_V2_CX_H

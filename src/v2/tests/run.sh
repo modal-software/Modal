@@ -1,6 +1,6 @@
 #!/bin/sh
 # Front-end checks for v2. Run from the repository root: `make test_v2`.
-BIN=./modal-v2
+BIN=${BIN:-./modal}
 EX=./examples
 fail=0
 
@@ -136,7 +136,7 @@ else
     echo "FAIL  unknown backend is rejected"
     fail=1
 fi
-for prog in hello counter; do
+for prog in hello counter context patterns globals literals structs output; do
     if $BIN --run $EX/run/$prog.modal 2>&1 | cmp -s - $EX/run/$prog.expected; then
         echo "ok    $prog.modal compiles to C and prints the expected output"
     else
@@ -144,6 +144,164 @@ for prog in hello counter; do
         fail=1
     fi
 done
+
+C=$EX/errors/context.modal
+expect_output "a context must be a struct" "context.modal:2:.*a context must be a struct" $C
+expect_output "a context cannot be reassigned" "context.modal:8:.*context parameter: it cannot be reassigned" $C
+expect_output "a missing context is reported" "context.modal:11:.*'needs' needs a context 'arena'" $C
+
+P=$EX/errors/patterns.modal
+expect_output "a clause after a catch-all never runs" "patterns.modal:5:.*this clause would never run" $P
+expect_output "two clauses with the same patterns" "patterns.modal:8:.*with the same patterns" $P
+expect_output "clauses need a final catch-all" "patterns.modal:2:.*none after them that takes every value" $P
+F=$EX/errors/patterns_fit.modal
+expect_output "a pattern must fit its type" "patterns_fit.modal:1:.*the pattern 300 does not fit u8" $F
+expect_output "a negative pattern on an unsigned type" "patterns_fit.modal:4:.*the pattern -1 does not fit u8" $F
+expect_output "a bool pattern on an integer" "patterns_fit.modal:7:.*is a bool, but the parameter is not" $F
+
+N=$EX/errors/bounds.modal
+expect_output "a constant must fit its field" "bounds.modal:1:.*300 does not fit u8 (0 to 255, 8 bits)" $N
+expect_output "a constant must fit the other operand" "bounds.modal:6:.*200 does not fit i8" $N
+expect_output "an argument must fit its parameter" "bounds.modal:9:.*256 does not fit u8" $N
+expect_output "a negative argument must fit" "bounds.modal:10:.*-129 does not fit i8 (-128 to 127" $N
+expect_output "a returned constant must fit" "bounds.modal:11:.*1000 does not fit u8" $N
+
+O=$EX/errors/output.modal
+expect_output "printing with no out where the file has one" "output.modal:16:.*there is none here. Take the context parameter \`out: out\`" $O
+expect_output "std.sys.put takes a byte that fits" "output.modal:20:.*300 does not fit u8" $O
+expect_output "std.sys.put takes a u8" "output.modal:21:.*std.sys.put takes a u8, not \[\]u8" $O
+expect_output "std.sys.put takes one argument" "output.modal:22:.*takes one byte" $O
+
+D=$EX/errors/devices.modal
+expect_output "a register block gives every field an offset" "devices.modal:4:.*give 'b' one too" $D
+expect_output "a register's offset is aligned" "devices.modal:7:.*offset 2 is not a multiple of 4" $D
+expect_output "registers do not overlap" "devices.modal:11:.*overlaps the register before it, which ends at 8" $D
+expect_output "a register is a number or a bool" "devices.modal:14:.*is a register: a sized number or bool, not \[\]u8" $D
+expect_output "only a register block is placed at an address" "devices.modal:26:.*give each field of plain its offset" $D
+expect_output "a device is type-last" "devices.modal:27:.*a device stays at its address" $D
+expect_output "a device's address is aligned" "devices.modal:28:.*address 0x2002 is not a multiple of 4" $D
+expect_output "a read-only register cannot be assigned" "devices.modal:24:.*'status' is immutable" $D
+DC=${TMPDIR:-/tmp}/modal-test-device-$$.c
+if $BIN -o "$DC" $EX/run/device.modal >/dev/null 2>&1 && grep -q "volatile uint16_t ibrd" "$DC" &&
+    ${CC:-cc} -std=c99 -Wall -Wextra -Werror -c -o "$DC.o" "$DC" 2>/dev/null; then
+    echo "ok    a register block is volatile in C, and C agrees with its layout"
+else
+    echo "FAIL  a register block is volatile in C, and C agrees with its layout"
+    fail=1
+fi
+rm -f "$DC" "$DC.o"
+
+expect_output "an immutable module binding cannot be assigned" "globals.modal:17:.*'limit' is immutable" $EX/errors/globals.modal
+
+expect_output "a closure is reported" "closure.modal:2:.*a closure" $EX/errors/closure.modal -o ${TMPDIR:-/tmp}/modal-test-closure-$$.c
+
+# the native backend (copy-and-patch): same output and exit status as the C backend
+if [ "$(uname -m)" = arm64 ] || [ "$(uname -m)" = aarch64 ]; then
+    for prog in hello counter context patterns globals literals structs output; do
+        if $BIN --backend native --run $EX/run/$prog.modal 2>&1 | cmp -s - $EX/run/$prog.expected; then
+            echo "ok    $prog.modal compiles to arm64 by copy-and-patch and prints the expected output"
+        else
+            echo "FAIL  $prog.modal compiles to arm64 by copy-and-patch and prints the expected output"
+            fail=1
+        fi
+    done
+    $BIN --backend native --run $EX/run/counter.modal >/dev/null 2>&1
+    native=$?
+    $BIN --run $EX/run/counter.modal >/dev/null 2>&1
+    if [ $native = $? ]; then
+        echo "ok    native and C programs exit with the same status"
+    else
+        echo "FAIL  native and C programs exit with the same status"
+        fail=1
+    fi
+    if $BIN --backend native --run $EX/run/multi/main.modal 2>&1 | cmp -s - $EX/run/multi/main.expected; then
+        echo "ok    a program in several files compiles natively"
+    else
+        echo "FAIL  a program in several files compiles natively"
+        fail=1
+    fi
+    LZ=${TMPDIR:-/tmp}/modal-test-lazy-$$
+    expect_output "what cannot be generated is reported only when called" \
+        "util.modal:16:.*closure.*in 'f', which the program calls" $EX/errors/lazy/main.modal --backend native -o $LZ
+    rm -f "$LZ"
+fi
+# x86-64: on an x86-64 host, or on Apple Silicon through Rosetta
+if [ "$(uname -m)" = x86_64 ] || arch -x86_64 /usr/bin/true 2>/dev/null; then
+    for prog in hello counter context patterns globals literals structs output; do
+        if $BIN --backend x86_64 --run $EX/run/$prog.modal 2>&1 | cmp -s - $EX/run/$prog.expected; then
+            echo "ok    $prog.modal compiles to x86-64 by copy-and-patch and prints the expected output"
+        else
+            echo "FAIL  $prog.modal compiles to x86-64 by copy-and-patch and prints the expected output"
+            fail=1
+        fi
+    done
+fi
+# Linux: static ELF executables, run on macOS through tools/elfrun.c (only the two system
+# calls are replaced), or directly on Linux.
+ELF=${TMPDIR:-/tmp}/modal-test-elf-$$
+for cpu in arm64 x86_64; do
+    if [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = "$cpu" -o "$(uname -m)-$cpu" = aarch64-arm64 ]; then
+        runner=""
+    elif [ "$(uname -s)" = Darwin ] && { [ $cpu = arm64 ] && [ "$(uname -m)" = arm64 ] || { [ $cpu = x86_64 ] && arch -x86_64 /usr/bin/true 2>/dev/null; }; }; then
+        ${CC:-cc} -arch $cpu -O2 -std=c17 ./src/v2/tools/elfrun.c -o "$ELF.run" 2>/dev/null || continue
+        runner="$ELF.run"
+        [ $cpu = x86_64 ] && runner="arch -x86_64 $ELF.run"
+    else
+        continue
+    fi
+    for prog in hello counter context patterns globals literals structs output; do
+        if $BIN --target $cpu-linux -o "$ELF" $EX/run/$prog.modal >/dev/null 2>&1 &&
+            $runner "$ELF" 2>&1 | cmp -s - $EX/run/$prog.expected; then
+            echo "ok    $prog.modal as a Linux $cpu ELF prints the expected output"
+        else
+            echo "FAIL  $prog.modal as a Linux $cpu ELF prints the expected output"
+            fail=1
+        fi
+    done
+    if $BIN --target $cpu-linux -o "$ELF" $EX/run/device.modal >/dev/null 2>&1 &&
+        $runner --device 0x10000000000 48 "$ELF" 2>&1 | cmp -s - $EX/run/device.expected; then
+        echo "ok    device.modal on $cpu: registers stored at their offsets and widths"
+    else
+        echo "FAIL  device.modal on $cpu: registers stored at their offsets and widths"
+        fail=1
+    fi
+    # bare metal: the image at the memory map's flash, the stack at the top of its RAM, print
+    # through `out` to a UART; the halt after main ends the run with main's result
+    $BIN --target $cpu-none -o "$ELF" $EX/board/blink.modal >/dev/null 2>&1 &&
+        $runner --ram 0x10000020000 4096 --device 0x10000000000 8 "$ELF" > "$ELF.out" 2>&1
+    bare_status=$?
+    if [ $bare_status = 42 ] && cmp -s "$ELF.out" $EX/board/blink.expected; then
+        echo "ok    a bare-metal $cpu image runs from its memory map and prints to its UART"
+    else
+        echo "FAIL  a bare-metal $cpu image runs from its memory map and prints to its UART"
+        fail=1
+    fi
+    rm -f "$ELF.out"
+    $BIN --target $cpu-linux -o "$ELF" $EX/run/counter.modal >/dev/null 2>&1 && $runner "$ELF" >/dev/null 2>&1
+    elf_status=$?
+    $BIN --run $EX/run/counter.modal >/dev/null 2>&1
+    if [ $elf_status = $? ]; then
+        echo "ok    a Linux $cpu ELF exits with the C program's status"
+    else
+        echo "FAIL  a Linux $cpu ELF exits with the C program's status"
+        fail=1
+    fi
+    rm -f "$ELF" "$ELF.run"
+done
+# memory budgets: the value stack sized from the call graph; mod.modal's max_code / max_ram
+BG=${TMPDIR:-/tmp}/modal-test-budget-$$
+expect_output "the value stack is sized exactly from the call graph" "^memory .*value stack 152 B (19 slots, exact)" $EX/run/counter.modal --backend native -o "$BG" --stats
+expect_output "a recursive program says which function has no known depth" "'fact' calls itself" $EX/run/patterns.modal --backend native -o "$BG" --stats
+expect_output "a program within its budgets compiles" "^ok: .*small.modal" $EX/budget/small.modal --backend native -o "$BG"
+expect_output "code over max_code is an error" "deep.modal:21:.*code is [0-9]* bytes, over max_code = 1500" $EX/budget/deep.modal --backend native -o "$BG"
+expect_output "memory over max_ram is an error, with what it is made of" "deep.modal:21:.*over max_ram = 512 (mod.modal): value stack 160, output buffer 64, 3 nested calls" $EX/budget/deep.modal --backend native -o "$BG"
+rm -f "$BG"
+BM=${TMPDIR:-/tmp}/modal-test-bare-$$
+expect_output "bare metal needs a memory map" "bare.modal:2:.*runs without a system: its mod.modal gives the memory map" $EX/errors/bare.modal --target arm64-none -o "$BM"
+expect_output "bare metal has no system output: print needs an out" "hello.modal:5:.*arm64-none has no system output" $EX/run/hello.modal --target arm64-none -o "$BM"
+expect_output "the memory map is the budget" "^memory .*ram 1264 B" $EX/board/blink.modal --target arm64-none -o "$BM" --stats
+rm -f "$BM"
+expect_output "an unknown target is rejected with the known ones" "unknown target 'mips'. Known targets: arm64-macos" $EX/run/hello.modal --target mips
 OUT=${TMPDIR:-/tmp}/modal-test-$$.c
 if $BIN -o "$OUT" $EX/run/counter.modal >/dev/null 2>&1 && ${CC:-cc} -std=c99 -Wall -Wextra -Werror -o "$OUT.bin" "$OUT" 2>/dev/null; then
     echo "ok    generated C builds with -Wall -Wextra -Werror"
@@ -187,7 +345,7 @@ for f in main.modal calls.modal errors/calls.modal; do
     fi
 done
 rm -rf "$MC"
-expect_output "bodies are not kept in memory" "nodes kept 7[0-9] " $EX/run/counter.modal --stats
+expect_output "bodies are not kept in memory" "nodes kept [78][0-9] " $EX/run/counter.modal --stats
 expect_output "eager mode keeps the whole tree" "nodes kept 1[0-9][0-9] " $EX/run/counter.modal --stats --eager
 expect_output "phase timing" "^total .* MB/s of source" $EX/run/counter.modal --time
 

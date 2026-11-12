@@ -68,7 +68,7 @@ static NodeId skip_self(const Unit *u, NodeId param)
         const Token *t = TOK(u, NODE(u, param)->tok);
         if (is_self_token(TSTART(t), t->len))
         {
-            return NODE(u, param)->next;
+            return NEXT(u, param);
         }
     }
     return param;
@@ -90,7 +90,7 @@ static int same_pattern(const Unit *u, NodeId pa, NodeId pb)
 
 static int has_patterns(const Unit *u, NodeId params)
 {
-    for (NodeId p = params; p; p = NODE(u, p)->next)
+    for (NodeId p = params; p; p = NEXT(u, p))
     {
         if (NODE(u, p)->flags & AST_F_PATTERN)
         {
@@ -103,7 +103,7 @@ static int has_patterns(const Unit *u, NodeId params)
 static int arity(const Unit *u, NodeId params)
 {
     int n = 0;
-    for (NodeId p = skip_self(u, params); p; p = NODE(u, p)->next)
+    for (NodeId p = skip_self(u, params); p; p = NEXT(u, p))
     {
         n++;
     }
@@ -120,8 +120,8 @@ static int same_signature(const Unit *u, NodeId pa, NodeId pb)
         {
             return 0;
         }
-        pa = NODE(u, pa)->next;
-        pb = NODE(u, pb)->next;
+        pa = NEXT(u, pa);
+        pb = NEXT(u, pb);
     }
     return pa == pb;
 }
@@ -307,10 +307,10 @@ static void declare_define(Unit *u, Scope *scope, SymId owner, NodeId decl, int 
 
 static void declare_import_items(Unit *u, NodeId item)
 {
-    for (; item; item = NODE(u, item)->next)
+    for (; item; item = NEXT(u, item))
     {
         const AstNode *n = NODE(u, item);
-        declare_value(u, u->scope, 0, SYM_IMPORT, 0, n->c ? n->c : n->tok, item);
+        declare_value(u, u->scope, 0, SYM_IMPORT, 0, n->b ? n->b : n->tok, item);
     }
 }
 
@@ -319,7 +319,7 @@ static void declare_import_items(Unit *u, NodeId item)
 static uint32_t bucket_count(const Unit *u, NodeId first, uint32_t minimum)
 {
     uint32_t n = 0, buckets = minimum;
-    for (NodeId d = first; d; d = NODE(u, d)->next)
+    for (NodeId d = first; d; d = NEXT(u, d))
     {
         n++;
     }
@@ -348,7 +348,7 @@ static void declare_struct(Unit *u, Scope *scope, SymId owner, NodeId decl)
     SYM(self)->scope_ref = scope_ref(members);
     scope_insert(scope, self);
 
-    for (NodeId m = NODE(u, decl)->a; m; m = NODE(u, m)->next)
+    for (NodeId m = NODE(u, decl)->a; m; m = NEXT(u, m))
     {
         const AstNode *n = NODE(u, m);
         switch (n->kind)
@@ -378,7 +378,7 @@ void sema_declare(Unit *u)
     u->scope = scope_new(NULL, 0, bucket_count(u, NODE(u, u->root)->a, SCOPE_MODULE_BUCKETS));
 
     // Pass 1: structs, so that `name(self: T)` can attach to a T declared further down.
-    for (NodeId d = NODE(u, u->root)->a; d; d = NODE(u, d)->next)
+    for (NodeId d = NODE(u, u->root)->a; d; d = NEXT(u, d))
     {
         if (NODE(u, d)->kind == AST_STRUCT_DECL)
         {
@@ -387,7 +387,7 @@ void sema_declare(Unit *u)
     }
 
     // Pass 2: everything else at the top level.
-    for (NodeId d = NODE(u, u->root)->a; d; d = NODE(u, d)->next)
+    for (NodeId d = NODE(u, u->root)->a; d; d = NEXT(u, d))
     {
         const AstNode *n = NODE(u, d);
         switch (n->kind)

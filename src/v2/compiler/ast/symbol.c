@@ -7,7 +7,7 @@
 
 static void name_table_grow(void)
 {
-    size_t cap = cx.name_table_cap ? cx.name_table_cap * 2 : 1024;
+    size_t cap = cx.name_table_cap ? cx.name_table_cap * 2 : 128; // the keywords, then doubling
     uint64_t *table = (uint64_t *)arena_alloc(cap * sizeof(uint64_t));
     memset(table, 0, cap * sizeof(uint64_t));
     for (NameId id = 1; id < cx.nnames; id++)

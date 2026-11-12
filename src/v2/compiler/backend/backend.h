@@ -50,6 +50,14 @@ typedef struct Backend
     // Every function has been handed over: emit the entry point and finish the output.
     // Returns the number of errors reported with diag_at for constructs it cannot translate.
     int (*end)(const BackendJob *job);
+
+    // Optional, for `--run`: the program can be run in the compiler's own process, with no file
+    // written. If can_run() says so for the selected target, the job is given no output
+    // (out == NULL, path == NULL), end() keeps the program in memory, and run() runs it and
+    // returns its exit status, or -1 if it could not be loaded (the driver reports it; -o
+    // still writes the executable).
+    int (*can_run)(void);
+    int (*run)(const BackendJob *job);
 } Backend;
 
 // registry.c

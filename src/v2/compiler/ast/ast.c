@@ -6,12 +6,12 @@
 #include <string.h>
 
 const uint8_t ast_child_mask[AST__COUNT] = {
-    [AST_MODULE] = 1,     [AST_STRUCT_DECL] = 1, [AST_FIELD_DECL] = 3, [AST_METHOD_DECL] = 7,
+    [AST_MODULE] = 1,     [AST_STRUCT_DECL] = 1, [AST_FIELD_DECL] = 3, [AST_METHOD_DECL] = 3,
     [AST_PARAM] = 1,      [AST_DEFINE] = 1,      [AST_VAL_DECL] = 3,   [AST_TYPE_SLICE] = 1,
-    [AST_TYPE_PTR] = 1,   [AST_TYPE_STRUCT] = 1, [AST_FN_LIT] = 7,     [AST_BLOCK] = 1,
+    [AST_TYPE_PTR] = 1,   [AST_TYPE_STRUCT] = 1, [AST_FN_LIT] = 3,     [AST_BLOCK] = 1,
     [AST_RETURN] = 1,     [AST_ASSIGN] = 3,      [AST_BIN_OP] = 3,     [AST_UNARY_OP] = 1,
     [AST_CALL] = 3,       [AST_INDEX] = 3,       [AST_SELECTOR] = 1,   [AST_PAREN_GROUP] = 1,
-    [AST_IMPORT_ALL] = 1, [AST_IMPORT_PICK] = 3,
+    [AST_IMPORT_ALL] = 1, [AST_IMPORT_PICK] = 3,  [AST_SIG] = 3,
 };
 
 void node_array_grow(Unit *u)
@@ -21,15 +21,16 @@ void node_array_grow(Unit *u)
                                                  &u->nodes.cap, u->nodes.size + 1);
 }
 
-static NodeId ast_new_node(Unit *u, AstNodeKind kind, uint32_t tok, NodeId a, NodeId b, NodeId c)
+static NodeId ast_new_node(Unit *u, AstNodeKind kind, uint32_t tok, NodeId a, NodeId b)
 {
-    return node_new(u, kind, tok, a, b, c);
+    return node_new(u, kind, tok, a, b);
 }
 
 static const char *ast_kind_name(AstNodeKind kind)
 {
     static const char *const names[AST__COUNT] = {
         [AST_NONE] = "none",
+        [AST_SIG] = "signature",
         [AST_MODULE] = "module",
         [AST_STRUCT_DECL] = "struct",
         [AST_FIELD_DECL] = "field",
@@ -156,7 +157,7 @@ static char *ast_type_str(const Unit *u, NodeId type, char *buf, size_t cap)
 static void str_params(Str *s, const Unit *u, NodeId param)
 {
     str_puts(s, "(");
-    for (int first = 1; param; param = NODE(u, param)->next, first = 0)
+    for (int first = 1; param; param = NEXT(u, param), first = 0)
     {
         const AstNode *n = NODE(u, param);
         const Token *name = TOK(u, n->tok);
@@ -187,21 +188,23 @@ static char *ast_sig_str(const Unit *u, NodeId decl, char *buf, size_t cap)
     Str s = {buf, cap, 0};
     const AstNode *n = NODE(u, decl);
     const Token *name = TOK(u, n->tok);
-    const AstNode *fn = n->kind == AST_DEFINE ? NODE(u, n->a) : n;
+    NodeId fid = n->kind == AST_DEFINE ? n->a : decl;
+    const AstNode *fn = NODE(u, fid);
+    NodeId ret = fn_ret_node(u, fid);
     int type_first = (n->flags & AST_F_MUT) != 0;
 
     buf[0] = '\0';
     if (type_first)
     {
-        str_type(&s, u, fn->b);
+        str_type(&s, u, ret);
         str_puts(&s, " ");
     }
     str_put(&s, TSTART(name), (size_t)name->len);
     str_params(&s, u, fn->a);
-    if (!type_first && fn->b)
+    if (!type_first && ret)
     {
         str_puts(&s, ": ");
-        str_type(&s, u, fn->b);
+        str_type(&s, u, ret);
     }
     return buf;
 }
@@ -235,25 +238,28 @@ static int print_visit(Unit *u, NodeId id, uint32_t depth, void *ctx)
             skip = VISIT_SKIP_A;
         }
         break;
+    case AST_SIG: // the return type is shown on the function's line
+        skip = VISIT_SKIP_A;
+        break;
     case AST_METHOD_DECL:
         str_params(&s, u, n->a);
-        if (n->b)
+        if (fn_ret_node(u, id))
         {
             str_puts(&s, ": ");
-            str_type(&s, u, n->b);
+            str_type(&s, u, fn_ret_node(u, id));
         }
         printf(" %.*s%s", t->len, TSTART(t), text);
-        skip = VISIT_SKIP_A | VISIT_SKIP_B;
+        skip = VISIT_SKIP_A; // the signature node below holds the body
         break;
     case AST_FN_LIT:
         str_params(&s, u, n->a);
-        if (n->b)
+        if (fn_ret_node(u, id))
         {
             str_puts(&s, " ");
-            str_type(&s, u, n->b);
+            str_type(&s, u, fn_ret_node(u, id));
         }
         printf(" %s", text);
-        skip = VISIT_SKIP_A | VISIT_SKIP_B;
+        skip = VISIT_SKIP_A; // the signature node below holds the body
         break;
     case AST_TYPE_NAME:
     case AST_TYPE_SLICE:
@@ -264,9 +270,9 @@ static int print_visit(Unit *u, NodeId id, uint32_t depth, void *ctx)
         break;
     case AST_IMPORT_ITEM:
         printf(" %.*s", t->len, TSTART(t));
-        if (n->c)
+        if (n->b)
         {
-            const Token *alias = TOK(u, n->c);
+            const Token *alias = TOK(u, n->b);
             printf(" as %.*s", alias->len, TSTART(alias));
         }
         break;

@@ -4,6 +4,7 @@
 #define _XOPEN_SOURCE 700
 #include "v2/compiler/backend/backend.h"
 #include "v2/compiler/cx.h"
+#include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,6 +22,8 @@ static int usage(const char *argv0)
             "  --run            generate, build with the backend's toolchain, and run\n"
             "  --backend NAME   backend to generate with (default: %s)\n"
             "  --backends       list the registered backends\n"
+            "  --target NAME    machine and system to build for (native backend): arm64-macos,\n"
+            "                   arm64-linux, x86_64-macos, x86_64-linux (default: this Mac)\n"
             "  --ast            print the syntax tree of every loaded file\n"
             "  --syms           print the symbol table with visibility\n"
             "  --sig            print the derived contract of every domain\n"
@@ -35,31 +38,146 @@ static int usage(const char *argv0)
     return 1;
 }
 
-// --run: build the generated file with the backend's toolchain and run the result.
+extern char **environ;
+
+// Starts a program directly (no /bin/sh) and waits for it. Returns its exit status, 1 if a
+// signal stopped it, -1 if it could not be started.
+static int spawn_wait(char *const argv[])
+{
+    fflush(stdout);
+    fflush(stderr);
+    pid_t pid;
+    if (posix_spawnp(&pid, argv[0], NULL, NULL, argv, environ) != 0)
+    {
+        return -1;
+    }
+    int status;
+    while (waitpid(pid, &status, 0) < 0)
+    {
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+}
+
+// The toolchain command as it would be split by the shell (words separated by blanks; `$CC`
+// may carry flags), then `-o OUT IN`.
+static int toolchain_build(const char *toolchain, const char *out, const char *in)
+{
+    char words[512];
+    char *argv[40];
+    int n = 0;
+    snprintf(words, sizeof(words), "%s", toolchain);
+    for (char *w = strtok(words, " \t"); w && n < 36; w = strtok(NULL, " \t"))
+    {
+        argv[n++] = w;
+    }
+    argv[n++] = "-o";
+    argv[n++] = (char *)out;
+    argv[n++] = (char *)in;
+    argv[n] = NULL;
+    return spawn_wait(argv);
+}
+
+static char *file_read(const char *path, size_t *len)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f)
+    {
+        return NULL;
+    }
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *p = n >= 0 ? malloc((size_t)n + 1) : NULL;
+    if (p && fread(p, 1, (size_t)n, f) != (size_t)n)
+    {
+        free(p);
+        p = NULL;
+    }
+    fclose(f);
+    *len = p ? (size_t)n : 0;
+    return p;
+}
+
+static int file_write(const char *path, const char *p, size_t len)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f)
+    {
+        return 0;
+    }
+    int ok = fwrite(p, 1, len, f) == len;
+    return fclose(f) == 0 && ok;
+}
+
+// --run with a backend that writes source for a toolchain: build the generated file and run
+// the result. Built executables are kept by content ($TMPDIR/modal-run/<hash>, beside a copy of
+// the source they were built from): an unchanged program is neither rebuilt nor a new file
+// the system has to validate again (docs/p.md §2.2). A hit is exact: the kept source must be
+// byte-identical to this one, so a hash collision only costs a rebuild.
 // Returns the exit status of the program, or 1 if it could not be built.
-static int build_and_run(const Backend *backend, const char *source, const char *exe)
+static int build_and_run(const Backend *backend, const char *source, const char *tmp)
 {
     const char *toolchain = getenv("CC") ? getenv("CC") : backend->toolchain;
-    char cmd[1600];
-
-    snprintf(cmd, sizeof(cmd), "%s -o '%s' '%s'", toolchain, exe, source);
-    fflush(stdout);
-    fflush(stderr);
-    int status = system(cmd);
-    if (status != 0)
+    size_t len;
+    char *text = file_read(source, &len);
+    if (!text)
     {
-        fprintf(stderr, "fatal: '%s' failed; the generated file was kept at %s\n", toolchain,
-                source);
+        fprintf(stderr, "fatal: cannot read back '%s'\n", source);
         return 1;
     }
+    uint64_t h = 0xcbf29ce484222325ull; // FNV-1a over the toolchain and the source
+    for (const char *p = toolchain; *p; p++)
+    {
+        h = (h ^ (uint8_t)*p) * 0x100000001b3ull;
+    }
+    h = (h ^ 0) * 0x100000001b3ull;
+    for (size_t i = 0; i < len; i++)
+    {
+        h = (h ^ (uint8_t)text[i]) * 0x100000001b3ull;
+    }
+    char dir[600], exe[700], kept[710], building[720];
+    snprintf(dir, sizeof(dir), "%s/modal-run", tmp);
+    mkdir(dir, 0700);
+    snprintf(exe, sizeof(exe), "%s/%016llx", dir, (unsigned long long)h);
+    snprintf(kept, sizeof(kept), "%s.c", exe);
+    snprintf(building, sizeof(building), "%s.%ld", exe, (long)getpid());
+
+    size_t kept_len;
+    char *was = file_read(kept, &kept_len);
+    int hit = was && kept_len == len && memcmp(was, text, len) == 0 && access(exe, X_OK) == 0;
+    free(was);
+    if (!hit)
+    {
+        // Built under a name of its own, then renamed: a concurrent run never sees half a file.
+        int built = toolchain_build(toolchain, building, source);
+        if (built != 0)
+        {
+            remove(building);
+            free(text);
+            fprintf(stderr, "fatal: '%s' failed; the generated file was kept at %s\n", toolchain,
+                    source);
+            return 1;
+        }
+        if (!file_write(kept, text, len) || rename(building, exe) != 0)
+        {
+            remove(building);
+            remove(kept);
+            free(text);
+            fprintf(stderr, "fatal: cannot keep the built program in %s\n", dir);
+            return 1;
+        }
+    }
+    free(text);
     remove(source);
 
-    fflush(stdout);
-    fflush(stderr);
-    snprintf(cmd, sizeof(cmd), "'%s'", exe);
-    status = system(cmd);
-    remove(exe);
-    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+    char *argv[] = {exe, NULL};
+    int status = spawn_wait(argv);
+    if (status < 0)
+    {
+        fprintf(stderr, "fatal: cannot start '%s'\n", exe);
+        return 1;
+    }
+    return status;
 }
 
 int main(int argc, char **argv)
@@ -71,6 +189,7 @@ int main(int argc, char **argv)
     FILE *gen = NULL;
     const char *out_path = NULL;
     const Backend *backend = backend_default();
+    int backend_given = 0;
 
     for (int i = 1; i < argc; i++)
     {
@@ -90,6 +209,7 @@ int main(int argc, char **argv)
         else if ((strcmp(argv[i], "--backend") == 0 || strcmp(argv[i], "-b") == 0) && i + 1 < argc)
         {
             backend = backend_find(argv[++i]);
+            backend_given = 1;
             if (!backend)
             {
                 fprintf(stderr, "%s: unknown backend '%s'. Registered backends:\n", argv[0],
@@ -97,6 +217,22 @@ int main(int argc, char **argv)
                 backend_list(stderr);
                 return 2;
             }
+        }
+        else if (strcmp(argv[i], "--target") == 0 && i + 1 < argc)
+        {
+            const MachineTarget *t = target_find(argv[++i]);
+            if (!t)
+            {
+                fprintf(stderr, "%s: unknown target '%s'. Known targets:", argv[0], argv[i]);
+                for (int k = 0; targets[k]; k++)
+                {
+                    fprintf(stderr, " %s", targets[k]->name);
+                }
+                fprintf(stderr, "\n");
+                return 2;
+            }
+            target_set(t);
+            cx.target_given = 1;
         }
         else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc)
         {
@@ -137,6 +273,7 @@ int main(int argc, char **argv)
         else if (strcmp(argv[i], "--stats") == 0)
         {
             show_stats = 1;
+            cx.stats = 1;
         }
         else if (argv[i][0] == '-' || entry)
         {
@@ -151,6 +288,34 @@ int main(int argc, char **argv)
     {
         fprintf(stderr, "%s: fatal: no input files\n", argv[0]);
         return usage(argv[0]);
+    }
+    // A target is built by the native backend for its CPU; a native backend without a target
+    // builds for this system.
+    if (cx.target_given)
+    {
+        const char *cpu = cx.target->cpu == TCPU_X86_64 ? "x86_64" : "arm64";
+        if (!backend_given || strcmp(backend->name, "native") == 0)
+        {
+            backend = backend_find(cpu);
+        }
+        else if (strcmp(backend->name, cpu) != 0)
+        {
+            fprintf(stderr, "%s: fatal: target '%s' is built by the native backend, not '%s'\n",
+                    argv[0], cx.target->name, backend->name);
+            return 2;
+        }
+    }
+    else if (backend->executable)
+    {
+        target_set(target_find(strcmp(backend->name, "x86_64") == 0 ? "x86_64-macos"
+                               : strcmp(backend->name, "arm64") == 0 ? "arm64-macos"
+                                                                      : target_get()->name));
+    }
+    if (run && target_get()->os != TOS_MACOS)
+    {
+        fprintf(stderr, "%s: fatal: a %s executable cannot run on this machine; write it with -o\n",
+                argv[0], target_get()->name);
+        return 2;
     }
 
     // Diagnostics are buffered: unbuffered stderr makes every fprintf/fputc of a report its
@@ -167,12 +332,18 @@ int main(int argc, char **argv)
     cx.timing = (uint8_t)show_time;
 
     // Code generation is streamed while the program is checked, so the output is opened
-    // before the first file is read.
-    if (out_path || run)
+    // before the first file is read. `--run` with a backend that can run the program in this
+    // process writes no file at all.
+    const char *tmp = getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp";
+    int in_memory = run && !out_path && backend->can_run && backend->can_run();
+    if (in_memory)
+    {
+        codegen_start(backend, NULL, NULL);
+    }
+    else if (out_path || run)
     {
         if (run && !out_path)
         {
-            const char *tmp = getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp";
             if (!backend->toolchain && !backend->executable)
             {
                 fprintf(stderr, "fatal: backend '%s' has no toolchain to build with\n",
@@ -251,7 +422,11 @@ int main(int argc, char **argv)
     }
     modules_link();
 
-    if (gen)
+    if (in_memory)
+    {
+        codegen_finish();
+    }
+    else if (gen)
     {
         codegen_finish();
         uint64_t t = clock_ns();
@@ -304,33 +479,42 @@ int main(int argc, char **argv)
 
     int status = cx.errors > 0;
 
-    if (!status && run && !out_path)
+    if (!status && in_memory)
+    {
+        fflush(stdout);
+        fflush(stderr);
+        status = codegen_run(); // the program's output and status
+        if (status < 0)
+        {
+            fprintf(stderr, "fatal: the program could not be loaded into memory to run; write it "
+                            "with -o and start it\n");
+            status = 1;
+        }
+    }
+    else if (!status && run && !out_path)
     {
         if (backend->executable)
         {
             // The backend wrote the program itself: it only has to be started.
             chmod(gen_path, 0755);
-            fflush(stdout);
-            fflush(stderr);
-            char cmd[1100];
-            snprintf(cmd, sizeof(cmd), "'%s'", gen_path);
-            int ran = system(cmd);
+            char *argv[] = {gen_path, NULL};
+            status = spawn_wait(argv);
             remove(gen_path);
-            status = WIFEXITED(ran) ? WEXITSTATUS(ran) : 1;
+            if (status < 0)
+            {
+                fprintf(stderr, "fatal: cannot start '%s'\n", gen_path);
+                status = 1;
+            }
         }
         else
         {
-            status = build_and_run(backend, gen_path, exe_path); // the program's output and status
+            status = build_and_run(backend, gen_path, tmp); // the program's output and status
         }
     }
     else if (!status && out_path && backend->object)
     {
         const char *toolchain = getenv("CC") ? getenv("CC") : backend->toolchain;
-        char cmd[1600];
-        snprintf(cmd, sizeof(cmd), "%s -o '%s' '%s'", toolchain, out_path, gen_path);
-        fflush(stdout);
-        fflush(stderr);
-        status = system(cmd) != 0;
+        status = toolchain_build(toolchain, out_path, gen_path) != 0;
         remove(gen_path);
         if (status)
         {

@@ -52,21 +52,21 @@ NodeId parse_type(Parser *p)
         if (parser_consume(p, TOK_RBRACKET, "expected ']' (a slice type is written []T)"))
         {
             NodeId elem = parse_type(p);
-            type = elem ? node_new(u, AST_TYPE_SLICE, tok_idx(p, t), elem, 0, 0) : 0;
+            type = elem ? node_new(u, AST_TYPE_SLICE, tok_idx(p, t), elem, 0) : 0;
         }
         break;
     case TOK_STAR:
     {
         parser_advance(p);
         NodeId elem = parse_type(p);
-        type = elem ? node_new(u, AST_TYPE_PTR, tok_idx(p, t), elem, 0, 0) : 0;
+        type = elem ? node_new(u, AST_TYPE_PTR, tok_idx(p, t), elem, 0) : 0;
         break;
     }
     case TOK_STRUCT:
     {
         parser_advance(p);
         NodeId members = parse_struct_body(p);
-        type = p->panic ? 0 : node_new(u, AST_TYPE_STRUCT, tok_idx(p, t), members, 0, 0);
+        type = p->panic ? 0 : node_new(u, AST_TYPE_STRUCT, tok_idx(p, t), members, 0);
         break;
     }
     case TOK_IDENTIFIER:
@@ -80,7 +80,7 @@ NodeId parse_type(Parser *p)
             parser_advance(p);
             extra++;
         }
-        type = node_new(u, AST_TYPE_NAME, tok_idx(p, t), 0, 0, 0);
+        type = node_new(u, AST_TYPE_NAME, tok_idx(p, t), 0, 0);
         NODE(u, type)->aux = extra;
         break;
     }
@@ -103,8 +103,7 @@ NodeId parse_type(Parser *p)
 NodeId parse_params(Parser *p, int *has_self)
 {
     Unit *u = p->unit;
-    NodeList params = {0};
-    NodeId pending = 0; // first name still waiting for its type
+    int pending = -1; // first name still waiting for its type: an index in the list
     int index = 0;
 
     *has_self = 0;
@@ -112,6 +111,7 @@ NodeId parse_params(Parser *p, int *has_self)
     {
         return 0;
     }
+    NodeList params = list_begin();
     p->paren_depth++;
 
     while (p->current->kind != TOK_RPAREN && p->current->kind != TOK_EOF)
@@ -126,9 +126,9 @@ NodeId parse_params(Parser *p, int *has_self)
             t->kind == TOK_STAR || (t->kind == TOK_LBRACKET && t[1].kind == TOK_RBRACKET);
         if (type_first)
         {
-            if (pending)
+            if (pending >= 0)
             {
-                const Token *wait = TOK(u, NODE(u, pending)->tok);
+                const Token *wait = TOK(u, list_at(&params, (uint32_t)pending)->tok);
                 parser_error_at(p, wait,
                                 "parameter '%.*s' needs its type before a type-first parameter",
                                 wait->len, TSTART(wait));
@@ -157,8 +157,8 @@ NodeId parse_params(Parser *p, int *has_self)
                     parser_advance(p);
                 }
                 parser_advance(p);
-                NodeId param = node_new(u, AST_PARAM, tok_idx(p, lit), type, 0, 0);
-                NODE(u, param)->flags = AST_F_MUT | AST_F_PATTERN;
+                NodeId param = node_new(u, AST_PARAM, tok_idx(p, lit), type, 0);
+                NODE(u, param)->flags |= AST_F_MUT | AST_F_PATTERN;
                 NODE(u, param)->aux = (uint16_t)negative;
                 node_list_push(u, &params, param);
                 index++;
@@ -187,8 +187,8 @@ NodeId parse_params(Parser *p, int *has_self)
                                 name->len, TSTART(name), name->len, TSTART(name));
                 break;
             }
-            NodeId param = node_new(u, AST_PARAM, tok_idx(p, name), type, 0, 0);
-            NODE(u, param)->flags = AST_F_MUT;
+            NodeId param = node_new(u, AST_PARAM, tok_idx(p, name), type, 0);
+            NODE(u, param)->flags |= AST_F_MUT;
             node_list_push(u, &params, param);
             index++;
             if (!parser_match(p, TOK_COMMA))
@@ -204,9 +204,10 @@ NodeId parse_params(Parser *p, int *has_self)
             break;
         }
 
-        NodeId param = node_new(u, AST_PARAM, tok_idx(p, name), 0, 0, 0);
+        NodeId param = node_new(u, AST_PARAM, tok_idx(p, name), 0, 0);
         int is_self = is_self_token(TSTART(name), name->len);
         node_list_push(u, &params, param);
+        int mine = (int)params.count - 1; // the parameter is staged now: reached by index
 
         if (is_self)
         {
@@ -225,16 +226,16 @@ NodeId parse_params(Parser *p, int *has_self)
             {
                 break;
             }
-            NODE(u, param)->a = type;
-            for (NodeId id = pending; id && id != param; id = NODE(u, id)->next)
+            list_at(&params, (uint32_t)mine)->a = type;
+            for (int i = pending; i >= 0 && i < mine; i++)
             {
-                NODE(u, id)->a = type;
+                list_at(&params, (uint32_t)i)->a = type; // a type applies backwards
             }
-            pending = 0;
+            pending = -1;
         }
-        else if (!is_self && !pending)
+        else if (!is_self && pending < 0)
         {
-            pending = param;
+            pending = mine;
         }
 
         index++;
@@ -247,17 +248,20 @@ NodeId parse_params(Parser *p, int *has_self)
     p->paren_depth--;
     if (p->panic)
     {
+        list_abort(&params);
         return 0;
     }
-    if (pending)
+    if (pending >= 0)
     {
-        const Token *name = TOK(u, NODE(u, pending)->tok);
+        const Token *name = TOK(u, list_at(&params, (uint32_t)pending)->tok);
         parser_error_at(p, name, "parameter '%.*s' needs a type", name->len, TSTART(name));
+        list_abort(&params);
         return 0;
     }
     parser_consume(p, TOK_RPAREN, "expected ')' after the parameters");
+    NodeId head = list_finish(u, &params);
     // A parameter named exactly like its (simple) type is a context parameter.
-    for (NodeId id = params.head; id; id = NODE(u, id)->next)
+    for (NodeId id = head; id; id = NEXT(u, id))
     {
         AstNode *n = NODE(u, id);
         if (n->a && !(n->flags & AST_F_MUT) && NODE(u, n->a)->kind == AST_TYPE_NAME &&
@@ -270,7 +274,7 @@ NodeId parse_params(Parser *p, int *has_self)
             }
         }
     }
-    return params.head;
+    return head;
 }
 
 // Everything after the method name. `flags` carries AST_F_MUT for the type-first form, in
@@ -340,9 +344,10 @@ static NodeId parse_method(Parser *p, const Token *name, NodeId ret, uint8_t fla
         return 0;
     }
 
-    NodeId method = node_new(u, AST_METHOD_DECL, tok_idx(p, name), params, ret, body);
-    NODE(u, method)->flags =
+    NodeId method = node_new_fn(u, AST_METHOD_DECL, tok_idx(p, name), params, ret, body);
+    NODE(u, method)->flags |=
         (uint8_t)(flags | (has_self ? AST_F_SELF : 0) | (deferred ? AST_F_LAZY : 0));
+    NODE(u, NODE(u, method)->b)->flags |= deferred ? AST_F_LAZY : 0; // its signature node knows too
     return method;
 }
 
@@ -351,11 +356,30 @@ static NodeId parse_initializer(Parser *p)
     return parser_match(p, TOK_EQ) ? parse_expression(p) : 0;
 }
 
+// `@ n`: where a field (an offset) or a device (an address) is placed. 0 if there is no `@`.
+static NodeId parse_place(Parser *p)
+{
+    if (p->current->kind != TOK_AT || p->current->nl)
+    {
+        return 0;
+    }
+    parser_advance(p);
+    if (p->current->kind != TOK_NUMBER || p->current->nl)
+    {
+        parser_error_at(p, p->previous, "expected a number after '@': an offset or an address");
+        return 0;
+    }
+    NodeId n = node_new(p->unit, AST_NUMBER_LIT, tok_idx(p, p->current), 0, 0);
+    parser_advance(p);
+    return n;
+}
+
 // name: T    a, b: T    name: struct { ... }
-static NodeId parse_type_last(Parser *p)
+// The names go straight onto `into`: a grouped declaration is several elements of that list.
+static int parse_type_last(Parser *p, NodeList *into)
 {
     Unit *u = p->unit;
-    NodeList fields = {0};
+    uint32_t first = into->count;
     int count = 0;
 
     do
@@ -363,14 +387,16 @@ static NodeId parse_type_last(Parser *p)
         const Token *name = p->current;
         if (!parser_consume(p, TOK_IDENTIFIER, "expected a name"))
         {
+            list_truncate(into, first);
             return 0;
         }
-        node_list_push(u, &fields, node_new(u, AST_FIELD_DECL, tok_idx(p, name), 0, 0, 0));
+        node_list_push(u, into, node_new(u, AST_FIELD_DECL, tok_idx(p, name), 0, 0));
         count++;
     } while (parser_match(p, TOK_COMMA));
 
     if (!parser_consume(p, TOK_COLON, "expected ':' and a type after the name"))
     {
+        list_truncate(into, first);
         return 0;
     }
     if ((p->current->nl) || !type_starts_at(p->current))
@@ -379,6 +405,7 @@ static NodeId parse_type_last(Parser *p)
                         "expected a type after ':' on the same line (there are no `pub:` / "
                         "`mut:` sections: mutability is `T name`, exposure is declared in the "
                         "domain's mod.modal)");
+        list_truncate(into, first);
         return 0;
     }
 
@@ -388,31 +415,42 @@ static NodeId parse_type_last(Parser *p)
         NodeId members = parse_struct_body(p);
         if (p->panic)
         {
+            list_truncate(into, first);
             return 0;
         }
-        AstNode *decl = NODE(u, fields.head);
+        AstNode *decl = list_at(into, first);
         decl->kind = AST_STRUCT_DECL;
         decl->a = members;
-        return fields.head;
+        return 1;
     }
 
     NodeId type = parse_type(p);
     if (!type)
     {
+        list_truncate(into, first);
         return 0;
     }
-    NodeId init = parse_initializer(p);
+    NodeId place = parse_place(p);
+    if (place && count > 1)
+    {
+        parser_error_at(p, p->previous, "a placed field has one name: `name: T @ offset`");
+        list_truncate(into, first);
+        return 0;
+    }
+    NodeId init = place ? place : parse_initializer(p);
     if (p->panic)
     {
+        list_truncate(into, first);
         return 0;
     }
     // A grouped declaration shares one type (and initializer) node between its names.
-    for (NodeId id = fields.head; id; id = NODE(u, id)->next)
+    for (uint32_t i = first; i < into->count; i++)
     {
-        NODE(u, id)->a = type;
-        NODE(u, id)->b = init;
+        list_at(into, i)->a = type;
+        list_at(into, i)->b = init;
+        list_at(into, i)->flags |= place ? AST_F_PLACED : 0;
     }
-    return fields.head;
+    return 1;
 }
 
 // T name    T name(params) ...
@@ -442,13 +480,14 @@ static NodeId parse_type_first(Parser *p)
         return parse_method(p, name, type, AST_F_MUT);
     }
 
-    NodeId init = parse_initializer(p);
+    NodeId place = parse_place(p);
+    NodeId init = place ? place : parse_initializer(p);
     if (p->panic)
     {
         return 0;
     }
-    NodeId field = node_new(u, AST_FIELD_DECL, tok_idx(p, name), type, init, 0);
-    NODE(u, field)->flags = AST_F_MUT;
+    NodeId field = node_new(u, AST_FIELD_DECL, tok_idx(p, name), type, init);
+    NODE(u, field)->flags |= AST_F_MUT | (place ? AST_F_PLACED : 0);
     return field;
 }
 
@@ -463,7 +502,7 @@ NodeId parse_define(Parser *p)
     {
         return 0;
     }
-    return node_new(p->unit, AST_DEFINE, tok_idx(p, name), value, 0, 0);
+    return node_new(p->unit, AST_DEFINE, tok_idx(p, name), value, 0);
 }
 
 // items := item (',' item)*      item := IDENT [ 'as' IDENT ]
@@ -475,7 +514,6 @@ NodeId parse_define(Parser *p)
 NodeId parse_import_items(Parser *p, const Token *open)
 {
     Unit *u = p->unit;
-    NodeList items = {0};
 
     if (p->current->kind == TOK_RPAREN)
     {
@@ -483,6 +521,7 @@ NodeId parse_import_items(Parser *p, const Token *open)
         p->panic = 0;
         return 0;
     }
+    NodeList items = list_begin();
 
     while (p->current->kind != TOK_RPAREN && p->current->kind != TOK_EOF)
     {
@@ -492,12 +531,12 @@ NodeId parse_import_items(Parser *p, const Token *open)
         if (name->kind == TOK_IDENTIFIER)
         {
             parser_advance(p);
-            item = node_new(u, AST_IMPORT_ITEM, tok_idx(p, name), 0, 0, 0);
+            item = node_new(u, AST_IMPORT_ITEM, tok_idx(p, name), 0, 0);
             if (parser_match(p, TOK_AS))
             {
                 if (p->current->kind == TOK_IDENTIFIER)
                 {
-                    NODE(u, item)->c = tok_idx(p, p->current);
+                    NODE(u, item)->b = tok_idx(p, p->current); // the alias token (not staged yet)
                     parser_advance(p);
                 }
                 else
@@ -535,7 +574,7 @@ NodeId parse_import_items(Parser *p, const Token *open)
             break;
         }
     }
-    return items.head;
+    return list_finish(u, &items);
 }
 
 // val (a as b, c): import(x).y
@@ -570,19 +609,19 @@ static NodeId parse_val_decl(Parser *p)
         parser_error_at(p, val, "val (...) destructures an import: `val (a as b): import(x).y`");
         return 0;
     }
-    return node_new(u, AST_VAL_DECL, tok_idx(p, val), items, source, 0);
+    return node_new(u, AST_VAL_DECL, tok_idx(p, val), items, source);
 }
 
 // '{' member* '}' with ',', ';' or a newline between members.
 static NodeId parse_struct_body(Parser *p)
 {
     Unit *u = p->unit;
-    NodeList members = {0};
 
     if (!parser_consume(p, TOK_LBRACE, "expected '{' to open the struct body") || !parser_enter(p))
     {
         return 0;
     }
+    NodeList members = list_begin();
     int saved_paren_depth = p->paren_depth;
     p->paren_depth = 0;
 
@@ -593,13 +632,12 @@ static NodeId parse_struct_body(Parser *p)
             continue;
         }
 
-        NodeId member = parse_declaration(p, DECL_STRUCT);
+        parse_declaration(p, DECL_STRUCT, &members);
         if (p->panic)
         {
             parser_synchronize(p);
             continue;
         }
-        node_list_push(u, &members, member);
 
         TokenKind k = p->current->kind;
         if (k != TOK_RBRACE && k != TOK_COMMA && k != TOK_SEMICOLON && k != TOK_EOF &&
@@ -613,10 +651,28 @@ static NodeId parse_struct_body(Parser *p)
     p->paren_depth = saved_paren_depth;
     parser_leave(p);
     parser_consume(p, TOK_RBRACE, "expected '}' to close the struct");
-    return members.head;
+    return list_finish(u, &members);
 }
 
-NodeId parse_declaration(Parser *p, DeclContext ctx)
+static NodeId parse_declaration_one(Parser *p, DeclContext ctx);
+
+int parse_declaration(Parser *p, DeclContext ctx, NodeList *into)
+{
+    const Token *t = p->current;
+    if (t->kind == TOK_IDENTIFIER && (t[1].kind == TOK_COLON || t[1].kind == TOK_COMMA))
+    {
+        return parse_type_last(p, into);
+    }
+    NodeId decl = parse_declaration_one(p, ctx);
+    if (p->panic || !decl)
+    {
+        return 0;
+    }
+    node_list_push(p->unit, into, decl);
+    return 1;
+}
+
+static NodeId parse_declaration_one(Parser *p, DeclContext ctx)
 {
     const Token *t = p->current;
 
@@ -648,7 +704,7 @@ NodeId parse_declaration(Parser *p, DeclContext ctx)
             return parse_define(p);
         case TOK_COLON:
         case TOK_COMMA:
-            return parse_type_last(p);
+            return 0; // handled by parse_declaration
         case TOK_LPAREN:
             if (!(t[1].nl))
             {
