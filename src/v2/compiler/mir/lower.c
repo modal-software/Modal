@@ -560,6 +560,8 @@ static int c_variant(NodeId id)
     {
         return int_variant(u->types[id]);
     }
+    uint64_t bits;
+    int neg;
     switch (n->kind)
     {
     case AST_NUMBER_LIT:
@@ -567,6 +569,15 @@ static int c_variant(NodeId id)
         uint64_t v = literal_value(TOK(u, n->tok));
         return v <= 0x7fffffffu ? MV_I32 : v <= 0x7fffffffffffffffull ? MV_I64 : MV_U64;
     }
+    case AST_IDENT:
+    case AST_SELECTOR:
+        // an unsized constant: the variant a literal of its value has (-7 is an int, as `-7` is)
+        if (sema_unsized_value(u, id, &bits, &neg))
+        {
+            return neg ? ((int64_t)bits >= -0x80000000ll ? MV_I32 : MV_I64)
+                       : (bits <= 0x7fffffffu ? MV_I32 : bits <= 0x7fffffffffffffffull ? MV_I64 : MV_U64);
+        }
+        return MV_I32;
     case AST_PAREN_GROUP:
         return c_variant(n->a);
     case AST_UNARY_OP:
@@ -613,9 +624,11 @@ static BinPlan plan_binop(NodeId id)
     BinPlan p = {-1, -1, -1};
     for (size_t i = 0; i < sizeof(binops) / sizeof(binops[0]); i++)
     {
-        if (strlen(binops[i].text) == t->len && memcmp(binops[i].text, TSTART(t), t->len) == 0)
+        // (strncmp stops at the table text's end, so text[len] is in bounds when it matched)
+        if (strncmp(binops[i].text, TSTART(t), t->len) == 0 && binops[i].text[t->len] == '\0')
         {
             p.index = (int)i;
+            break;
         }
     }
     if (p.index < 0)
@@ -686,6 +699,11 @@ static int compute(int op, int v, uint64_t a, uint64_t b, uint64_t *out)
     }
 }
 
+int mir_compute(int op, int v, uint64_t a, uint64_t b, uint64_t *out)
+{
+    return compute(op, v, a, b, out);
+}
+
 // The value of an expression made of literals only, as the generated code would compute it.
 static int const_value(NodeId id, uint64_t *out)
 {
@@ -707,6 +725,16 @@ static int const_value(NodeId id, uint64_t *out)
     }
     case AST_PAREN_GROUP:
         return const_value(n->a, out);
+    case AST_CALL:
+    {
+        int v = u->types[id] == T_INT_LIT ? -1 : int_variant(u->types[id]);
+        if (!sema_sizeof(u, id, out))
+        {
+            return 0;
+        }
+        *out = v >= 0 ? mir_normalize(*out, v) : *out; // unsized, as a literal is
+        return 1;
+    }
     case AST_SELECTOR: // `util.limit`: a constant of another module
     case AST_IDENT:
     {
@@ -721,6 +749,19 @@ static int const_value(NodeId id, uint64_t *out)
         const AstNode *decl = NODE(home, SYM(s)->decl);
         NodeId init = decl->kind == AST_FIELD_DECL ? decl->b : decl->a;
         int v = int_variant(u->types[id]);
+        uint64_t computed;
+        int neg;
+        if (sema_unsized_value(u, id, &computed, &neg))
+        {
+            *out = computed; // unsized: what it meets converts it, as for a literal
+            return 1;
+        }
+        if (v >= 0 && !(decl->kind == AST_FIELD_DECL && (decl->flags & AST_F_MUT)) &&
+            sema_comptime_value(s, &computed)) // computed by the compiler (docs/comptime.md)
+        {
+            *out = mir_normalize(computed, v);
+            return 1;
+        }
         if (!init || NODE(home, init)->kind != AST_NUMBER_LIT || v < 0 ||
             (decl->kind == AST_FIELD_DECL && (decl->flags & AST_F_MUT)))
         {
@@ -1120,7 +1161,8 @@ int mir_next_helper(MirFunc *out)
         L.ret = T_VOID;
         L.has_self = 0;
         L.struct_abi = 1; // never inlined: it is the point of having it once
-        *out = (MirFunc){.u = L.u, .sym = sink_helpers[i].helper, .label = sink_labels[sink_helpers[i].kind]};
+        *out = (MirFunc){.u = L.u, .sym = sink_helpers[i].helper, .label = sink_labels[sink_helpers[i].kind],
+                         .param_slots = 2};
         sink_slot = 0;
         sink_put = put;
         int kind = sink_helpers[i].kind;
@@ -1319,6 +1361,31 @@ static uint32_t struct_slots(SymId s)
 }
 
 // Fields are where C puts them (sema/layout.c), read and written in their own width.
+// A field placed with `@`: a device register. Its loads and stores are marked MIR_MEM_DEVICE.
+static int field_is_register(SymId field)
+{
+    const Unit *home = &cx.units[SYM(field)->unit];
+    return SYM(field)->decl && (NODE(home, SYM(field)->decl)->flags & AST_F_PLACED) != 0;
+}
+
+static int struct_is_registers(TypeId t)
+{
+    if (type_kind(t) != T_STRUCT)
+    {
+        return 0;
+    }
+    SymId s = type_ref(t);
+    const Unit *home = &cx.units[SYM(s)->unit];
+    for (NodeId m = NODE(home, SYM(s)->decl)->a; m; m = NEXT(home, m))
+    {
+        if (NODE(home, m)->kind == AST_FIELD_DECL && (NODE(home, m)->flags & AST_F_PLACED))
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static uint64_t field_offset(SymId field)
 {
     return field_offset_of(field);
@@ -1342,6 +1409,21 @@ static void copy_slots(MirSlot dst, MirSlot src, uint32_t k)
         MirInst *c = inst(MIR_COPY);
         c->d = dst + j;
         c->a = src + j;
+    }
+}
+
+// A string or struct value the compiler computed (docs/comptime.md): its numbers as constants,
+// its strings as the program's own strings.
+static MirSlot computed_string(const ComptimeAggregate *c)
+{
+    return string_slot(c->str[0], c->len[0]);
+}
+
+static void computed_struct_into(const ComptimeAggregate *c, MirSlot dst)
+{
+    for (uint32_t j = 0; j < c->n; j++)
+    {
+        into(c->str[j] ? string_slot(c->str[j], c->len[j]) : emit_const(c->slots[j]), dst + j);
     }
 }
 
@@ -1371,6 +1453,7 @@ static void lower_struct_into(NodeId id, MirSlot dst)
         {
             MirInst *i = inst(MIR_LOAD);
             i->var = MV_U64;
+            i->sub = struct_is_registers(t) ? MIR_MEM_DEVICE : 0;
             i->d = dst + j;
             i->a = 0;
             i->imm = 8 * j;
@@ -1385,6 +1468,14 @@ static void lower_struct_into(NodeId id, MirSlot dst)
     if (n->kind == AST_CALL)
     {
         copy_slots(dst, lower_call(id), k); // the result is in the window: taken at once
+        return;
+    }
+    const ComptimeAggregate *computed = (n->kind == AST_IDENT || n->kind == AST_SELECTOR) && u->refs[id]
+                                            ? sema_comptime_aggregate(u->refs[id])
+                                            : NULL;
+    if (computed && computed->n == k)
+    {
+        computed_struct_into(computed, dst); // a module-level struct the compiler computed
         return;
     }
     unsupported(n->tok, "this struct value");
@@ -1420,6 +1511,19 @@ static MirSlot lower_struct_addr(NodeId id)
     return a->d;
 }
 
+// `file:line:col: assertion failed: <the condition as written>`, the message of a failed assert.
+int mir_assert_message(Unit *u, NodeId call, char *text, size_t cap)
+{
+    const AstNode *n = NODE(u, call);
+    const Token *open = TOK(u, NODE(u, n->a)->tok) + 1;
+    int line, col;
+    source_pos(u->src, TSTART(TOK(u, NODE(u, n->a)->tok)), &line, &col);
+    const char *from = TSTART(open) + 1, *to = open->match ? TSTART(TOK(u, open->match)) : from;
+    int k = snprintf(text, cap, "%s:%d:%d: assertion failed: %.*s\n", u->path, line, col, (int)(to - from), from);
+    return k < 0 ? 0 : k >= (int)cap ? (int)cap - 1 : k;
+}
+#define assert_message mir_assert_message
+
 static MirSlot lower_call(NodeId id)
 {
     Unit *u = L.u;
@@ -1431,6 +1535,26 @@ static MirSlot lower_call(NodeId id)
     if (callee->kind == AST_IDENT && TOK(u, callee->tok)->kind == TOK_WRITE)
     {
         return lower_output(n->b, 0, put);
+    }
+    uint64_t size;
+    if (sema_sizeof(u, id, &size))
+    {
+        return emit_const(size); // a constant of the target's layout
+    }
+    if (sema_is_assert(u, id))
+    {
+        // a run-time guard (docs/guards.md §2.2): the condition, then a trap with what failed
+        char text[600];
+        assert_message(u, id, text, sizeof(text));
+        MirSlot cond = lower_as(n->b, T_BOOL);
+        uint32_t ok = new_label();
+        MirInst *j = inst(MIR_JNZ);
+        j->a = cond;
+        j->imm = ok;
+        MirSlot m = string_slot((const uint8_t *)text, strlen(text));
+        inst(MIR_TRAP)->a = m;
+        place_label(ok);
+        return temp();
     }
     if (callee->kind == AST_IDENT && sema_is_std_print(u, u->refs[n->a]))
     {
@@ -1573,6 +1697,8 @@ static MirSlot lower_call(NodeId id)
     return r->d;
 }
 
+static void guard_divisor(MirSlot b, uint32_t tok);
+
 static MirSlot lower_binop(NodeId id)
 {
     Unit *u = L.u;
@@ -1638,6 +1764,10 @@ static MirSlot lower_binop(NodeId id)
     else
     {
         MirSlot b = lower_expr(right);
+        if (op == MB_DIV && !(const_value(right, &k) && mir_normalize(k, p.var) != 0))
+        {
+            guard_divisor(b, n->tok);
+        }
         i = inst(MIR_BIN);
         i->b = b;
     }
@@ -1654,6 +1784,25 @@ static MirSlot lower_binop(NodeId id)
         c->d = d;
     }
     return d;
+}
+
+// A divisor that may be zero: the program stops there, with the place, instead of doing what
+// the CPU does (0 on arm64, a fault on x86-64, undefined in C). The C backend says the same.
+static void guard_divisor(MirSlot b, uint32_t tok)
+{
+    Unit *u = L.u;
+    int line, col;
+    source_pos(u->src, TSTART(TOK(u, tok)), &line, &col);
+    char text[600];
+    int n = snprintf(text, sizeof(text), "%s:%d:%d: division by zero\n", u->path, line, col);
+    n = n < 0 ? 0 : n >= (int)sizeof(text) ? (int)sizeof(text) - 1 : n;
+    uint32_t ok = new_label();
+    MirInst *j = inst(MIR_JNZ);
+    j->a = b;
+    j->imm = ok;
+    MirSlot m = string_slot((const uint8_t *)text, (size_t)n);
+    inst(MIR_TRAP)->a = m;
+    place_label(ok);
 }
 
 static MirSlot lower_field_base(NodeId base, uint32_t tok, int *ok)
@@ -1713,6 +1862,7 @@ static MirSlot lower_expr(NodeId id)
             }
             MirInst *i = inst(MIR_LOAD);
             i->var = (uint8_t)mem_variant(field_type(s));
+            i->sub = field_is_register(s) ? MIR_MEM_DEVICE : 0;
             i->d = temp();
             i->a = 0;
             i->imm = field_offset(s);
@@ -1721,7 +1871,9 @@ static MirSlot lower_expr(NodeId id)
         NodeId ginit;
         if (is_global(s, &ginit))
         {
-            if (ginit && NODE(&cx.units[SYM(s)->unit], ginit)->kind != AST_NUMBER_LIT)
+            uint64_t computed;
+            if (ginit && NODE(&cx.units[SYM(s)->unit], ginit)->kind != AST_NUMBER_LIT &&
+                !sema_comptime_value(s, &computed) && !sema_comptime_aggregate(s))
             {
                 unsupported(n->tok, "a module-level variable whose initializer is not a literal");
                 return temp();
@@ -1746,6 +1898,11 @@ static MirSlot lower_expr(NodeId id)
             {
                 unsupported(n->tok, "a module-level variable");
                 return temp();
+            }
+            const ComptimeAggregate *computed = sema_comptime_aggregate(s);
+            if (computed && type == T_STR)
+            {
+                return computed_string(computed);
             }
             if (NODE(home, init)->kind != AST_STRING_LIT)
             {
@@ -1828,7 +1985,9 @@ static MirSlot lower_expr(NodeId id)
         NodeId sinit;
         if (is_global(member, &sinit)) // a module-level variable of another module
         {
-            if (sinit && NODE(&cx.units[SYM(member)->unit], sinit)->kind != AST_NUMBER_LIT)
+            uint64_t computed;
+            if (sinit && NODE(&cx.units[SYM(member)->unit], sinit)->kind != AST_NUMBER_LIT &&
+                !sema_comptime_value(member, &computed) && !sema_comptime_aggregate(member))
             {
                 unsupported(n->tok, "a module-level variable whose initializer is not a literal");
                 return temp();
@@ -1851,6 +2010,11 @@ static MirSlot lower_expr(NodeId id)
             {
                 return lower_string(TOK(home, NODE(home, init)->tok));
             }
+            const ComptimeAggregate *computed = sema_comptime_aggregate(member);
+            if (computed && u->types[id] == T_STR)
+            {
+                return computed_string(computed);
+            }
             unsupported(n->tok, "a module-level constant that is not a literal");
             return temp();
         }
@@ -1871,6 +2035,7 @@ static MirSlot lower_expr(NodeId id)
         }
         MirInst *i = inst(MIR_LOAD);
         i->var = (uint8_t)mem_variant(field_type(member));
+        i->sub = field_is_register(member) ? MIR_MEM_DEVICE : 0;
         i->d = temp();
         i->a = base;
         i->imm = field_offset(member);
@@ -1925,6 +2090,7 @@ static MirSlot lower_expr(NodeId id)
             }
             MirInst *i = inst(MIR_STORE);
             i->var = (uint8_t)mem_variant(field_type(s));
+            i->sub = field_is_register(s) ? MIR_MEM_DEVICE : 0;
             i->a = base;
             i->imm = field_offset(s);
             i->b = value;
@@ -1999,6 +2165,34 @@ static void lower_stmt(NodeId id)
         L.top = top + 1;
         return;
     }
+    case AST_FIELD_DECL: // a local with its type: its value converted to it, or zero
+    {
+        TypeId t = u->types[id];
+        if (is_struct(t))
+        {
+            uint32_t k = slots_of(t);
+            MirSlot slot = temp_n(k);
+            if (n->b)
+            {
+                lower_struct_into(n->b, slot);
+            }
+            else
+            {
+                for (uint32_t i = 0; i < k; i++)
+                {
+                    into(emit_const(0), slot + i);
+                }
+            }
+            push_local_n(token_name(TOK(u, n->tok)), slot, k);
+            L.top = top + k;
+            return;
+        }
+        MirSlot slot = temp();
+        into(n->b ? lower_as(n->b, t) : emit_const(0), slot);
+        push_local(token_name(TOK(u, n->tok)), slot);
+        L.top = top + 1;
+        return;
+    }
     case AST_RETURN:
         lower_return(n->a);
         L.top = top;
@@ -2038,7 +2232,23 @@ static void init_globals(void)
         }
         const Unit *home = &cx.units[SYM(s)->unit];
         uint64_t value = 0;
-        if (init)
+        uint64_t computed;
+        const ComptimeAggregate *text = init ? sema_comptime_aggregate(s) : NULL;
+        if (text && text->n == 1 && text->str[0]) // a string the compiler computed
+        {
+            MirSlot k = string_slot(text->str[0], text->len[0]);
+            MirInst *st = inst(MIR_GSTORE);
+            st->a = k;
+            st->imm = global_index(s);
+            L.top = k;
+            continue;
+        }
+        if (init && sema_comptime_value(s, &computed))
+        {
+            int v = int_variant(sema_value_type((Unit *)home, s));
+            value = v >= 0 ? mir_normalize(computed, v) : computed;
+        }
+        else if (init)
         {
             const AstNode *n = NODE(home, init);
             const Token *t = TOK(home, n->tok);
@@ -2057,10 +2267,11 @@ static void init_globals(void)
     }
 }
 
+static void region_start(void);
+
 int mir_lower(Unit *u, SymId fn, MirFunc *out)
 {
-    region_end(REGION_MIR); // reserves it on first use
-    region_set_end(REGION_MIR, cx.regions[REGION_MIR].base); // the previous function is done
+    region_start(); // the previous function is done
     const AstNode *n = fn_node(u, fn);
 
     L.u = u;
@@ -2112,6 +2323,7 @@ int mir_lower(Unit *u, SymId fn, MirFunc *out)
         }
     }
     uint32_t params_end = L.top;
+    out->param_slots = params_end;
     MirSlot next_slot = first_param;
     for (NodeId p = sema_fn_params(u, fn); p; p = NEXT(u, p))
     {
@@ -2186,6 +2398,10 @@ int mir_lower(Unit *u, SymId fn, MirFunc *out)
     }
 
     finish_frame(out);
+    if (L.errors == 0)
+    {
+        mir_optimize(out);
+    }
     keep_if_small(out); // a small body, kept to be spliced into later callers
     return L.errors == 0;
 }
@@ -2217,6 +2433,116 @@ static void finish_frame(MirFunc *out)
     }
 }
 
+// ---- compile time ---------------------------------------------------------------------------------
+
+// Lowering inside a lowering: the optimizer of one function asks the compiler to run a callee
+// (sema/comptime.c), which may lower it now. The function being optimized keeps its MIR (the
+// nested lowerings start after it in the region) and the lowering state comes back after.
+static const void *nest_base; // where a nested lowering starts (NULL: not nested)
+static Lower saved_L;
+
+int mir_nest_begin(void)
+{
+    if (nest_base)
+    {
+        return 0; // one level only
+    }
+    nest_base = region_end(REGION_MIR);
+    saved_L = L;
+    return 1;
+}
+
+// The region may move to a reservation of its own while a nested lowering grows it (what was
+// handed out before stays where it is): the nested start is then the new region's end.
+static int in_mir_region(const void *p)
+{
+    const Region *r = &cx.regions[REGION_MIR];
+    return (const char *)p >= r->base && (const char *)p <= r->base + r->used;
+}
+
+void mir_nest_end(void)
+{
+    L = saved_L;
+    if (in_mir_region(nest_base))
+    {
+        region_set_end(REGION_MIR, nest_base);
+    }
+    nest_base = NULL;
+}
+
+static void region_start(void)
+{
+    region_end(REGION_MIR); // reserves it on first use
+    if (nest_base && !in_mir_region(nest_base))
+    {
+        nest_base = region_end(REGION_MIR);
+    }
+    region_set_end(REGION_MIR, nest_base ? nest_base : cx.regions[REGION_MIR].base);
+}
+
+// The slots a call to fn fills: self, then each parameter (a struct takes several). From the
+// signature alone, so the optimizer can ask without lowering fn.
+uint32_t mir_param_slots(SymId fn)
+{
+    Unit *u = &cx.units[SYM(fn)->unit];
+    uint32_t k = SYM(fn)->owner != 0;
+    for (NodeId p = sema_fn_params(u, fn); p; p = NEXT(u, p))
+    {
+        k += slots_of(sema_param_type(u, fn, p));
+    }
+    return k;
+}
+
+// A fresh compilation in the same process (--repeat; the compiler lowers while checking now):
+// nothing kept from the last one.
+void mir_reset(void)
+{
+    inlinable = NULL;
+    inlinable_cap = 0;
+    global_of = NULL;
+    global_cap = 0;
+    nglobals = 0;
+    nsink_helpers = 0;
+    nest_base = NULL;
+}
+
+// A module-level initializer as a function of no parameters that returns it (in slot 0), for the
+// compiler to run (sema/comptime.c). The function `fn` it is lowered for names it in --mir.
+int mir_lower_expr(Unit *u, NodeId expr, TypeId type, SymId fn, MirFunc *out)
+{
+    region_start();
+    L.u = u;
+    L.f = out;
+    L.errors = 0;
+    L.top = L.max_top = L.perm = 0;
+    L.nlocals = 0;
+    L.ret = type;
+    L.has_self = 0;
+    L.struct_abi = 1; // never kept for inlining
+    *out = (MirFunc){.u = u, .sym = fn, .returns = 1, .ret_slots = slots_of(type), .label = "(compile time)"};
+    if (type == T_VOID) // a statement (`assert(...)`, a call): run for what it checks
+    {
+        out->ret_slots = 0;
+        out->returns = 0;
+        lower_expr(expr);
+        inst(MIR_RET);
+        finish_frame(out);
+        return L.errors == 0;
+    }
+    L.top = out->ret_slots; // from slot 0: the result
+    if (is_struct(type))
+    {
+        lower_struct_into(expr, 0);
+    }
+    else
+    {
+        into(lower_as(expr, type), 0);
+    }
+    inst(MIR_RET);
+    finish_frame(out);
+    return L.errors == 0;
+}
+
 // ---- --mir ----------------------------------------------------------------------------------------
 
 void mir_print(const MirFunc *f, FILE *out)
@@ -2224,6 +2550,7 @@ void mir_print(const MirFunc *f, FILE *out)
     static const char *const ops[MIR__COUNT] = {
         "const", "copy", "addr", "zero", "load", "store", "bin", "bini", "neg",
         "not",   "norm", "label", "jz",  "jnz",  "call",  "ret", "str",  "write", "gload", "gstore",
+        "trap",
     };
     static const char *const bins[MB__COUNT] = {"add", "sub", "mul", "div", "eq",
                                                 "ne",  "lt",  "le",  "gt",  "ge"};

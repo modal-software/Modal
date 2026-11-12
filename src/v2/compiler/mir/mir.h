@@ -49,8 +49,13 @@ typedef enum
     MIR_WRITE,  // write a, as `sub` (MirWrite)
     MIR_GLOAD,  // d = module-level variable imm
     MIR_GSTORE, // module-level variable imm = a
+    MIR_TRAP,   // end the program: a holds the address of its message (a division by zero)
     MIR__COUNT,
 } MirOp;
+
+// LOAD / STORE `sub`: a device register (a field placed with `@`). It is done exactly as written,
+// in its order: never forwarded, merged or removed, and nothing is moved across it.
+#define MIR_MEM_DEVICE 1
 
 typedef enum
 {
@@ -120,6 +125,7 @@ typedef struct MirFunc
     uint32_t frame_size; // slots before the call window
     uint8_t returns;     // has a result in slot 0
     uint32_t ret_slots;  // the slots the result takes (a struct: several; none: 0)
+    uint32_t param_slots; // slots 0 .. param_slots - 1 are the parameters, which the caller writes
     // Why it could not be lowered (mir_lower returned 0): the token and what is missing.
     uint32_t fail_tok;
     const char *fail_what;
@@ -130,11 +136,30 @@ typedef struct MirFunc
 // lowered yet. The function lives in its own region until the next call.
 int mir_lower(Unit *u, SymId fn, MirFunc *out);
 
+void mir_reset(void); // a fresh compilation: no kept bodies, globals or output routines
+
+// A module-level initializer as a function returning it (slot 0), for the compiler to run.
+int mir_lower_expr(Unit *u, NodeId expr, TypeId type, SymId fn, MirFunc *out);
+// A lowering inside a lowering (the optimizer runs a callee in the compiler): begin keeps the
+// current function's MIR and the lowering state, end gives them back. 0: already nested.
+uint32_t mir_param_slots(SymId fn); // the slots a call to fn fills (from its signature)
+int mir_nest_begin(void);
+void mir_nest_end(void);
+// The optimizer's question to the compiler (sema/comptime.c): run `fn` on these argument slots.
+// 1: it ran without effects; its result is in result[0 .. *nresult). 0: the call stays.
+int comptime_fold_call(SymId fn, const uint64_t *args, uint32_t nargs, uint64_t *result, uint32_t *nresult);
+uint32_t comptime_folded(void);    // calls the optimizer replaced by their result (--stats)
+int comptime_param_slots(SymId fn); // the argument slots fn takes, or -1 if it cannot be folded
+
 // Can this function be generated at all? (report: say why not)
 int mir_lowerable(Unit *u, SymId fn, int report);
 
 // Compile-time arithmetic in a variant, exactly as the generated code computes it.
 uint64_t mir_normalize(uint64_t v, int variant);
+// a <op> b in variant v, as the generated code computes it; 0 if it must not be folded.
+int mir_compute(int op, int v, uint64_t a, uint64_t b, uint64_t *out);
+// The optimizer (mir/opt.c): run by mir_lower on every function before it is kept or emitted.
+void mir_optimize(MirFunc *f);
 
 void mir_print(const MirFunc *f, FILE *out); // --mir
 
