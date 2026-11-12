@@ -264,12 +264,20 @@ static void emit_as(Emit *e, NodeId id, TypeId want)
 }
 
 // An integer literal too large for a long long is C's unsigned long long: printed unsigned.
+// An unsized constant (`n := 5`) is written as the literal of its value, so the same holds.
 static int literal_above_i64(const Unit *u, NodeId id)
 {
     const AstNode *n = NODE(u, id);
     while (n->kind == AST_PAREN_GROUP)
     {
+        id = n->a;
         n = NODE(u, n->a);
+    }
+    uint64_t bits;
+    int neg;
+    if ((n->kind == AST_IDENT || n->kind == AST_SELECTOR) && sema_unsized_value(u, id, &bits, &neg))
+    {
+        return !neg && bits > 0x7fffffffffffffffull;
     }
     if (n->kind != AST_NUMBER_LIT)
     {
@@ -361,12 +369,75 @@ static void emit_output(Emit *e, NodeId args, int newline, SymId sink)
 #undef OPEN
 }
 
+// Bytes as a C string literal: anything but letters, digits and spaces as an octal escape.
+static void put_c_bytes(Emit *e, const uint8_t *b, size_t n)
+{
+    char buf[8];
+    put_c(e, '"');
+    for (size_t i = 0; i < n; i++)
+    {
+        if ((b[i] >= 'a' && b[i] <= 'z') || (b[i] >= 'A' && b[i] <= 'Z') || (b[i] >= '0' && b[i] <= '9') ||
+            b[i] == ' ')
+        {
+            put_c(e, (char)b[i]);
+        }
+        else
+        {
+            snprintf(buf, sizeof(buf), "\\%03o", b[i]);
+            put(e, buf);
+        }
+    }
+    put_c(e, '"');
+}
+
+// An unsized constant (docs/comptime.md §3.1) where it is used: the literal of its value, so C
+// gives it the type it gives that literal.
+static int emit_unsized(Emit *e, NodeId id)
+{
+    uint64_t bits;
+    int neg;
+    if (!sema_unsized_value(e->u, id, &bits, &neg))
+    {
+        return 0;
+    }
+    char num[48];
+    if (neg)
+    {
+        snprintf(num, sizeof(num), "(-%lldll - 1)", (long long)~bits); // -2^63 too
+    }
+    else
+    {
+        snprintf(num, sizeof(num), bits > 0x7fffffffffffffffull ? "%lluu" : "%llu", (unsigned long long)bits);
+    }
+    put(e, num);
+    return 1;
+}
+
 static void emit_call(Emit *e, NodeId id)
 {
     Unit *u = e->u;
     const AstNode *n = NODE(u, id);
     const AstNode *callee = NODE(u, n->a);
     SymId fn = u->refs[id];
+    uint64_t size;
+    if (sema_sizeof(u, id, &size))
+    {
+        char num[32];
+        snprintf(num, sizeof(num), "%llu", (unsigned long long)size);
+        put(e, num);
+        return;
+    }
+    if (sema_is_assert(u, id))
+    {
+        char text[600];
+        int k = mir_assert_message(u, id, text, sizeof(text));
+        PUT(e, "((");
+        emit_expr(e, n->b);
+        PUT(e, ") ? (void)0 : m_trap(");
+        put_c_bytes(e, (const uint8_t *)text, (size_t)k);
+        PUT(e, "))");
+        return;
+    }
 
     SymId sink = (n->flags & AST_F_SINK) ? fn : 0;
     if (callee->kind == AST_IDENT && TOK(u, callee->tok)->kind == TOK_WRITE)
@@ -495,6 +566,9 @@ static void emit_expr(Emit *e, NodeId id)
             PUT(e, "self->"); // a bare member name, through implicit self
             out_tok(e, n->tok);
         }
+        else if (s && SYM(s)->kind == SYM_CONST && emit_unsized(e, id))
+        {
+        }
         else if (s && SYM(s)->kind == SYM_CONST)
         {
             PUT(e, "g_");
@@ -532,6 +606,15 @@ static void emit_expr(Emit *e, NodeId id)
             PUT(e, "self"); // &self: the reference itself
             break;
         }
+        if (t->kind == TOK_MINUS && type >= T_U8 && type <= T_INT) // wraps, as `0 - x` does
+        {
+            PUT(e, "((");
+            out_type(e, type, n->tok);
+            PUT(e, ")(0 - (uint64_t)(");
+            emit_expr(e, n->a);
+            PUT(e, ")))");
+            break;
+        }
         put_c(e, '(');
         put_c(e, *TSTART(t));
         emit_expr(e, n->a);
@@ -545,6 +628,49 @@ static void emit_expr(Emit *e, NodeId id)
             unsupported(e, n->tok, "an operator on strings");
         }
         // Arithmetic is done in the Modal type: u8 wraps at 256 at every step, as declared.
+        // `+ - *` are computed in uint64_t and converted back: that is the same wrap as the
+        // native code, where C's own arithmetic would be undefined on a signed overflow (and on
+        // u16 * u16, which C promotes to int).
+        int wraps = type >= T_U8 && type <= T_INT &&
+                    (t->kind == TOK_PLUS || t->kind == TOK_MINUS || t->kind == TOK_STAR);
+        if (wraps)
+        {
+            PUT(e, "((");
+            out_type(e, type, n->tok);
+            PUT(e, ")((uint64_t)(");
+            emit_expr(e, n->a);
+            PUT(e, ") ");
+            put_n(e, TSTART(t), t->len);
+            PUT(e, " (uint64_t)(");
+            emit_expr(e, n->b);
+            PUT(e, ")))");
+            break;
+        }
+        if (t->kind == TOK_SLASH && type >= T_U8 && type <= T_INT)
+        {
+            // A zero divisor stops the program with its place, as in the native code.
+            int line, col;
+            source_pos(u->src, TSTART(t), &line, &col);
+            PUT(e, "m_div_");
+            out_type(e, type, n->tok);
+            PUT(e, "(");
+            emit_expr(e, n->a);
+            PUT(e, ", ");
+            emit_expr(e, n->b);
+            PUT(e, ", \"");
+            for (const char *c = u->path; *c; c++)
+            {
+                if (*c == '"' || *c == '\\')
+                {
+                    put_c(e, '\\');
+                }
+                put_c(e, *c);
+            }
+            char pos[48];
+            snprintf(pos, sizeof(pos), ":%d:%d: division by zero\\n\")", line, col);
+            put(e, pos);
+            break;
+        }
         if (type >= T_U8 && type <= T_INT)
         {
             PUT(e, "((");
@@ -574,6 +700,10 @@ static void emit_expr(Emit *e, NodeId id)
     case AST_SELECTOR:
     {
         SymId member = u->refs[id];
+        if (member && SYM(member)->kind == SYM_CONST && emit_unsized(e, id))
+        {
+            break; // `util.limit`, an unsized constant of another module
+        }
         if (!member || SYM(member)->kind != SYM_FIELD)
         {
             unsupported(e, n->tok, "using a method as a value");
@@ -648,6 +778,22 @@ static void emit_stmt(Emit *e, NodeId id, TypeId ret)
         out_tok(e, n->tok);
         PUT(e, " = ");
         emit_as(e, n->a, u->types[id]);
+        PUT(e, ";\n");
+        return;
+    case AST_FIELD_DECL: // a local with its type: its value converted to it, or zero
+        out_indent(e);
+        out_type(e, u->types[id], n->tok);
+        PUT(e, " v_");
+        out_tok(e, n->tok);
+        PUT(e, " = ");
+        if (n->b)
+        {
+            emit_as(e, n->b, u->types[id]);
+        }
+        else
+        {
+            put(e, type_kind(u->types[id]) == T_STRUCT ? "{0}" : "0");
+        }
         PUT(e, ";\n");
         return;
     case AST_RETURN:
@@ -905,6 +1051,7 @@ static const char *const prelude =
     "#include <stddef.h>\n"
     "#include <stdint.h>\n"
     "#include <stdio.h>\n"
+    "#include <stdlib.h>\n"
     "\n"
     "typedef struct\n"
     "{\n"
@@ -920,6 +1067,13 @@ static const char *const prelude =
     "#endif\n"
     "\n"
     "M_RT void m_write_str(m_str s) { fwrite(s.ptr, 1, s.len, stdout); }\n"
+    // A trap: the output so far, then the place, then status 1 (as the native backends do).
+    "M_RT void m_trap(const char *m) { fflush(stdout); fputs(m, stderr); exit(1); }\n"
+    // Division: a zero divisor traps; the smallest signed value by -1 wraps (as `0 - x` does).
+    "#define M_DIV(T) M_RT T m_div_##T(T a, T b, const char *m) { if (!b) m_trap(m); \\\n"
+    "    if ((T)-1 < 0 && b == (T)-1) return (T)(0 - (uint64_t)a); return (T)(a / b); }\n"
+    "M_DIV(uint8_t) M_DIV(uint16_t) M_DIV(uint32_t) M_DIV(uint64_t)\n"
+    "M_DIV(int8_t) M_DIV(int16_t) M_DIV(int32_t) M_DIV(int64_t)\n"
     "M_RT void m_write_int(long long n) { printf(\"%lld\", n); }\n"
     "M_RT void m_write_uint(unsigned long long n) { printf(\"%llu\", n); }\n"
     "M_RT void m_write_bool(bool b) { fputs(b ? \"true\" : \"false\", stdout); }\n"
@@ -942,6 +1096,68 @@ static const char *const prelude =
 
 // One Emit for the whole job: it holds the output buffer between the three calls.
 static Emit emit_state;
+
+
+// A string or struct value the compiler computed (docs/comptime.md), as a C initializer: the
+// fields by name, a string as its bytes and length.
+static void emit_computed(Emit *e, const ComptimeAggregate *c, TypeId t, uint32_t off)
+{
+    char buf[64];
+    if (t == T_STR)
+    {
+        const uint8_t *b = c->str[off / 8];
+        uint32_t n = c->len[off / 8];
+        PUT(e, "{(const uint8_t *)\"");
+        for (uint32_t i = 0; i < n; i++)
+        {
+            snprintf(buf, sizeof(buf), "\\%03o", b[i]); // octal: never joins the next character
+            put(e, buf);
+        }
+        snprintf(buf, sizeof(buf), "\", %u}", n);
+        put(e, buf);
+        return;
+    }
+    if (type_kind(t) == T_STRUCT)
+    {
+        SymId st = type_ref(t);
+        Unit *home = &cx.units[SYM(st)->unit];
+        PUT(e, "{");
+        int first = 1;
+        for (NodeId m = NODE(home, SYM(st)->decl)->a; m; m = NEXT(home, m))
+        {
+            if (NODE(home, m)->kind != AST_FIELD_DECL)
+            {
+                continue;
+            }
+            const Token *field = TOK(home, NODE(home, m)->tok);
+            put(e, first ? "." : ", .");
+            first = 0;
+            put_n(e, TSTART(field), field->len);
+            PUT(e, " = ");
+            emit_computed(e, c, sema_type_of(home, NODE(home, m)->a, st), off + layout_member_offset(st, m));
+        }
+        PUT(e, "}");
+        return;
+    }
+    // a number or a bool: its bytes at off, little-endian in the slots
+    uint32_t size = type_layout(t).size;
+    uint64_t v = 0;
+    memcpy(&v, (const uint8_t *)c->slots + off, size > 8 ? 8 : size);
+    int is_signed = t == T_I8 || t == T_I16 || t == T_I32 || t == T_I64 || t == T_INT;
+    if (is_signed && size < 8 && (v >> (size * 8 - 1)) & 1)
+    {
+        v |= ~0ull << (size * 8);
+    }
+    if (is_signed && (int64_t)v < 0)
+    {
+        snprintf(buf, sizeof(buf), "(-%lldll - 1)", (long long)~v); // -2^63 too
+    }
+    else
+    {
+        snprintf(buf, sizeof(buf), "%lluull", (unsigned long long)v);
+    }
+    put(e, buf);
+}
 
 static void backend_c_begin(const BackendJob *job)
 {
@@ -998,6 +1214,10 @@ static void backend_c_begin(const BackendJob *job)
         SymId s = scope_find_token(u->scope, name);
         NodeId init = n->kind == AST_FIELD_DECL ? n->b : n->a;
         TypeId type = s ? sema_value_type(u, s) : T_NONE;
+        if (type == T_INT_LIT)
+        {
+            continue; // unsized: written as its value where it is used
+        }
         if (s && sema_device_address(s)) // a device: a constant reference to its registers
         {
             char at[48];
@@ -1012,11 +1232,30 @@ static void backend_c_begin(const BackendJob *job)
             continue;
         }
 
-        put(e, (n->kind == AST_DEFINE || !(n->flags & AST_F_MUT)) ? "static const " : "static ");
+        // A struct is not `const` in C: methods take its address as `self` (Modal keeps it
+        // immutable).
+        put(e, (n->kind == AST_DEFINE || !(n->flags & AST_F_MUT)) && type_kind(type) != T_STRUCT ? "static const "
+                                                                                              : "static ");
         out_type(e, type, n->tok);
         PUT(e, " g_");
         put_n(e, TSTART(name), name->len);
-        if (init)
+        uint64_t computed;
+        const ComptimeAggregate *agg = init && s ? sema_comptime_aggregate(s) : NULL;
+        if (agg)
+        {
+            PUT(e, " = ");
+            emit_computed(e, agg, type, 0);
+        }
+        else if (init && s && sema_comptime_value(s, &computed))
+        {
+            // computed by the compiler (docs/comptime.md): the number, in its type
+            char num[48];
+            PUT(e, " = (");
+            out_type(e, type, n->tok);
+            snprintf(num, sizeof(num), ")%lluull", (unsigned long long)computed);
+            put(e, num);
+        }
+        else if (init)
         {
             PUT(e, " = ");
             emit_expr(e, init);

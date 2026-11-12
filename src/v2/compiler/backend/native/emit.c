@@ -21,6 +21,7 @@
 #include "v2/compiler/backend/backend.h"
 #include "v2/compiler/backend/native/elf.h"
 #include "v2/compiler/backend/native/macho.h"
+#include "v2/compiler/backend/native/regalloc.h"
 #include "v2/compiler/backend/native/run.h"
 #include "v2/compiler/backend/native/stencil.h"
 #include "v2/compiler/mir/mir.h"
@@ -65,6 +66,9 @@ typedef struct
         size_t first_call;
         uint32_t frame; // value-stack slots of its frame (MirFunc.frame_size): callees start there
         uint32_t uses;  // slots it touches itself, inlined bodies in the window included
+        uint32_t saved; // bytes of registers it saves on the machine stack (generated with registers)
+        uint32_t call_frame; // machine-stack bytes each of its calls takes
+        uint64_t out;        // most bytes it writes to the system output itself (OUT_UNKNOWN)
     } *order;
     size_t norder, order_cap;
     MachoImportCall *externs; // calls to the C library
@@ -76,6 +80,17 @@ typedef struct
     Fixup *jumps; // branches of the function being emitted
     size_t njumps, jumps_cap;
     size_t labels[MAX_LABELS];
+
+    // `main` is a constant program: after the optimizer its MIR only writes constant text and
+    // returns a constant. Then the whole program is that text and that status (see const_entry).
+    int const_main;
+    uint8_t *const_text;
+    size_t const_len;
+    uint64_t const_status;
+
+    uint32_t regs_functions; // functions generated with registers (--stats)
+    uint32_t folded;         // functions dropped as identical to another (shake)
+    SymId main_sym;          // the entry's main (found once)
 } Native;
 
 static Native nat;
@@ -366,7 +381,7 @@ static void begin_range(SymId sym)
         nat.order = (struct FnRange *)region_grow_array(REGION_FNS, nat.order, sizeof(struct FnRange), &nat.order_cap,
                                                 nat.norder + 1);
     }
-    nat.order[nat.norder++] = (struct FnRange){sym, nat.len, nat.ncalls, 0, 0};
+    nat.order[nat.norder++] = (struct FnRange){sym, nat.len, nat.ncalls, 0, 0, 0, 0, 0};
 }
 
 // The function holding code offset `at`: an index in nat.order (they are in code order).
@@ -402,10 +417,136 @@ static size_t remap(void *list, size_t n, size_t stride, const uint8_t *keep, co
     return out;
 }
 
+// Identical-code folding (gold's and lld's --icf): two kept functions whose machine code is the
+// same byte for byte, with the same calls, runtime calls and C calls at the same places, are one
+// function. The later one is dropped and every call to it goes to the first. Returns, per
+// function, the one it became (SIZE_MAX: itself or dropped).
+typedef struct
+{
+    const Fixup *calls;
+    size_t ncalls;
+    size_t rt_lo, rt_hi;   // its runtime calls in nat.rtcalls
+    size_t ext_lo, ext_hi; // its C calls in nat.externs
+} FnFixups;
+
+static int same_function(size_t i, size_t j, const FnFixups *fx)
+{
+    const struct FnRange *a = &nat.order[i], *b = &nat.order[j];
+    size_t na = (i + 1 < nat.norder ? nat.order[i + 1].at : nat.len) - a->at;
+    size_t nb = (j + 1 < nat.norder ? nat.order[j + 1].at : nat.len) - b->at;
+    if (na != nb || fx[i].ncalls != fx[j].ncalls || fx[i].rt_hi - fx[i].rt_lo != fx[j].rt_hi - fx[j].rt_lo ||
+        fx[i].ext_hi - fx[i].ext_lo != fx[j].ext_hi - fx[j].ext_lo || memcmp(nat.code + a->at, nat.code + b->at, na) != 0)
+    {
+        return 0;
+    }
+    for (size_t k = 0; k < fx[i].ncalls; k++)
+    {
+        const Fixup *x = &fx[i].calls[k], *y = &fx[j].calls[k];
+        if (x->at - a->at != y->at - b->at || x->ref != y->ref || x->reloc != y->reloc || x->addend != y->addend)
+        {
+            return 0;
+        }
+    }
+    for (size_t k = 0; k < fx[i].rt_hi - fx[i].rt_lo; k++)
+    {
+        const Fixup *x = &nat.rtcalls[fx[i].rt_lo + k], *y = &nat.rtcalls[fx[j].rt_lo + k];
+        if (x->at - a->at != y->at - b->at || x->ref != y->ref)
+        {
+            return 0;
+        }
+    }
+    for (size_t k = 0; k < fx[i].ext_hi - fx[i].ext_lo; k++)
+    {
+        const MachoImportCall *x = &nat.externs[fx[i].ext_lo + k], *y = &nat.externs[fx[j].ext_lo + k];
+        if (x->at - a->at != y->at - b->at || x->sym != y->sym)
+        {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static size_t *fold_identical(uint8_t *keep)
+{
+    size_t nf = nat.norder;
+    size_t *alias = (size_t *)arena_alloc(nf * sizeof(size_t));
+    FnFixups *fx = (FnFixups *)arena_alloc(nf * sizeof(FnFixups));
+    size_t nbuckets = 1;
+    while (nbuckets < nf * 2)
+    {
+        nbuckets <<= 1;
+    }
+    size_t *bucket = (size_t *)arena_alloc(nbuckets * sizeof(size_t));
+    for (size_t b = 0; b < nbuckets; b++)
+    {
+        bucket[b] = SIZE_MAX;
+    }
+    size_t rt = 0, ext = 0;
+    for (size_t i = 0; i < nf; i++)
+    {
+        alias[i] = SIZE_MAX;
+        size_t at = nat.order[i].at, end = i + 1 < nf ? nat.order[i + 1].at : nat.len;
+        size_t c_end = i + 1 < nf ? nat.order[i + 1].first_call : nat.ncalls;
+        fx[i].calls = nat.calls ? nat.calls + nat.order[i].first_call : NULL;
+        fx[i].ncalls = c_end - nat.order[i].first_call;
+        while (rt < nat.nrtcalls && nat.rtcalls[rt].at < at)
+        {
+            rt++;
+        }
+        fx[i].rt_lo = rt;
+        while (rt < nat.nrtcalls && nat.rtcalls[rt].at < end)
+        {
+            rt++;
+        }
+        fx[i].rt_hi = rt;
+        while (ext < nat.nexterns && nat.externs[ext].at < at)
+        {
+            ext++;
+        }
+        fx[i].ext_lo = ext;
+        while (ext < nat.nexterns && nat.externs[ext].at < end)
+        {
+            ext++;
+        }
+        fx[i].ext_hi = ext;
+        if (!keep[i] || i + 1 == nf || !nat.order[i].sym)
+        {
+            continue; // the entry stays itself
+        }
+        uint64_t h = 1469598103934665603ull ^ (end - at);
+        for (size_t k = at; k < end; k++)
+        {
+            h = (h ^ nat.code[k]) * 1099511628211ull;
+        }
+        for (size_t k = 0; k < fx[i].ncalls; k++)
+        {
+            h = (h ^ fx[i].calls[k].ref) * 1099511628211ull;
+        }
+        size_t b = (size_t)(h ^ (h >> 29)) & (nbuckets - 1);
+        for (; bucket[b] != SIZE_MAX; b = (b + 1) & (nbuckets - 1))
+        {
+            if (same_function(bucket[b], i, fx))
+            {
+                break;
+            }
+        }
+        if (bucket[b] == SIZE_MAX)
+        {
+            bucket[b] = i;
+            continue;
+        }
+        alias[i] = bucket[b];
+        keep[i] = 0;
+        nat.folded++;
+    }
+    return alias;
+}
+
 // Dead-code elimination: only the functions the entry reaches, through calls, stay. They are
 // moved down over the ones dropped; branches inside a function are relative, so they move with it.
 static void shake(void)
 {
+    ArenaMark mark = arena_mark(); // its tables are its own
     size_t nf = nat.norder;
     uint8_t *keep = (uint8_t *)arena_alloc(nf);
     size_t *start = (size_t *)arena_alloc(nf * sizeof(size_t));
@@ -442,6 +583,8 @@ static void shake(void)
         }
     }
 
+    size_t *alias = fold_identical(keep);
+
     size_t to = nat.order[0].at;
     for (size_t i = 0; i < nf; i++)
     {
@@ -460,11 +603,12 @@ static void shake(void)
     {
         if (nat.order[i].sym)
         {
-            nat.fn_at[nat.order[i].sym] = keep[i] ? start[i] : NOT_EMITTED;
+            nat.fn_at[nat.order[i].sym] = keep[i] ? start[i] : alias[i] != SIZE_MAX ? start[alias[i]] : NOT_EMITTED;
         }
     }
     nat.entry_at = start[nf - 1];
     nat.len = to;
+    arena_release(mark);
 }
 
 // ---- the accumulator ------------------------------------------------------------------------------
@@ -480,6 +624,10 @@ enum
     V_R = 3,   // to acc
 };
 
+_Static_assert(ST_trap_a == ST_trap + 1 && ST_write_byte_a == ST_write_byte + 1 &&
+                   ST_write_str_a == ST_write_str + 1 && ST_write_uint_a == ST_write_uint + 1 &&
+                   ST_write_bool_a == ST_write_bool + 1,
+               "the _a forms do not follow their stencils");
 _Static_assert(ST_add_u8_a == ST_add_u8 + V_A && ST_add_u8_ar == ST_add_u8 + V_AR &&
                    ST_add_u8_r == ST_add_u8 + V_R && ST_norm_i64_r == ST_norm_i64 + V_R &&
                    ST_load_u8_r == ST_load_u8 + V_R && ST_copy_ar == ST_copy + V_AR &&
@@ -506,6 +654,8 @@ static int acc_operand(const MirInst *in)
         return 1;
     case MIR_WRITE:
         return in->sub != MW_SPACE && in->sub != MW_NL;
+    case MIR_TRAP:
+        return 1;
     case MIR_STORE:
         return 2;
     case MIR_GSTORE:
@@ -569,6 +719,7 @@ static int reads(const MirInst *in, MirSlot s, uint32_t frame_size)
     case MIR_JZ:
     case MIR_JNZ:
     case MIR_WRITE:
+    case MIR_TRAP:
     case MIR_GSTORE:
         return in->a == s;
     case MIR_CALL:
@@ -661,29 +812,1415 @@ static int to_acc(const MirFunc *f, size_t k)
     return 1;
 }
 
-static void emit_mir(const MirFunc *f)
+static uint32_t frame_bytes(const Stencil *s); // memory budgets, below
+
+// ---- registers --------------------------------------------------------------------------------
+//
+// A function whose slots got registers (regalloc.c) is generated instruction by instruction here:
+// each operation on registers or frame slots is encoded directly (one to four machine
+// instructions), and the stencils stay for what calls out: calls, output, traps, and division on
+// x86-64 (its idiv needs rax and rdx and faults on INT64_MIN / -1). A slot that got no register is
+// read and written in the frame at a short offset (`ldr x9, [x0, #s*8]`, `mov rax, [rdi + s*8]`).
+// The registers are those the C calling convention preserves, so every stencil and runtime call
+// keeps them; the function saves the ones it uses on entry and restores them at each return.
+// Scratch registers: arm64 x9-x11 (stencils pass only x0-x2 between them); x86-64 rax, rcx.
+// A value stays in its canonical form (the slot rule: zero- or sign-extended to 64 bits), so
+// arithmetic is done in 64 bits and the result is extended from its width again.
+
+static const uint8_t a64_regs[] = {19, 20, 21, 22, 23, 24, 25, 26, 27, 28};
+static const uint8_t x64_regs[] = {3, 14, 15, 5, 12, 13}; // rbx r14 r15 rbp r12 r13
+// Registers a call out does not keep, for values no call out crosses: nothing to save.
+static const uint8_t a64_scratch[] = {3, 4, 5, 6, 7, 8, 12, 13, 14, 15};
+static const uint8_t x64_scratch[] = {8, 9, 10, 11}; // r8-r11
+
+static RegAlloc ra;
+static int ra_saved; // registers the prologue saves (an even count: the stack stays aligned)
+// A leaf function that calls the runtime itself (output, traps) keeps f and c in the first two
+// preserved registers (arm64 x19 x20, x86-64 rbx r14), so a runtime call is a plain call with
+// nothing to save around it; its values use the preserved registers after those (ra_base = 2).
+// ra_lr: arm64 keeps the link register on the stack for the whole function (it calls out).
+static int ra_base, ra_lr;
+
+
+// The frame without the slots that live only in a register: ra_shift[s] is how many of those
+// are below slot s, which moves down by as much (blocks of slots never contain one, so they stay
+// whole; the call window moves down with the rest). NULL: the frame is as the MIR says.
+static uint32_t *ra_shift;
+static uint32_t ra_removed;
+
+static uint32_t H(MirSlot s)
 {
-    if (f->nlabels > MAX_LABELS)
+    MirSlot slot = s & RA_VIRTUAL ? ra_slot(&ra, s) : s; // a value split from a slot: the slot's place
+    if (!ra_shift)
     {
-        fatal("too many branches in one function");
+        return slot;
     }
-    fn_at_fit();
-    nat.fn_at[f->sym] = nat.len;
-    begin_range(f->sym);
-    nat.order[nat.norder - 1].frame = f->frame_size;
-    uint32_t uses = f->frame_size > f->ret_slots ? f->frame_size : f->ret_slots;
+    return slot - (slot < ra.norig ? ra_shift[slot] : ra_removed);
+}
+
+static int regs_count(void)
+{
+    return nat.arch->cpu == CPU_ARM64 ? (int)sizeof(a64_regs) : (int)sizeof(x64_regs);
+}
+
+static int scratch_count(void)
+{
+    return nat.arch->cpu == CPU_ARM64 ? (int)sizeof(a64_scratch) : (int)sizeof(x64_scratch);
+}
+
+// The machine register of slot s, or -1 when it is in the frame.
+static int R(MirSlot s)
+{
+    uint32_t n = ra_index(&ra, s);
+    if (n >= ra.nnames || ra.reg[n] == RA_NONE)
+    {
+        return -1;
+    }
+    int r = ra.reg[n], keep = regs_count() - ra_base;
+    if (nat.arch->cpu == CPU_ARM64)
+    {
+        return r < keep ? a64_regs[ra_base + r] : a64_scratch[r - keep];
+    }
+    return r < keep ? x64_regs[ra_base + r] : x64_scratch[r - keep];
+}
+
+// Does instruction `in` run a stencil or call out, which may change the scratch registers?
+static int clobbers(const MirInst *in)
+{
+    int x86 = nat.arch->cpu == CPU_X86_64;
+    switch (in->op)
+    {
+    case MIR_CALL:
+    case MIR_WRITE:
+        return 1;
+    case MIR_ZERO:
+        return in->imm > 16;
+    case MIR_BIN:
+    case MIR_BINI:
+        return x86 && in->sub == MB_DIV;
+    case MIR_LOAD:
+    case MIR_STORE:
+        return x86 && in->imm > 0x7fffffffull;
+    case MIR_GLOAD:
+    case MIR_GSTORE:
+        return x86 && in->imm > 0x0fffffffull;
+    default:
+        return 0; // a trap does not come back
+    }
+}
+
+static void push_jump(size_t at, uint8_t reloc, int8_t addend, uint32_t label)
+{
+    push_fixup(REGION_JUMPS, &nat.jumps, &nat.njumps, &nat.jumps_cap, (Fixup){at, reloc, addend, label});
+}
+
+// ---- arm64 ----
+
+static void a64_mov(int d, int n)
+{
+    if (d != n)
+    {
+        put32(0xaa0003e0u | (uint32_t)n << 16 | (uint32_t)d); // orr xd, xzr, xn
+    }
+}
+
+static void a64_imm(int d, uint64_t v)
+{
+    if (v == 0)
+    {
+        put32(0xd2800000u | (uint32_t)d); // movz xd, #0
+        return;
+    }
+    int zeros = 0, ones = 0;
+    for (int hw = 0; hw < 4; hw++)
+    {
+        uint32_t part = (uint32_t)(v >> (16 * hw)) & 0xffffu;
+        zeros += part == 0;
+        ones += part == 0xffffu;
+    }
+    int inverted = ones > zeros; // movn, then movk for the pieces that are not all ones
+    int first = 1;
+    for (int hw = 0; hw < 4; hw++)
+    {
+        uint32_t part = (uint32_t)(v >> (16 * hw)) & 0xffffu;
+        if (part == (inverted ? 0xffffu : 0u) && !(hw == 3 && first))
+        {
+            continue;
+        }
+        if (first)
+        {
+            uint32_t imm = inverted ? (~part & 0xffffu) : part;
+            put32((inverted ? 0x92800000u : 0xd2800000u) | (uint32_t)hw << 21 | imm << 5 | (uint32_t)d);
+            first = 0;
+        }
+        else
+        {
+            put32(0xf2800000u | (uint32_t)hw << 21 | part << 5 | (uint32_t)d); // movk
+        }
+    }
+}
+
+static void a64_ldr_slot(int t, MirSlot s)
+{
+    put32(0xf9400000u | H(s) << 10 | (uint32_t)t); // ldr xt, [x0, #s*8]
+}
+
+static void a64_str_slot(int t, MirSlot s)
+{
+    put32(0xf9000000u | H(s) << 10 | (uint32_t)t); // str xt, [x0, #s*8]
+}
+
+// The register holding slot s: its own, or `scratch` loaded from the frame.
+static int a64_src(MirSlot s, int scratch)
+{
+    int r = R(s);
+    if (r >= 0)
+    {
+        return r;
+    }
+    a64_ldr_slot(scratch, s);
+    return scratch;
+}
+
+static int a64_dst(MirSlot s, int scratch)
+{
+    int r = R(s);
+    return r >= 0 ? r : scratch;
+}
+
+static void a64_fin(MirSlot s, int r)
+{
+    if (R(s) < 0)
+    {
+        a64_str_slot(r, s);
+    }
+}
+
+// xd = xn extended from the width of `var` (ubfm / sbfm xd, xn, #0, #bits - 1).
+static void a64_norm(int d, int n, int var)
+{
+    static const uint8_t top[MV__COUNT] = {7, 15, 31, 63, 7, 15, 31, 63};
+    if (top[var] == 63)
+    {
+        a64_mov(d, n);
+        return;
+    }
+    put32((var >= MV_I8 ? 0x93400000u : 0xd3400000u) | (uint32_t)top[var] << 10 | (uint32_t)n << 5 | (uint32_t)d);
+}
+
+// cset xd for comparison `sub` in `var` (signed or unsigned conditions).
+static uint32_t a64_cond(int sub, int var);
+
+static void a64_cset(int d, int sub, int var)
+{
+    put32(0x9a9f07e0u | (a64_cond(sub, var) ^ 1u) << 12 | (uint32_t)d); // csinc xd, xzr, xzr, !cond
+}
+
+static int is_compare(int sub)
+{
+    return sub >= MB_EQ;
+}
+
+static uint32_t a64_cond(int sub, int var)
+{
+    static const uint8_t sgn[MB__COUNT] = {[MB_EQ] = 0, [MB_NE] = 1, [MB_LT] = 11, [MB_LE] = 13, [MB_GT] = 12, [MB_GE] = 10};
+    static const uint8_t uns[MB__COUNT] = {[MB_EQ] = 0, [MB_NE] = 1, [MB_LT] = 3, [MB_LE] = 9, [MB_GT] = 8, [MB_GE] = 2};
+    return var >= MV_I8 ? sgn[sub] : uns[sub];
+}
+
+// The flags of comparison `in` (cmp with a register, or an immediate when it fits).
+static void a64_compare(const MirInst *in)
+{
+    int lhs = a64_src(in->a, 9);
+    if (in->op == MIR_BINI)
+    {
+        uint64_t v = mir_normalize(in->imm, in->var);
+        int64_t sv = (int64_t)v;
+        if (v < 4096 || (sv < 0 && sv > -4096))
+        {
+            uint32_t k = (uint32_t)(sv >= 0 ? sv : -sv);
+            put32((sv >= 0 ? 0xf100001fu : 0xb100001fu) | k << 10 | (uint32_t)lhs << 5); // cmp / cmn
+            return;
+        }
+        a64_imm(10, v);
+        put32(0xeb00001fu | 10u << 16 | (uint32_t)lhs << 5);
+        return;
+    }
+    int rhs = a64_src(in->b, 10);
+    put32(0xeb00001fu | (uint32_t)rhs << 16 | (uint32_t)lhs << 5); // cmp xn, xm
+}
+
+// A comparison and the branch that is its only reader: cmp and b.cond (cbz / cbnz against 0).
+static void a64_compare_branch(const MirInst *cmp, const MirInst *br)
+{
+    int when_true = br->op == MIR_JNZ;
+    if (cmp->op == MIR_BINI && mir_normalize(cmp->imm, cmp->var) == 0 && (cmp->sub == MB_EQ || cmp->sub == MB_NE))
+    {
+        int r = a64_src(cmp->a, 9);
+        int nonzero = (cmp->sub == MB_NE) == when_true;
+        push_jump(nat.len, SR_BRANCH19, 0, (uint32_t)br->imm);
+        put32((nonzero ? 0xb5000000u : 0xb4000000u) | (uint32_t)r); // cbnz / cbz
+        return;
+    }
+    a64_compare(cmp);
+    uint32_t cond = a64_cond(cmp->sub, cmp->var) ^ (when_true ? 0u : 1u);
+    push_jump(nat.len, SR_BRANCH19, 0, (uint32_t)br->imm);
+    put32(0x54000000u | cond); // b.cond
+}
+
+static void a64_compare(const MirInst *in);
+
+static void a64_bin(const MirInst *in)
+{
+    if (is_compare(in->sub))
+    {
+        a64_compare(in);
+        int rd = a64_dst(in->d, 9);
+        a64_cset(rd, in->sub, in->var);
+        a64_fin(in->d, rd);
+        return;
+    }
+    int ra_ = a64_src(in->a, 9);
+    int rd = a64_dst(in->d, 9);
+    int rb;
+    if (in->op == MIR_BINI)
+    {
+        uint64_t v = mir_normalize(in->imm, in->var);
+        int64_t sv = (int64_t)v;
+        if ((in->sub == MB_ADD || in->sub == MB_SUB) && (v < 4096 || (sv < 0 && sv > -4096)))
+        {
+            int add = (in->sub == MB_ADD) == (sv >= 0);
+            uint32_t k = (uint32_t)(sv >= 0 ? sv : -sv);
+            put32((add ? 0x91000000u : 0xd1000000u) | k << 10 | (uint32_t)ra_ << 5 | (uint32_t)rd);
+            a64_norm(rd, rd, in->var);
+            a64_fin(in->d, rd);
+            return;
+        }
+        if (is_compare(in->sub) && (v < 4096 || (sv < 0 && sv > -4096)))
+        {
+            uint32_t k = (uint32_t)(sv >= 0 ? sv : -sv);
+            put32((sv >= 0 ? 0xf100001fu : 0xb100001fu) | k << 10 | (uint32_t)ra_ << 5); // cmp / cmn
+            a64_cset(rd, in->sub, in->var);
+            a64_fin(in->d, rd);
+            return;
+        }
+        a64_imm(10, v);
+        rb = 10;
+    }
+    else
+    {
+        rb = a64_src(in->b, 10);
+    }
+    uint32_t mnr = (uint32_t)rb << 16 | (uint32_t)ra_ << 5 | (uint32_t)rd;
+    switch (in->sub)
+    {
+    case MB_ADD:
+        put32(0x8b000000u | mnr);
+        break;
+    case MB_SUB:
+        put32(0xcb000000u | mnr);
+        break;
+    case MB_MUL:
+        put32(0x9b007c00u | mnr); // madd xd, xn, xm, xzr
+        break;
+    case MB_DIV:
+        // The divisor is not zero (MIR_TRAP came first). INT_MIN / -1 wraps in 64 bits (arm64
+        // does not trap), and the narrower types are extended back, as the stencils do.
+        put32((in->var >= MV_I8 ? 0x9ac00c00u : 0x9ac00800u) | mnr);
+        break;
+    default:
+        put32(0xeb00001fu | (uint32_t)rb << 16 | (uint32_t)ra_ << 5); // cmp xn, xm
+        a64_cset(rd, in->sub, in->var);
+        a64_fin(in->d, rd);
+        return;
+    }
+    a64_norm(rd, rd, in->var);
+    a64_fin(in->d, rd);
+}
+
+// The load / store instruction of a width (unsigned offset form), and its size.
+static uint32_t a64_mem_op(int var, int store, uint32_t *size)
+{
+    static const uint32_t ld[MV__COUNT] = {0x39400000u, 0x79400000u, 0xb9400000u, 0xf9400000u,
+                                           0x39800000u, 0x79800000u, 0xb9800000u, 0xf9400000u};
+    static const uint32_t st[4] = {0x39000000u, 0x79000000u, 0xb9000000u, 0xf9000000u};
+    *size = 1u << (var & 3);
+    return store ? st[var & 3] : ld[var];
+}
+
+static void a64_mem(const MirInst *in, int store)
+{
+    int base = a64_src(in->a, 9);
+    int t = store ? a64_src(in->b, 10) : a64_dst(in->d, 10);
+    uint32_t size;
+    uint32_t op = a64_mem_op(in->var, store, &size);
+    if (in->imm % size == 0 && in->imm / size < 4096)
+    {
+        put32(op | (uint32_t)(in->imm / size) << 10 | (uint32_t)base << 5 | (uint32_t)t);
+    }
+    else
+    {
+        a64_imm(11, in->imm);
+        put32(0x8b000000u | 11u << 16 | (uint32_t)base << 5 | 11u); // add x11, base, x11
+        put32(op | 11u << 5 | (uint32_t)t);
+    }
+    if (!store)
+    {
+        a64_fin(in->d, t);
+    }
+}
+
+static void a64_global(const MirInst *in, int store)
+{
+    put32(0xf9400000u | 2u << 10 | 1u << 5 | 9u); // ldr x9, [x1, #16]: c->globals
+    int t = store ? a64_src(in->a, 10) : a64_dst(in->d, 10);
+    if (in->imm < 4096)
+    {
+        put32((store ? 0xf9000000u : 0xf9400000u) | (uint32_t)in->imm << 10 | 9u << 5 | (uint32_t)t);
+    }
+    else
+    {
+        a64_imm(11, in->imm);
+        put32((store ? 0xf8207800u : 0xf8607800u) | 11u << 16 | 9u << 5 | (uint32_t)t); // [x9, x11, lsl 3]
+    }
+    if (!store)
+    {
+        a64_fin(in->d, t);
+    }
+}
+
+// ---- x86-64 ----
+
+static void xb(uint8_t b)
+{
+    put_bytes(&b, 1);
+}
+
+// An instruction with a register operand `reg` and an r/m operand: register `rm`, or [rm + disp]
+// when `mem`. `byte`: an 8-bit register operand (spl..dil need a REX prefix).
+static void x_op(int w, int p66, const char *op, int nop, int reg, int rm, int mem, int32_t disp, int byte)
+{
+    if (p66)
+    {
+        xb(0x66);
+    }
+    uint8_t rex = (uint8_t)(0x40 | (w ? 8 : 0) | (reg & 8 ? 4 : 0) | (rm & 8 ? 1 : 0));
+    if (rex != 0x40 || (byte && reg >= 4 && reg < 8))
+    {
+        xb(rex);
+    }
+    for (int i = 0; i < nop; i++)
+    {
+        xb((uint8_t)op[i]);
+    }
+    int r = reg & 7, low = rm & 7;
+    if (!mem)
+    {
+        xb((uint8_t)(0xc0 | r << 3 | low));
+        return;
+    }
+    if (disp == 0 && low != 5)
+    {
+        xb((uint8_t)(r << 3 | low));
+        if (low == 4)
+        {
+            xb(0x24);
+        }
+    }
+    else if (disp >= -128 && disp <= 127)
+    {
+        xb((uint8_t)(0x40 | r << 3 | low));
+        if (low == 4)
+        {
+            xb(0x24);
+        }
+        xb((uint8_t)disp);
+    }
+    else
+    {
+        xb((uint8_t)(0x80 | r << 3 | low));
+        if (low == 4)
+        {
+            xb(0x24);
+        }
+        put32((uint32_t)disp);
+    }
+}
+
+enum
+{
+    XAX = 0,
+    XCX = 1,
+    XDX = 2,
+    XSI = 6,
+    XDI = 7,
+};
+
+// op reg, slot (the slot's register or its place in the frame, [rdi + s*8]).
+static void x_slot(int w, const char *op, int nop, int reg, MirSlot s)
+{
+    int r = R(s);
+    if (r >= 0)
+    {
+        x_op(w, 0, op, nop, reg, r, 0, 0, 0);
+    }
+    else
+    {
+        x_op(w, 0, op, nop, reg, XDI, 1, (int32_t)(H(s) * 8), 0);
+    }
+}
+
+static void x_load(int reg, MirSlot s)
+{
+    if (R(s) != reg)
+    {
+        x_slot(1, "\x8b", 1, reg, s); // mov reg, slot
+    }
+}
+
+static void x_store(int reg, MirSlot s)
+{
+    int r = R(s);
+    if (r == reg)
+    {
+        return;
+    }
+    if (r >= 0)
+    {
+        x_op(1, 0, "\x89", 1, reg, r, 0, 0, 0); // mov r, reg
+    }
+    else
+    {
+        x_op(1, 0, "\x89", 1, reg, XDI, 1, (int32_t)(H(s) * 8), 0); // mov [rdi + s*8], reg
+    }
+}
+
+// The register holding slot s: its own, or `scratch` loaded from the frame.
+static int x_src(MirSlot s, int scratch)
+{
+    int r = R(s);
+    if (r >= 0)
+    {
+        return r;
+    }
+    x_load(scratch, s);
+    return scratch;
+}
+
+static void x_norm(int var)
+{
+    switch (var)
+    {
+    case MV_U8:
+        put_bytes("\x0f\xb6\xc0", 3); // movzx eax, al
+        break;
+    case MV_U16:
+        put_bytes("\x0f\xb7\xc0", 3); // movzx eax, ax
+        break;
+    case MV_U32:
+        put_bytes("\x89\xc0", 2); // mov eax, eax
+        break;
+    case MV_I8:
+        put_bytes("\x48\x0f\xbe\xc0", 4); // movsx rax, al
+        break;
+    case MV_I16:
+        put_bytes("\x48\x0f\xbf\xc0", 4); // movsx rax, ax
+        break;
+    case MV_I32:
+        put_bytes("\x48\x63\xc0", 3); // movsxd rax, eax
+        break;
+    default:
+        break;
+    }
+}
+
+static void x_imm(int reg, uint64_t v)
+{
+    if (v == 0)
+    {
+        x_op(0, 0, "\x31", 1, reg, reg, 0, 0, 0); // xor r32, r32
+    }
+    else if (v <= 0xffffffffull)
+    {
+        if (reg & 8)
+        {
+            xb(0x41);
+        }
+        xb((uint8_t)(0xb8 | (reg & 7))); // mov r32, imm32
+        put32((uint32_t)v);
+    }
+    else if ((int64_t)v >= INT32_MIN && (int64_t)v <= INT32_MAX)
+    {
+        x_op(1, 0, "\xc7", 1, 0, reg, 0, 0, 0); // mov r64, simm32
+        put32((uint32_t)v);
+    }
+    else
+    {
+        xb((uint8_t)(0x48 | (reg & 8 ? 1 : 0)));
+        xb((uint8_t)(0xb8 | (reg & 7))); // movabs
+        put_bytes(&v, 8);
+    }
+}
+
+static uint8_t x_cond(int sub, int var)
+{
+    static const uint8_t sgn[MB__COUNT] = {[MB_EQ] = 4, [MB_NE] = 5, [MB_LT] = 0xc, [MB_LE] = 0xe, [MB_GT] = 0xf, [MB_GE] = 0xd};
+    static const uint8_t uns[MB__COUNT] = {[MB_EQ] = 4, [MB_NE] = 5, [MB_LT] = 2, [MB_LE] = 6, [MB_GT] = 7, [MB_GE] = 3};
+    return var >= MV_I8 ? sgn[sub] : uns[sub];
+}
+
+static void x_setcc(int sub, int var)
+{
+    xb(0x0f);
+    xb((uint8_t)(0x90 | x_cond(sub, var))); // setcc al
+    xb(0xc0);
+    put_bytes("\x0f\xb6\xc0", 3); // movzx eax, al
+}
+
+static void x_load(int reg, MirSlot s);
+static void x_imm(int reg, uint64_t v);
+static void x_slot(int w, const char *op, int nop, int reg, MirSlot s);
+
+// The flags of comparison `in`: cmp lhs, rhs (an immediate when it fits 32 bits).
+static void x_compare(const MirInst *in)
+{
+    int lhs = R(in->a);
+    if (lhs < 0)
+    {
+        x_load(XAX, in->a);
+        lhs = XAX;
+    }
+    if (in->op == MIR_BINI)
+    {
+        int64_t sv = (int64_t)mir_normalize(in->imm, in->var);
+        if (sv >= INT32_MIN && sv <= INT32_MAX)
+        {
+            int small = sv >= -128 && sv <= 127;
+            x_op(1, 0, small ? "\x83" : "\x81", 1, 7, lhs, 0, 0, 0); // cmp lhs, imm
+            if (small)
+            {
+                xb((uint8_t)sv);
+            }
+            else
+            {
+                put32((uint32_t)sv);
+            }
+            return;
+        }
+        x_imm(XCX, (uint64_t)sv);
+        x_op(1, 0, "\x3b", 1, lhs, XCX, 0, 0, 0);
+        return;
+    }
+    x_slot(1, "\x3b", 1, lhs, in->b); // cmp lhs, b
+}
+
+static void x_compare_branch(const MirInst *cmp, const MirInst *br)
+{
+    int when_true = br->op == MIR_JNZ;
+    uint8_t cc;
+    if (cmp->op == MIR_BINI && mir_normalize(cmp->imm, cmp->var) == 0 && (cmp->sub == MB_EQ || cmp->sub == MB_NE) &&
+        R(cmp->a) >= 0)
+    {
+        x_op(1, 0, "\x85", 1, R(cmp->a), R(cmp->a), 0, 0, 0); // test r, r
+        cc = cmp->sub == MB_NE ? 5 : 4;
+    }
+    else
+    {
+        x_compare(cmp);
+        cc = x_cond(cmp->sub, cmp->var);
+    }
+    cc ^= when_true ? 0 : 1;
+    xb(0x0f);
+    xb((uint8_t)(0x80 | cc)); // jcc rel32
+    push_jump(nat.len, SR_REL32, -4, (uint32_t)br->imm);
+    put32(0);
+}
+
+// Spills the register operands an instruction reads to their frame places (before a stencil),
+// and reloads the register of the slot it wrote (after it).
+static void spill_reads(const MirInst *in)
+{
+    MirSlot r[2] = {in->a, in->b};
+    int n = in->op == MIR_BIN || in->op == MIR_STORE ? 2 : 1;
+    for (int k = 0; k < n; k++)
+    {
+        int reg = R(r[k]);
+        if (reg >= 0)
+        {
+            if (nat.arch->cpu == CPU_ARM64)
+            {
+                a64_str_slot(reg, r[k]);
+            }
+            else
+            {
+                x_op(1, 0, "\x89", 1, reg, XDI, 1, (int32_t)(H(r[k]) * 8), 0);
+            }
+        }
+    }
+}
+
+static void reload_write(MirSlot d)
+{
+    int reg = R(d);
+    if (reg >= 0)
+    {
+        if (nat.arch->cpu == CPU_ARM64)
+        {
+            a64_ldr_slot(reg, d);
+        }
+        else
+        {
+            x_op(1, 0, "\x8b", 1, reg, XDI, 1, (int32_t)(H(d) * 8), 0);
+        }
+    }
+}
+
+static void x_bin(const MirInst *in)
+{
+    if (in->sub == MB_DIV)
+    {
+        spill_reads(in);
+        if (in->op == MIR_BIN)
+        {
+            emit(st_bin[MB_DIV][in->var], H(in->d), H(in->a), H(in->b), 0, 0);
+        }
+        else
+        {
+            emit(st_bini[MB_DIV][in->var], H(in->d), H(in->a), in->imm, 0, 0);
+        }
+        reload_write(in->d);
+        return;
+    }
+    if (is_compare(in->sub))
+    {
+        x_compare(in);
+        x_setcc(in->sub, in->var);
+        x_store(XAX, in->d);
+        return;
+    }
+    x_load(XAX, in->a);
+    if (in->op == MIR_BINI)
+    {
+        uint64_t v = mir_normalize(in->imm, in->var);
+        int64_t sv = (int64_t)v;
+        static const uint8_t ext[MB__COUNT] = {[MB_ADD] = 0, [MB_SUB] = 5, [MB_EQ] = 7, [MB_NE] = 7, [MB_LT] = 7,
+                                               [MB_LE] = 7, [MB_GT] = 7, [MB_GE] = 7};
+        if (sv >= INT32_MIN && sv <= INT32_MAX)
+        {
+            int small = sv >= -128 && sv <= 127;
+            if (in->sub == MB_MUL)
+            {
+                x_op(1, 0, small ? "\x6b" : "\x69", 1, XAX, XAX, 0, 0, 0); // imul rax, rax, imm
+            }
+            else
+            {
+                x_op(1, 0, small ? "\x83" : "\x81", 1, ext[in->sub], XAX, 0, 0, 0); // add/sub/cmp rax, imm
+            }
+            if (small)
+            {
+                xb((uint8_t)sv);
+            }
+            else
+            {
+                put32((uint32_t)sv);
+            }
+        }
+        else
+        {
+            x_imm(XCX, v);
+            static const char *const ops[MB__COUNT] = {[MB_ADD] = "\x03", [MB_SUB] = "\x2b", [MB_MUL] = "\x0f\xaf",
+                                                       [MB_EQ] = "\x3b", [MB_NE] = "\x3b", [MB_LT] = "\x3b",
+                                                       [MB_LE] = "\x3b", [MB_GT] = "\x3b", [MB_GE] = "\x3b"};
+            x_op(1, 0, ops[in->sub], in->sub == MB_MUL ? 2 : 1, XAX, XCX, 0, 0, 0);
+        }
+    }
+    else
+    {
+        switch (in->sub)
+        {
+        case MB_ADD:
+            x_slot(1, "\x03", 1, XAX, in->b);
+            break;
+        case MB_SUB:
+            x_slot(1, "\x2b", 1, XAX, in->b);
+            break;
+        case MB_MUL:
+            x_slot(1, "\x0f\xaf", 2, XAX, in->b);
+            break;
+        default:
+            x_slot(1, "\x3b", 1, XAX, in->b); // cmp rax, b
+            break;
+        }
+    }
+    if (is_compare(in->sub))
+    {
+        x_setcc(in->sub, in->var);
+    }
+    else
+    {
+        x_norm(in->var);
+    }
+    x_store(XAX, in->d);
+}
+
+static void x_mem(const MirInst *in, int store)
+{
+    int base = x_src(in->a, XCX);
+    int32_t disp = (int32_t)in->imm;
+    if (!store)
+    {
+        int t = R(in->d) >= 0 ? R(in->d) : XAX;
+        switch (in->var)
+        {
+        case MV_U8:
+            x_op(0, 0, "\x0f\xb6", 2, t, base, 1, disp, 0);
+            break;
+        case MV_U16:
+            x_op(0, 0, "\x0f\xb7", 2, t, base, 1, disp, 0);
+            break;
+        case MV_U32:
+            x_op(0, 0, "\x8b", 1, t, base, 1, disp, 0);
+            break;
+        case MV_I8:
+            x_op(1, 0, "\x0f\xbe", 2, t, base, 1, disp, 0);
+            break;
+        case MV_I16:
+            x_op(1, 0, "\x0f\xbf", 2, t, base, 1, disp, 0);
+            break;
+        case MV_I32:
+            x_op(1, 0, "\x63", 1, t, base, 1, disp, 0);
+            break;
+        default:
+            x_op(1, 0, "\x8b", 1, t, base, 1, disp, 0);
+            break;
+        }
+        x_store(t, in->d);
+        return;
+    }
+    int v = x_src(in->b, XAX);
+    switch (in->var & 3)
+    {
+    case 0:
+        x_op(0, 0, "\x88", 1, v, base, 1, disp, 1);
+        break;
+    case 1:
+        x_op(0, 1, "\x89", 1, v, base, 1, disp, 0);
+        break;
+    case 2:
+        x_op(0, 0, "\x89", 1, v, base, 1, disp, 0);
+        break;
+    default:
+        x_op(1, 0, "\x89", 1, v, base, 1, disp, 0);
+        break;
+    }
+}
+
+// ---- both ----
+
+// arm64: the registers the prologue stores, in pairs: the preserved ones in use, then the link
+// register when the function calls out (with a spare preserved register to make the pair).
+static uint8_t a64_save[12];
+static int a64_nsave;
+
+static void a64_plan_save(void)
+{
+    int n = ra_base + ra.used;
+    a64_nsave = 0;
+    for (int i = 0; i < n; i++)
+    {
+        a64_save[a64_nsave++] = a64_regs[i];
+    }
+    if (ra_lr)
+    {
+        a64_save[a64_nsave++] = 30;
+    }
+    if (a64_nsave & 1)
+    {
+        a64_save[a64_nsave++] = n < (int)sizeof(a64_regs) ? a64_regs[n] : 29;
+    }
+}
+
+static void regs_prologue(void)
+{
+    if (nat.arch->cpu == CPU_ARM64)
+    {
+        for (int i = 0; i < a64_nsave; i += 2)
+        {
+            put32(0xa9bf03e0u | (uint32_t)a64_save[i + 1] << 10 | a64_save[i]); // stp, [sp, #-16]!
+        }
+    }
+    for (int i = 0; i < ra_saved && nat.arch->cpu != CPU_ARM64; i++)
+    {
+        if (x64_regs[i] & 8)
+        {
+            xb(0x41);
+        }
+        xb((uint8_t)(0x50 | (x64_regs[i] & 7))); // push
+    }
+    if (ra_base)
+    {
+        if (nat.arch->cpu == CPU_ARM64)
+        {
+            a64_mov(19, 0); // f
+            a64_mov(20, 1); // c
+        }
+        else
+        {
+            put_bytes("\x48\x89\xfb", 3); // mov rbx, rdi
+            put_bytes("\x49\x89\xf6", 3); // mov r14, rsi
+        }
+    }
+    for (MirSlot s = 0; s < ra.norig; s++)
+    {
+        if (ra.live_in[s] && R(s) >= 0)
+        {
+            reload_write(s);
+        }
+    }
+}
+
+// A runtime function called with c and a value (output, a trap): arm64 `mov x1, value;
+// mov x0, x20; bl`, x86-64 the same in rsi / rdi with the stack aligned for a C call; then f and
+// c are back in their registers for the code after it.
+static void regs_runtime_call(MirSlot value, uint32_t rt, int returns)
+{
+    if (nat.arch->cpu == CPU_ARM64)
+    {
+        int r = R(value);
+        if (r >= 0)
+        {
+            a64_mov(1, r);
+        }
+        else
+        {
+            a64_ldr_slot(1, value);
+        }
+        a64_mov(0, 20);
+        push_fixup(REGION_RTCALLS, &nat.rtcalls, &nat.nrtcalls, &nat.rtcalls_cap, (Fixup){nat.len, SR_BRANCH26, 0, rt});
+        put32(0x94000000u); // bl
+        if (returns)
+        {
+            a64_mov(0, 19);
+            a64_mov(1, 20);
+        }
+        return;
+    }
+    x_load(XSI, value);
+    put_bytes("\x4c\x89\xf7", 3); // mov rdi, r14
+    xb(0x50);                       // push rax: the stack aligned for the call
+    xb(0xe8);
+    push_fixup(REGION_RTCALLS, &nat.rtcalls, &nat.nrtcalls, &nat.rtcalls_cap, (Fixup){nat.len, SR_REL32, -4, rt});
+    put32(0);
+    if (returns)
+    {
+        xb(0x59);                       // pop rcx
+        put_bytes("\x48\x89\xdf", 3); // mov rdi, rbx
+        put_bytes("\x4c\x89\xf6", 3); // mov rsi, r14
+    }
+}
+
+static void regs_epilogue(const MirFunc *f)
+{
+    for (MirSlot s = 0; s < f->ret_slots; s++)
+    {
+        spill_reads(&(MirInst){.op = MIR_COPY, .a = s});
+    }
+    for (int i = a64_nsave - 2; i >= 0 && nat.arch->cpu == CPU_ARM64; i -= 2)
+    {
+        put32(0xa8c103e0u | (uint32_t)a64_save[i + 1] << 10 | a64_save[i]); // ldp, [sp], #16
+    }
+    for (int i = ra_saved - 2; i >= 0 && nat.arch->cpu != CPU_ARM64; i -= 2)
+    {
+        {
+            for (int k = i + 1; k >= i; k--)
+            {
+                if (x64_regs[k] & 8)
+                {
+                    xb(0x41);
+                }
+                xb((uint8_t)(0x58 | (x64_regs[k] & 7))); // pop
+            }
+        }
+    }
+    if (nat.arch->cpu == CPU_ARM64)
+    {
+        put32(0xd65f03c0u); // ret
+    }
+    else
+    {
+        xb(0xc3);
+    }
+}
+
+// A string: its length and bytes in the code, after the instruction that takes its address.
+static void regs_string(const MirInst *in, const MirString *str)
+{
+    size_t data = 8 + str->len;
+    size_t padded = (data + 3) & ~(size_t)3;
+    int r = R(in->d);
+    if (nat.arch->cpu == CPU_ARM64)
+    {
+        int t = r >= 0 ? r : 9;
+        uint32_t off = r >= 0 ? 8 : 12;
+        put32(0x10000000u | (off >> 2) << 5 | (uint32_t)t); // adr t, data
+        a64_fin(in->d, t);
+        put32(0x14000000u | (uint32_t)((4 + padded) / 4)); // b over the data
+    }
+    else
+    {
+        int t = r >= 0 ? r : XAX;
+        xb((uint8_t)(0x48 | (t & 8 ? 4 : 0)));
+        xb(0x8d);
+        xb((uint8_t)(0x05 | (t & 7) << 3)); // lea t, [rip + disp]
+        size_t disp_at = nat.len;
+        put32(0);
+        x_store(t, in->d);
+        xb(0xe9); // jmp over the data
+        put32((uint32_t)padded);
+        set32(disp_at, (uint32_t)(nat.len - (disp_at + 4)));
+    }
+    uint64_t len = str->len;
+    put_bytes(&len, 8);
+    put_bytes(str->bytes, str->len);
+    static const uint8_t zero[4] = {0};
+    put_bytes(zero, padded - data);
+}
+
+// A call: the callee's frame is this one's window, so f moves up by the frame for the call and
+// back after it (the callee returns with f and c as it got them: every stencil passes them on).
+// arm64 keeps the link register on the stack; x86-64 keeps the stack aligned for the callee.
+static void regs_call(const MirFunc *f, SymId callee)
+{
+    uint32_t off = H(f->frame_size) * 8;
+    if (nat.arch->cpu == CPU_ARM64)
+    {
+        if (!ra_lr)
+        {
+            put32(0xf81f0ffeu); // str x30, [sp, #-16]!
+        }
+        if (off < 4096)
+        {
+            put32(0x91000000u | off << 10); // add x0, x0, #off
+        }
+        else
+        {
+            a64_imm(16, off);
+            put32(0x8b100000u); // add x0, x0, x16
+        }
+        push_fixup(REGION_CALLS, &nat.calls, &nat.ncalls, &nat.calls_cap, (Fixup){nat.len, SR_BRANCH26, 0, callee});
+        put32(0x94000000u); // bl callee
+        if (off < 4096)
+        {
+            put32(0xd1000000u | off << 10); // sub x0, x0, #off
+        }
+        else
+        {
+            a64_imm(16, off);
+            put32(0xcb100000u); // sub x0, x0, x16
+        }
+        if (!ra_lr)
+        {
+            put32(0xf84107feu); // ldr x30, [sp], #16
+        }
+        return;
+    }
+    xb(0x50); // push rax: the callee starts with the stack as a call leaves it
+    int small = off <= 127;
+    put_bytes(small ? "\x48\x83\xc7" : "\x48\x81\xc7", 3); // add rdi, off
+    if (small)
+    {
+        xb((uint8_t)off);
+    }
+    else
+    {
+        put32(off);
+    }
+    xb(0xe8); // call callee
+    push_fixup(REGION_CALLS, &nat.calls, &nat.ncalls, &nat.calls_cap, (Fixup){nat.len, SR_REL32, -4, callee});
+    put32(0);
+    put_bytes(small ? "\x48\x83\xef" : "\x48\x81\xef", 3); // sub rdi, off
+    if (small)
+    {
+        xb((uint8_t)off);
+    }
+    else
+    {
+        put32(off);
+    }
+    xb(0x59); // pop rcx
+}
+
+// An instruction whose operand is read by a stencil from acc (its _a form) when it is in a
+// register: rdx / x2 is acc.
+static void to_acc_reg(int reg)
+{
+    if (nat.arch->cpu == CPU_ARM64)
+    {
+        a64_mov(2, reg);
+    }
+    else
+    {
+        x_op(1, 0, "\x89", 1, reg, XDX, 0, 0, 0); // mov rdx, reg
+    }
+}
+
+// Which slots keep their place in the frame: those in no register, the parameters (the caller
+// writes them there) and the result (the caller reads it there), and on x86-64 the operands of
+// an instruction done by a stencil from the frame (division). The others are dropped from it.
+static void plan_homes(const MirFunc *f)
+{
+    ra_shift = NULL;
+    ra_removed = 0;
+    if (f->param_slots == UINT32_MAX)
+    {
+        return;
+    }
+    uint8_t *need = (uint8_t *)arena_alloc(ra.norig + 1);
+    memset(need, 0, ra.norig + 1);
+    for (size_t k = 0; k < f->n && nat.arch->cpu == CPU_X86_64; k++)
+    {
+        const MirInst *in = &ra.code[k];
+        if (clobbers(in) && in->op != MIR_CALL && in->op != MIR_WRITE && in->op != MIR_ZERO)
+        {
+            MirSlot s[3] = {in->d, in->a, in->b};
+            for (int i = 0; i < 3; i++)
+            {
+                MirSlot slot = ra_slot(&ra, s[i]);
+                if (slot < ra.norig)
+                {
+                    need[slot] = 1;
+                }
+            }
+        }
+    }
+    uint32_t keep = f->param_slots > f->ret_slots ? f->param_slots : f->ret_slots;
+    ra_shift = (uint32_t *)arena_alloc((ra.norig + 1) * sizeof(uint32_t));
+    for (MirSlot s = 0; s < ra.norig; s++)
+    {
+        ra_shift[s] = ra_removed;
+        if (s >= keep && !ra.home[s] && !need[s] && !ra.live_in[s])
+        {
+            ra_removed++;
+        }
+    }
+    ra_shift[ra.norig] = ra_removed;
+}
+
+static void emit_regs(const MirFunc *f)
+{
+    nat.njumps = 0;
+    for (uint32_t i = 0; i < f->nlabels; i++)
+    {
+        nat.labels[i] = NOT_EMITTED;
+    }
+    ra_saved = (ra_base + ra.used + 1) & ~1;
+    a64_plan_save();
+    plan_homes(f);
+    regs_prologue();
+    int arm = nat.arch->cpu == CPU_ARM64;
     for (size_t k = 0; k < f->n; k++)
     {
-        const MirInst *in = &f->code[k];
-        uint32_t top = in->d > in->a ? in->d : in->a;
-        top = in->b > top ? in->b : top;
-        if (in->op == MIR_ZERO || in->op == MIR_ADDR)
+        const MirInst *in = &ra.code[k];
+        if (ra.fused[k])
         {
-            top = in->a + (uint32_t)in->imm > top ? in->a + (uint32_t)in->imm - 1 : top;
+            if (arm)
+            {
+                a64_compare_branch(in, &ra.code[k + 1]);
+            }
+            else
+            {
+                x_compare_branch(in, &ra.code[k + 1]);
+            }
+            k++;
+            continue;
         }
-        uses = top + 1 > uses ? top + 1 : uses;
+        switch (in->op)
+        {
+        case MIR_CONST:
+        {
+            uint64_t v = in->imm;
+            if (arm)
+            {
+                if (v == 0 && R(in->d) < 0)
+                {
+                    a64_str_slot(31, in->d); // str xzr
+                    break;
+                }
+                int t = a64_dst(in->d, 9);
+                a64_imm(t, v);
+                a64_fin(in->d, t);
+            }
+            else if (R(in->d) >= 0)
+            {
+                x_imm(R(in->d), v);
+            }
+            else if ((int64_t)v >= INT32_MIN && (int64_t)v <= INT32_MAX)
+            {
+                x_op(1, 0, "\xc7", 1, 0, XDI, 1, (int32_t)(H(in->d) * 8), 0); // mov qword [rdi + d], simm32
+                put32((uint32_t)v);
+            }
+            else
+            {
+                x_imm(XAX, v);
+                x_store(XAX, in->d);
+            }
+            break;
+        }
+        case MIR_COPY:
+            if (in->d == in->a)
+            {
+                break;
+            }
+            if (arm)
+            {
+                int rd = R(in->d);
+                if (rd >= 0)
+                {
+                    int s = a64_src(in->a, rd);
+                    a64_mov(rd, s);
+                }
+                else
+                {
+                    a64_str_slot(a64_src(in->a, 9), in->d);
+                }
+            }
+            else
+            {
+                int rd = R(in->d);
+                if (rd >= 0)
+                {
+                    x_load(rd, in->a);
+                }
+                else
+                {
+                    x_store(x_src(in->a, XAX), in->d);
+                }
+            }
+            break;
+        case MIR_ADDR:
+            if (arm)
+            {
+                int t = a64_dst(in->d, 9);
+                uint32_t off = H(in->a) * 8;
+                if (off < 4096)
+                {
+                    put32(0x91000000u | off << 10 | (uint32_t)t); // add t, x0, #off
+                }
+                else
+                {
+                    a64_imm(10, off);
+                    put32(0x8b0a0000u | (uint32_t)t); // add t, x0, x10
+                }
+                a64_fin(in->d, t);
+            }
+            else
+            {
+                int t = R(in->d) >= 0 ? R(in->d) : XAX;
+                x_op(1, 0, "\x8d", 1, t, XDI, 1, (int32_t)(H(in->a) * 8), 0); // lea t, [rdi + a*8]
+                x_store(t, in->d);
+            }
+            break;
+        case MIR_ZERO:
+            if (in->imm > 16)
+            {
+                emit(ST_zero, H(in->a), in->imm, 0, 0, 0);
+                break;
+            }
+            if (!arm)
+            {
+                put_bytes("\x31\xc0", 2); // xor eax, eax
+            }
+            for (uint64_t i = 0; i < in->imm; i++)
+            {
+                if (arm)
+                {
+                    a64_str_slot(31, in->a + (MirSlot)i);
+                }
+                else
+                {
+                    x_store(XAX, in->a + (MirSlot)i);
+                }
+            }
+            break;
+        case MIR_LOAD:
+        case MIR_STORE:
+            if (arm)
+            {
+                a64_mem(in, in->op == MIR_STORE);
+            }
+            else if (in->imm > 0x7fffffffull)
+            {
+                spill_reads(in);
+                if (in->op == MIR_LOAD)
+                {
+                    emit(st_load[in->var], H(in->d), H(in->a), in->imm, 0, 0);
+                    reload_write(in->d);
+                }
+                else
+                {
+                    emit(st_store[in->var], H(in->a), in->imm, H(in->b), 0, 0);
+                }
+            }
+            else
+            {
+                x_mem(in, in->op == MIR_STORE);
+            }
+            break;
+        case MIR_BIN:
+        case MIR_BINI:
+            if (arm)
+            {
+                a64_bin(in);
+            }
+            else
+            {
+                x_bin(in);
+            }
+            break;
+        case MIR_NEG:
+        case MIR_NOT:
+        case MIR_NORM:
+            if (arm)
+            {
+                int s = a64_src(in->a, 9);
+                int t = a64_dst(in->d, 9);
+                if (in->op == MIR_NEG)
+                {
+                    put32(0xcb0003e0u | (uint32_t)s << 16 | (uint32_t)t); // neg
+                    a64_norm(t, t, in->var);
+                }
+                else if (in->op == MIR_NOT)
+                {
+                    put32(0xf100001fu | (uint32_t)s << 5); // cmp s, #0
+                    a64_cset(t, MB_EQ, MV_U64);
+                }
+                else
+                {
+                    a64_norm(t, s, in->var);
+                }
+                a64_fin(in->d, t);
+            }
+            else
+            {
+                x_load(XAX, in->a);
+                if (in->op == MIR_NEG)
+                {
+                    put_bytes("\x48\xf7\xd8", 3); // neg rax
+                    x_norm(in->var);
+                }
+                else if (in->op == MIR_NOT)
+                {
+                    put_bytes("\x48\x85\xc0", 3); // test rax, rax
+                    x_setcc(MB_EQ, MV_U64);
+                }
+                else
+                {
+                    x_norm(in->var);
+                }
+                x_store(XAX, in->d);
+            }
+            break;
+        case MIR_LABEL:
+            nat.labels[in->imm] = nat.len;
+            break;
+        case MIR_JZ:
+        case MIR_JNZ:
+            if (arm)
+            {
+                int r = a64_src(in->a, 9);
+                push_jump(nat.len, SR_BRANCH19, 0, (uint32_t)in->imm);
+                put32((in->op == MIR_JZ ? 0xb4000000u : 0xb5000000u) | (uint32_t)r); // cbz / cbnz
+            }
+            else
+            {
+                int r = R(in->a);
+                if (r >= 0)
+                {
+                    x_op(1, 0, "\x85", 1, r, r, 0, 0, 0); // test r, r
+                }
+                else
+                {
+                    x_op(1, 0, "\x83", 1, 7, XDI, 1, (int32_t)(H(in->a) * 8), 0); // cmp qword [rdi + a], 0
+                    xb(0);
+                }
+                xb(0x0f);
+                xb(in->op == MIR_JZ ? 0x84 : 0x85);
+                push_jump(nat.len, SR_REL32, -4, (uint32_t)in->imm);
+                put32(0);
+            }
+            break;
+        case MIR_CALL:
+            regs_call(f, (SymId)in->imm);
+            break;
+        case MIR_RET:
+            regs_epilogue(f);
+            break;
+        case MIR_STR:
+            regs_string(in, &f->strings[in->imm]);
+            break;
+        case MIR_WRITE:
+        case MIR_TRAP:
+        {
+            int st = in->op == MIR_TRAP ? ST_trap : st_write[in->sub];
+            int operand = in->op == MIR_TRAP || (in->sub != MW_SPACE && in->sub != MW_NL);
+            if (ra_base && (in->op == MIR_TRAP || in->sub != MW_BYTE) && operand)
+            {
+                static const uint8_t rt_of[] = {[MW_STR] = RT_write_str, [MW_INT] = RT_write_int,
+                                                [MW_UINT] = RT_write_uint, [MW_BOOL] = RT_write_bool};
+                regs_runtime_call(in->a, in->op == MIR_TRAP ? RT_trap : rt_of[in->sub], in->op != MIR_TRAP);
+            }
+            else if (operand && R(in->a) >= 0)
+            {
+                to_acc_reg(R(in->a));
+                emit(st + 1, in->a, 0, 0, 0, 0); // the _a form
+            }
+            else
+            {
+                emit(st, H(in->a), 0, 0, 0, 0);
+            }
+            break;
+        }
+        case MIR_GLOAD:
+        case MIR_GSTORE:
+            if (arm)
+            {
+                a64_global(in, in->op == MIR_GSTORE);
+            }
+            else if (in->imm > 0x0fffffffull)
+            {
+                spill_reads(in);
+                emit(in->op == MIR_GLOAD ? ST_gload : ST_gstore, in->op == MIR_GLOAD ? H(in->d) : in->imm,
+                     in->op == MIR_GLOAD ? in->imm : H(in->a), 0, 0, 0);
+                reload_write(in->op == MIR_GLOAD ? in->d : (MirSlot)-1);
+            }
+            else
+            {
+                x_op(1, 0, "\x8b", 1, XCX, XSI, 1, 16, 0); // mov rcx, [rsi + 16]: c->globals
+                if (in->op == MIR_GLOAD)
+                {
+                    int t = R(in->d) >= 0 ? R(in->d) : XAX;
+                    x_op(1, 0, "\x8b", 1, t, XCX, 1, (int32_t)(in->imm * 8), 0);
+                    x_store(t, in->d);
+                }
+                else
+                {
+                    x_op(1, 0, "\x89", 1, x_src(in->a, XAX), XCX, 1, (int32_t)(in->imm * 8), 0);
+                }
+            }
+            break;
+        default:
+            break;
+        }
     }
-    nat.order[nat.norder - 1].uses = uses;
+    for (size_t i = 0; i < nat.njumps; i++)
+    {
+        const Fixup *j = &nat.jumps[i];
+        fill_branch(j->at, j->reloc, j->addend, nat.labels[j->ref]);
+    }
+}
+
+static void emit_stencils(const MirFunc *f)
+{
     nat.njumps = 0;
     for (uint32_t i = 0; i < f->nlabels; i++)
     {
@@ -801,6 +2338,9 @@ static void emit_mir(const MirFunc *f)
         case MIR_WRITE:
             emit(st_write[in->sub] + (in_acc && acc_operand(in) ? 1 : 0), in->a, 0, 0, 0, 0);
             break;
+        case MIR_TRAP:
+            emit(in_acc ? ST_trap_a : ST_trap, in->a, 0, 0, 0, 0);
+            break;
         case MIR_GLOAD:
             emit(out ? ST_gload_r : ST_gload, in->d, in->imm, 0, 0, 0);
             break;
@@ -817,6 +2357,167 @@ static void emit_mir(const MirFunc *f)
         const Fixup *j = &nat.jumps[i];
         fill_branch(j->at, j->reloc, j->addend, nat.labels[j->ref]);
     }
+}
+
+// ---- the output bound -------------------------------------------------------------------------
+//
+// The most bytes a function writes to the system output itself: each write's largest text (a
+// string: its length, taken from the `str` that gave the slot its address in the same block; a
+// number: 20 characters, as -9223372036854775808; a bool: 5). With the call graph (stack_need)
+// this bounds what the whole program writes; when that fits the buffer `output_buffer` asks for,
+// the buffer is exactly that (one flush at the end either way). Unknown when a string comes from
+// elsewhere (a parameter) or when the function loops.
+#define OUT_UNKNOWN UINT64_MAX
+
+static uint64_t out_bound(const MirFunc *f)
+{
+    uint64_t total = 0;
+    int loops = 0, any = 0;
+    for (size_t k = 0; k < f->n && !any; k++)
+    {
+        any = f->code[k].op == MIR_WRITE;
+    }
+    if (!any)
+    {
+        return 0; // (a loop without output writes nothing)
+    }
+    ArenaMark mark = arena_mark();
+    uint8_t *placed = (uint8_t *)arena_alloc(f->nlabels + 1);
+    memset(placed, 0, f->nlabels + 1);
+    for (size_t k = 0; k < f->n; k++)
+    {
+        const MirInst *in = &f->code[k];
+        if (in->op == MIR_LABEL && in->imm < f->nlabels)
+        {
+            placed[in->imm] = 1;
+        }
+        if ((in->op == MIR_JZ || in->op == MIR_JNZ) && in->imm < f->nlabels && placed[in->imm])
+        {
+            loops = 1; // a branch back
+        }
+        if (in->op != MIR_WRITE)
+        {
+            continue;
+        }
+        switch (in->sub)
+        {
+        case MW_STR:
+        {
+            uint64_t len = OUT_UNKNOWN;
+            for (size_t j = k; j-- > 0;)
+            {
+                const MirInst *p = &f->code[j];
+                if (p->op == MIR_LABEL || p->op == MIR_JZ || p->op == MIR_JNZ || p->op == MIR_CALL)
+                {
+                    break;
+                }
+                if (writes(p, in->a))
+                {
+                    len = p->op == MIR_STR ? f->strings[p->imm].len : OUT_UNKNOWN;
+                    break;
+                }
+            }
+            if (len == OUT_UNKNOWN)
+            {
+                arena_release(mark);
+                return OUT_UNKNOWN;
+            }
+            total += len;
+            break;
+        }
+        case MW_INT:
+        case MW_UINT:
+            total += 20;
+            break;
+        case MW_BOOL:
+            total += 5;
+            break;
+        default:
+            total += 1;
+            break;
+        }
+    }
+    arena_release(mark);
+    return loops && total ? OUT_UNKNOWN : total;
+}
+
+// Registers or not. Every function gets them (measured over the examples and the benchmark: the
+// stencil form was shorter only for bodies that are a lone `ret`, and those now get no register
+// either). MODAL_REGS=0 turns them off, to compare: the fuzzer runs every way against the C backend.
+static int regs_mode(void)
+{
+    static int mode = -1;
+    if (mode < 0)
+    {
+        const char *e = getenv("MODAL_REGS");
+        mode = e && e[0] == '0' ? 0 : 1;
+    }
+    return mode;
+}
+
+static void emit_mir(const MirFunc *f)
+{
+    if (f->nlabels > MAX_LABELS)
+    {
+        fatal("too many branches in one function");
+    }
+    fn_at_fit();
+    nat.fn_at[f->sym] = nat.len;
+    begin_range(f->sym);
+    nat.order[nat.norder - 1].frame = f->frame_size;
+    uint32_t uses = f->frame_size > f->ret_slots ? f->frame_size : f->ret_slots;
+    for (size_t k = 0; k < f->n; k++)
+    {
+        const MirInst *in = &f->code[k];
+        uint32_t top = in->d > in->a ? in->d : in->a;
+        top = in->b > top ? in->b : top;
+        if (in->op == MIR_ZERO || in->op == MIR_ADDR)
+        {
+            top = in->a + (uint32_t)in->imm > top ? in->a + (uint32_t)in->imm - 1 : top;
+        }
+        uses = top + 1 > uses ? top + 1 : uses;
+    }
+    nat.order[nat.norder - 1].uses = uses;
+    nat.order[nat.norder - 1].out = out_bound(f);
+
+    ArenaMark mark = arena_mark();
+    nat.order[nat.norder - 1].call_frame = frame_bytes(&nat.arch->stencils[ST_call]);
+    uint8_t *clobber = NULL;
+    int runtime = 0, modal = 0; // calls the runtime with a value; calls a Modal function
+    if (regs_mode() && uses <= 4096)
+    {
+        clobber = (uint8_t *)arena_alloc(f->n + 1);
+        for (size_t k = 0; k < f->n; k++)
+        {
+            const MirInst *in = &f->code[k];
+            clobber[k] = (uint8_t)clobbers(in);
+            modal |= in->op == MIR_CALL;
+            runtime |= in->op == MIR_TRAP || (in->op == MIR_WRITE && in->sub != MW_SPACE && in->sub != MW_NL &&
+                                              in->sub != MW_BYTE);
+        }
+    }
+    ra_shift = NULL;
+    ra_removed = 0;
+    // Only in a function that calls no other Modal function: there the two registers cost what
+    // the write stencil's own frame did, at the same moment; in one that calls others they would
+    // stay saved under every nested call (RAM along the deepest chain).
+    ra_base = clobber && runtime && !modal ? 2 : 0;
+    ra_lr = clobber && nat.arch->cpu == CPU_ARM64 && (runtime || modal);
+    if (!clobber || !regalloc(f, regs_count() - ra_base, scratch_count(), clobber, &ra))
+    {
+        emit_stencils(f);
+        arena_release(mark);
+        return;
+    }
+    emit_regs(f);
+    nat.order[nat.norder - 1].saved = (uint32_t)(nat.arch->cpu == CPU_ARM64 ? a64_nsave : ra_saved) * 8;
+    nat.order[nat.norder - 1].frame = H(f->frame_size); // the frame without its register-only slots
+    nat.order[nat.norder - 1].uses = uses - ra_removed;
+    ra_shift = NULL;
+    // regs_call: the link register / the alignment push (arm64 ra_lr: in `saved`, below)
+    nat.order[nat.norder - 1].call_frame = ra_lr ? 0 : 16;
+    nat.regs_functions++;
+    arena_release(mark);
 }
 
 // ---- the backend --------------------------------------------------------------------------------
@@ -845,10 +2546,115 @@ static void begin_x86_64(const BackendJob *job)
     native_begin(job, &native_x86_64);
 }
 
+// Is `f` the entry's main, and is it only `str s; write.str s` pairs, maybe `const s0 = v`, and
+// a final `ret`? Then its output and status are known now.
+static void note_const_main(const MirFunc *f)
+{
+    if (!nat.main_sym)
+    {
+        nat.main_sym = scope_find(cx.units[0].scope, "main", 4);
+    }
+    if (f->label || f->sym != nat.main_sym || SYM(f->sym)->unit != 0 || SYM(f->sym)->owner)
+    {
+        return;
+    }
+    nat.const_main = 0;
+    size_t len = 0;
+    uint64_t status = 0;
+    for (size_t i = 0; i < f->n; i++)
+    {
+        const MirInst *in = &f->code[i];
+        if (in->op == MIR_STR && i + 1 < f->n && f->code[i + 1].op == MIR_WRITE &&
+            f->code[i + 1].sub == MW_STR && f->code[i + 1].a == in->d)
+        {
+            len += f->strings[in->imm].len;
+            i++;
+        }
+        else if (in->op == MIR_CONST && in->d == 0 && f->returns && f->ret_slots == 1)
+        {
+            status = in->imm;
+        }
+        else if (!(in->op == MIR_RET && i + 1 == f->n))
+        {
+            return;
+        }
+    }
+    uint8_t *text = (uint8_t *)arena_alloc(len ? len : 1);
+    size_t at = 0;
+    for (size_t i = 0; i < f->n; i++)
+    {
+        if (f->code[i].op == MIR_STR)
+        {
+            const MirString *str = &f->strings[f->code[i].imm];
+            memcpy(text + at, str->bytes, str->len);
+            at += str->len;
+        }
+    }
+    nat.const_main = 1;
+    nat.const_text = text;
+    nat.const_len = len;
+    nat.const_status = status;
+}
+
 static void native_function(const BackendJob *job, const MirFunc *f)
 {
     (void)job;
+    note_const_main(f);
     emit_mir(f);
+}
+
+// The entry of a constant program: write(1, text, len), then return the status. No value stack,
+// no runtime, no buffer: main is not called (the shake drops it).
+static size_t const_entry(void)
+{
+    uint32_t write_sym = 0;
+    while (nat.arch->externs[write_sym] && strcmp(nat.arch->externs[write_sym], "write") != 0)
+    {
+        write_sym++;
+    }
+    size_t start = nat.len;
+    size_t len = nat.const_len;
+    uint32_t status = (uint32_t)(nat.const_status & 0xff);
+    if (nat.arch->cpu == CPU_ARM64)
+    {
+        int wide = len >= 0x10000;
+        size_t adr_at = start + 8;
+        size_t text_at = start + 4 * (9 + wide);
+        int64_t off = (int64_t)(text_at - adr_at);
+        put32(0xa9bf7bfdu); // stp x29, x30, [sp, #-16]!
+        put32(0x910003fdu); // mov x29, sp
+        put32(0x10000001u | (((uint32_t)off & 3u) << 29) | ((((uint32_t)off >> 2) & 0x7ffffu) << 5)); // adr x1, text
+        put32(0xd2800020u); // movz x0, #1
+        put32(0xd2800002u | (((uint32_t)len & 0xffffu) << 5)); // movz x2, #len
+        if (wide)
+        {
+            put32(0xf2a00002u | ((((uint32_t)len >> 16) & 0xffffu) << 5)); // movk x2, #len >> 16, lsl 16
+        }
+        push_extern(nat.len, write_sym);
+        put32(0x94000000u);                       // bl write
+        put32(0x52800000u | (status << 5));       // movz w0, #status
+        put32(0xa8c17bfdu);                       // ldp x29, x30, [sp], #16
+        put32(0xd65f03c0u);                       // ret
+    }
+    else
+    {
+        size_t lea_end = start + 1 + 7;
+        size_t text_at = start + 1 + 7 + 5 + 5 + 5 + 5 + 1 + 1;
+        put_bytes("\x55", 1); // push rbp (the stack aligned for the call)
+        put_bytes("\x48\x8d\x35", 3); // lea rsi, [rip + text]
+        put32((uint32_t)(int32_t)((int64_t)text_at - (int64_t)lea_end));
+        put_bytes("\xbf\x01\x00\x00\x00", 5); // mov edi, 1
+        put_bytes("\xba", 1); // mov edx, len
+        put32((uint32_t)len);
+        put_bytes("\xe8", 1); // call write
+        push_extern(nat.len, write_sym);
+        put32(0);
+        put_bytes("\xb8", 1); // mov eax, status
+        put32(status);
+        put_bytes("\x5d\xc3", 2); // pop rbp; ret
+    }
+    put_bytes(nat.const_text, len);
+    return start;
 }
 
 // ---- memory budgets ----------------------------------------------------------------------------------
@@ -868,16 +2674,21 @@ typedef struct
 {
     uint64_t slots;   // value-stack slots of the deepest chain, from main
     uint32_t levels;  // nested Modal calls on it
+    uint64_t machine; // machine-stack bytes of the deepest chain: call stencils and saved registers
+    uint64_t out;     // most bytes the program writes to the system output (OUT_UNKNOWN)
     SymId recursive;  // a function that calls itself (through others), or 0
 } StackNeed;
 
 static StackNeed stack_need(SymId main_sym)
 {
-    StackNeed r = {0, 0, 0};
+    StackNeed r = {.out = OUT_UNKNOWN};
+    uint64_t call_frame = frame_bytes(&nat.arch->stencils[ST_call]);
     size_t nf = nat.norder;
     size_t *index_of = (size_t *)arena_alloc(cx.syms.cap * sizeof(size_t));
     uint64_t *need = (uint64_t *)arena_alloc(nf * sizeof(uint64_t) + 1);
     uint32_t *levels = (uint32_t *)arena_alloc(nf * sizeof(uint32_t) + 1);
+    uint64_t *machine = (uint64_t *)arena_alloc(nf * sizeof(uint64_t) + 1);
+    uint64_t *out = (uint64_t *)arena_alloc(nf * sizeof(uint64_t) + 1);
     uint8_t *state = (uint8_t *)arena_alloc(nf + 1); // 0: not seen, 1: on the path, 2: done
     size_t *path = (size_t *)arena_alloc(nf * sizeof(size_t) + 1);
     size_t *next = (size_t *)arena_alloc(nf * sizeof(size_t) + 1);
@@ -929,7 +2740,7 @@ static StackNeed stack_need(SymId main_sym)
             continue;
         }
         // every callee is done: this function's need is its frame and the deepest callee's
-        uint64_t deepest = 0;
+        uint64_t deepest = 0, mdeep = 0, written = nat.order[f].out;
         uint32_t lv = 0;
         int calls = 0;
         for (size_t c = nat.order[f].first_call; c < end; c++)
@@ -943,7 +2754,13 @@ static StackNeed stack_need(SymId main_sym)
             calls = 1;
             deepest = need[g] > deepest ? need[g] : deepest;
             lv = levels[g] > lv ? levels[g] : lv;
+            written = written == OUT_UNKNOWN || out[g] == OUT_UNKNOWN || out[g] > (1u << 30) ? OUT_UNKNOWN
+                                                                                             : written + out[g];
+            uint64_t cf = nat.order[f].call_frame ? nat.order[f].call_frame : call_frame;
+            mdeep = cf + machine[g] > mdeep ? cf + machine[g] : mdeep;
         }
+        machine[f] = nat.order[f].saved + mdeep;
+        out[f] = written;
         need[f] = nat.order[f].frame + deepest;
         need[f] = nat.order[f].uses > need[f] ? nat.order[f].uses : need[f];
         levels[f] = calls ? lv + 1 : 0;
@@ -952,6 +2769,8 @@ static StackNeed stack_need(SymId main_sym)
     }
     r.slots = need[index_of[main_sym]];
     r.levels = levels[index_of[main_sym]];
+    r.machine = machine[index_of[main_sym]];
+    r.out = r.recursive ? OUT_UNKNOWN : out[index_of[main_sym]];
     return r;
 }
 
@@ -1014,6 +2833,20 @@ static uint32_t frame_bytes(const Stencil *s)
     return total;
 }
 
+// The machine stack runtime function i takes, with the deepest of the functions it calls.
+static uint64_t runtime_depth(uint32_t i)
+{
+    const Stencil *s = &nat.arch->runtime[i];
+    uint64_t deepest = 0;
+    for (uint32_t r = 0; r < s->nrelocs; r++)
+    {
+        uint16_t t = s->relocs[r].target;
+        uint64_t d = t >= ST_EXTERN ? 64 : t >= ST_RUNTIME ? runtime_depth(t - ST_RUNTIME) : 0; // 64: the system call
+        deepest = d > deepest ? d : deepest;
+    }
+    return frame_bytes(s) + deepest;
+}
+
 static uint64_t round16(uint64_t v)
 {
     return (v + 15) & ~(uint64_t)15;
@@ -1024,14 +2857,15 @@ static size_t memory_report(Unit *u, StackNeed sn, uint64_t slots, uint64_t outb
 {
     uint64_t entry = frame_bytes(&nat.arch->stencils[entry_st]) + round16(slots * 8) +
                      round16(outbuf);
-    uint64_t calls = (uint64_t)sn.levels * frame_bytes(&nat.arch->stencils[ST_call]);
-    uint64_t runtime = 64; // the system call
-    for (int i = 0; i < RT__COUNT; i++)
+    // Each nested call: the call stencil's frame and the registers the callee saves (main's too).
+    uint64_t calls = sn.machine;
+    // The runtime: the deepest chain of its functions from a stencil that calls one (its own
+    // frame first), down to the system call.
+    uint64_t runtime = 0;
+    for (size_t i = 0; i < nat.nrtcalls; i++)
     {
-        if (nat.runtime_at[i] != NOT_EMITTED)
-        {
-            runtime += frame_bytes(&nat.arch->runtime[i]);
-        }
+        uint64_t d = frame_bytes(&nat.arch->stencils[ST_write_int]) + runtime_depth(nat.rtcalls[i].ref);
+        runtime = d > runtime ? d : runtime;
     }
     uint64_t ram = entry + calls + runtime;
     uint64_t code = nat.len;
@@ -1056,6 +2890,8 @@ static size_t memory_report(Unit *u, StackNeed sn, uint64_t slots, uint64_t outb
         {
             printf("          '%.*s' calls itself: its depth is not known when compiling\n", len, rec);
         }
+        printf("functions %u with registers, %u folded into an identical one, %u calls computed by the compiler\n",
+               nat.regs_functions, nat.folded, comptime_folded());
     }
     size_t errors = 0;
     if (max_code && code > max_code)
@@ -1105,22 +2941,49 @@ static size_t linux_system_layer(Unit *u)
                   "\xc3",                     // ret
                   8);
     }
+    size_t exit_at = NOT_EMITTED; // only if a trap can end the program
+    for (size_t i = 0; i < nat.nexterns; i++)
+    {
+        const char *name = nat.arch->externs[nat.externs[i].sym];
+        if (strcmp(name, "exit") == 0 && exit_at == NOT_EMITTED)
+        {
+            while (nat.len & 3)
+            {
+                put_bytes("", 1);
+            }
+            exit_at = nat.len;
+            if (arm)
+            {
+                put32(0xd2800bc8u); // movz x8, #94 (exit_group), the status already in w0
+                put32(0xd4000001u); // svc #0
+            }
+            else
+            {
+                put_bytes("\xb8\xe7\x00\x00\x00" // mov eax, 231 (exit_group), status in edi
+                          "\x0f\x05",                // syscall
+                          7);
+            }
+        }
+    }
     for (size_t i = 0; i < nat.nexterns; i++)
     {
         const MachoImportCall *c = &nat.externs[i];
-        if (strcmp(nat.arch->externs[c->sym], "write") != 0)
+        const char *name = nat.arch->externs[c->sym];
+        size_t target = strcmp(name, "write") == 0 ? write_at
+                        : strcmp(name, "exit") == 0 ? exit_at
+                                                    : NOT_EMITTED;
+        if (target == NOT_EMITTED)
         {
-            diag_at(u, 0, "error", "backend native: '%s' is not available on Linux",
-                    nat.arch->externs[c->sym]);
+            diag_at(u, 0, "error", "backend native: '%s' is not available on Linux", name);
             return (size_t)-1;
         }
         if (arm)
         {
-            fill_branch(c->at, SR_BRANCH26, 0, write_at);
+            fill_branch(c->at, SR_BRANCH26, 0, target);
         }
         else
         {
-            set32(c->at, (uint32_t)(int32_t)((int64_t)write_at - (int64_t)(c->at + 4)));
+            set32(c->at, (uint32_t)(int32_t)((int64_t)target - (int64_t)(c->at + 4)));
         }
     }
     while (nat.len & 3)
@@ -1172,16 +3035,43 @@ static size_t bare_system_layer(const MemoryMap *map)
     {
         put_bytes("\x31\xc0\xc3", 3); // xor eax, eax; ret
     }
+    // exit (a trap): there is no process to end, so the board halts, the status in x0 / edi.
+    size_t exit_at = NOT_EMITTED;
+    for (size_t i = 0; i < nat.nexterns && exit_at == NOT_EMITTED; i++)
+    {
+        if (strcmp(nat.arch->externs[nat.externs[i].sym], "exit") == 0)
+        {
+            while (nat.len & 3)
+            {
+                put_bytes("", 1);
+            }
+            exit_at = nat.len;
+            if (arm)
+            {
+                put32(0xd503207fu); // wfi
+                put32(0x17ffffffu); // b (back to the wfi)
+            }
+            else
+            {
+                put_bytes("\x89\xf8"   // mov eax, edi (the status), so the halt below is
+                          "\x89\xc7"   // _start's own: mov edi, eax; hlt; jmp (to the hlt)
+                          "\xf4"
+                          "\xeb\xfd",
+                          7);
+            }
+        }
+    }
     for (size_t i = 0; i < nat.nexterns; i++)
     {
         const MachoImportCall *c = &nat.externs[i];
+        size_t target = strcmp(nat.arch->externs[c->sym], "exit") == 0 ? exit_at : write_at;
         if (arm)
         {
-            fill_branch(c->at, SR_BRANCH26, 0, write_at);
+            fill_branch(c->at, SR_BRANCH26, 0, target);
         }
         else
         {
-            set32(c->at, (uint32_t)(int32_t)((int64_t)write_at - (int64_t)(c->at + 4)));
+            set32(c->at, (uint32_t)(int32_t)((int64_t)target - (int64_t)(c->at + 4)));
         }
     }
     while (nat.len & 15)
@@ -1266,12 +3156,57 @@ static int native_end(const BackendJob *job)
     {
         slots = mir_global_count() + domain_config_int(u->domain, "stack", 512 * 1024) / 8;
     }
-    int writes_out = nat.nrtcalls > 0; // a stencil writes to the system output
-    uint64_t outbuf = writes_out ? domain_config_int(u->domain, "output_buffer", 4096) : 16;
-    outbuf = outbuf ? outbuf : 16;
-    int entry_st = sema_fn_ret(u, entry) == T_VOID ? ST_entry_void : ST_entry;
+    int writes_out = 0; // a stencil writes to the system output (a trap only flushes what they wrote)
+    for (size_t i = 0; i < nat.nrtcalls && !writes_out; i++)
+    {
+        writes_out = nat.rtcalls[i].ref != RT_trap;
+    }
+    // Output that is only constant text, a few times, with no recursion: each string goes straight
+    // to the system. No buffer (RAM), no rt_put / rt_flush (code); the same bytes, in the same order.
+    int direct = writes_out && !sn.recursive;
+    size_t sites = 0;
+    for (size_t i = 0; i < nat.nrtcalls && direct; i++)
+    {
+        direct = nat.rtcalls[i].ref == RT_write_str || nat.rtcalls[i].ref == RT_trap;
+        sites += nat.rtcalls[i].ref == RT_write_str;
+    }
+    direct = direct && sites <= 16;
+    if (direct)
+    {
+        for (size_t i = 0; i < nat.nrtcalls; i++)
+        {
+            if (nat.rtcalls[i].ref == RT_write_str)
+            {
+                nat.rtcalls[i].ref = RT_write_direct;
+            }
+        }
+        writes_out = 0;
+    }
+    uint64_t outbuf = writes_out ? domain_config_int(u->domain, "output_buffer", 4096) : direct ? 0 : 16;
+    if (writes_out && sn.out != OUT_UNKNOWN && sn.out < outbuf)
+    {
+        outbuf = (sn.out + 7) & ~(uint64_t)7; // all of the output fits: one flush at the end, as before
+    }
+    outbuf = outbuf || direct ? outbuf : 16;
+    int void_main = sema_fn_ret(u, entry) == T_VOID;
+    int entry_st = direct ? (void_main ? ST_entry_void_direct : ST_entry_direct)
+                          : void_main ? ST_entry_void : ST_entry;
     begin_range(0);
-    nat.entry_at = emit(entry_st, mir_global_count(), slots, outbuf, entry, 0);
+    int constant = nat.const_main && mir_global_count() == 0 && nat.const_len < 0xffffffffull;
+    if (constant)
+    {
+        // The whole program is its text and its status: nothing else is reached, so the shake
+        // drops main and every runtime function, and no value stack or buffer is needed.
+        entry_st = ST_entry_void_direct; // (for the memory report: an upper bound of its frame)
+        outbuf = 0;
+        slots = 0;
+        sn.machine = 0; // main is not called
+        nat.entry_at = const_entry();
+    }
+    else
+    {
+        nat.entry_at = emit(entry_st, mir_global_count(), slots, outbuf, entry, 0);
+    }
     if (nat.fn_at[entry] == NOT_EMITTED)
     {
         const CodegenFailure *why = codegen_failure(entry);
@@ -1450,10 +3385,32 @@ static int native_end(const BackendJob *job)
     const char *base = job->path ? strrchr(job->path, '/') : NULL;
     const char *ident = base ? base + 1 : job->path ? job->path : "a.out";
     MachoCpu cpu = nat.arch->cpu == CPU_ARM64 ? MACHO_ARM64 : MACHO_X86_64;
+    // Only the C functions the program calls are imported (a program without a division has no
+    // `exit`): every import costs a stub, a GOT slot and a bind.
+    const char *imports[9];
+    uint32_t index[8] = {0}, nused = 0;
+    for (uint32_t k = 0; nat.arch->externs[k] && k < 8; k++)
+    {
+        int called = 0;
+        for (size_t i = 0; i < nat.nexterns && !called; i++)
+        {
+            called = nat.externs[i].sym == k;
+        }
+        if (called)
+        {
+            index[k] = nused;
+            imports[nused++] = nat.arch->externs[k];
+        }
+    }
+    imports[nused] = NULL;
+    for (size_t i = 0; i < nat.nexterns; i++)
+    {
+        nat.externs[i].sym = index[nat.externs[i].sym];
+    }
     int failed = object ? macho_write_object(job->out, cpu, nat.code, nat.len, nat.entry_at,
-                                             nat.externs, nat.nexterns, nat.arch->externs)
+                                             nat.externs, nat.nexterns, imports)
                         : macho_write_executable(job->out, cpu, nat.code, nat.len, nat.entry_at,
-                                                 nat.externs, nat.nexterns, nat.arch->externs, ident);
+                                                 nat.externs, nat.nexterns, imports, ident);
     if (failed)
     {
         diag_at(u, 0, "error", "backend native: cannot write %s", job->path);

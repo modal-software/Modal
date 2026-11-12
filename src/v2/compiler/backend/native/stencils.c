@@ -40,6 +40,7 @@ extern void CONTINUE(u64 *f, Ctx *c, u64 acc);
 extern void JUMP(u64 *f, Ctx *c, u64 acc);
 extern void CALLEE(u64 *f, Ctx *c, u64 acc);
 extern long write(int fd, const void *buf, unsigned long n);
+extern void exit(int status) __attribute__((noreturn));
 
 #define A ((u64)(uintptr_t)HOLE_A)
 #define B ((u64)(uintptr_t)HOLE_B)
@@ -49,7 +50,9 @@ extern long write(int fd, const void *buf, unsigned long n);
 // the stencil forget it instead of saving it across the call.
 #define NEXT_FRESH __attribute__((musttail)) return CONTINUE(f, c, 0)
 #define STENCIL(name) void st_##name(u64 *f, Ctx *c, __attribute__((unused)) u64 acc)
-#define RUNTIME __attribute__((noinline))
+// The runtime runs once per output call, far from the hot code: compiled for size (clang's
+// minsize, -Oz for these functions only), as p.md 4.5 asks.
+#define RUNTIME __attribute__((noinline, minsize))
 
 // ---- runtime: copied once into every program --------------------------------------------------
 
@@ -96,6 +99,17 @@ RUNTIME void rt_write_str(Ctx *c, const uint8_t *s)
     rt_put(c, s + 8, n);
 }
 
+// A program whose only output is constant text, with no recursion, writes each string straight
+// to the system (no buffer, no flush): the backend sends rt_write_str's calls here instead and
+// starts it with entry_direct. The bytes and their order are the same.
+RUNTIME void rt_write_direct(Ctx *c, const uint8_t *s)
+{
+    (void)c;
+    u64 n;
+    __builtin_memcpy(&n, s, 8);
+    write(1, s + 8, n);
+}
+
 RUNTIME void rt_write_uint(Ctx *c, u64 v)
 {
     uint8_t tmp[24];
@@ -128,6 +142,18 @@ RUNTIME void rt_write_bool(Ctx *c, u64 b)
     rt_put(c, text, b ? 4 : 5);
 }
 
+// A trap (a division by zero): the output written so far goes out first, then the message
+// (a length and its bytes) to the error output, and the program ends with status 1. `exit` is
+// the system's on macOS, exit_group on Linux, the halt on bare metal (each system layer).
+RUNTIME __attribute__((noreturn)) void rt_trap(Ctx *c, const uint8_t *msg)
+{
+    rt_flush(c);
+    u64 n;
+    __builtin_memcpy(&n, msg, 8);
+    write(2, msg + 8, n);
+    exit(1);
+}
+
 // ---- entry: the C `main` of the program ---------------------------------------------------------
 
 // The value stack starts with the module-level variables (A of them); main's frame follows.
@@ -147,6 +173,37 @@ int st_entry(void)
     CALLEE(stack + A, &ctx, 0);
     rt_flush(&ctx);
     return (int)stack[A]; // what main returned, as the C backend's `return (int)m_main()`
+}
+
+// The entries of a program that writes directly (rt_write_direct): no output buffer, nothing to
+// flush at the end. len = 0, so a trap's flush writes nothing.
+int st_entry_direct(void)
+{
+    Ctx ctx;
+    u64 slots = B;
+    __asm__("" : "+r"(slots));
+    u64 stack[slots];
+    ctx.len = 0;
+    ctx.cap = 0;
+    ctx.buf = 0;
+    ctx.globals = stack;
+    stack[A] = 0;
+    CALLEE(stack + A, &ctx, 0);
+    return (int)stack[A];
+}
+
+int st_entry_void_direct(void)
+{
+    Ctx ctx;
+    u64 slots = B;
+    __asm__("" : "+r"(slots));
+    u64 stack[slots];
+    ctx.len = 0;
+    ctx.cap = 0;
+    ctx.buf = 0;
+    ctx.globals = stack;
+    CALLEE(stack + A, &ctx, 0);
+    return 0;
 }
 
 int st_entry_void(void)
@@ -273,13 +330,17 @@ STENCIL(zero) // B slots from A set to 0
 
 #define WRAP(T, S, op, y) (u64)(S)(T)((u64)(T)x op (u64)(T)(y))
 #define EXACT(T, S, op, y) (u64)(S)(T)((T)x op (T)(y))
+// Division: the smallest signed value divided by -1 wraps (as `0 - x` does) instead of
+// trapping on x86-64; `(T)-1 < 0` is a constant, so unsigned division has no test at all.
+// A zero divisor never gets here: the MIR checks it first (MIR_TRAP).
+#define DIV(T, S, y) (((T)-1 < 0 && (T)(y) == (T)-1) ? (u64)(S)(T)(0 - (u64)(T)x) : EXACT(T, S, /, y))
 #define CMP(T, op, y) (u64)((T)x op (T)(y))
 
 #define INT_STENCILS(t, T, S)                                                                      \
     FOUR(add_##t, WRAP(T, S, +, f[C]))                                                             \
     FOUR(sub_##t, WRAP(T, S, -, f[C]))                                                             \
     FOUR(mul_##t, WRAP(T, S, *, f[C]))                                                             \
-    FOUR(div_##t, EXACT(T, S, /, f[C]))                                                            \
+    FOUR(div_##t, DIV(T, S, f[C]))                                                            \
     FOUR(eq_##t, CMP(T, ==, f[C]))                                                                 \
     FOUR(ne_##t, CMP(T, !=, f[C]))                                                                 \
     FOUR(lt_##t, CMP(T, <, f[C]))                                                                  \
@@ -289,7 +350,7 @@ STENCIL(zero) // B slots from A set to 0
     FOUR(addi_##t, WRAP(T, S, +, C))                                                               \
     FOUR(subi_##t, WRAP(T, S, -, C))                                                               \
     FOUR(muli_##t, WRAP(T, S, *, C))                                                               \
-    FOUR(divi_##t, EXACT(T, S, /, C))                                                              \
+    FOUR(divi_##t, DIV(T, S, C))                                                              \
     FOUR(eqi_##t, CMP(T, ==, C))                                                                   \
     FOUR(nei_##t, CMP(T, !=, C))                                                                   \
     FOUR(lti_##t, CMP(T, <, C))                                                                    \
@@ -366,6 +427,14 @@ WRITE(uint, rt_write_uint(c, x))
 WRITE(bool, rt_write_bool(c, x))
 
 WRITE(byte, { uint8_t ch = (uint8_t)x; rt_put(c, &ch, 1); })
+
+// A trap (MIR_TRAP): A holds the address of its message. It does not come back.
+STENCIL(trap) { rt_trap(c, (const uint8_t *)(uintptr_t)f[A]); }
+STENCIL(trap_a)
+{
+    (void)f;
+    rt_trap(c, (const uint8_t *)(uintptr_t)acc);
+}
 
 STENCIL(write_space)
 {
