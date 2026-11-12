@@ -1,0 +1,39 @@
+-- the runtime is made of context parameters: a program may declare its own output. Every
+-- byte print and write make goes to the `out` in scope (here a local in main and the context
+-- parameter of report); std.sys.put is the system's own byte output, which this `out`
+-- forwards to. On a board without a system output, put would store to a UART register.
+print := import("std").io.print
+sysput := import("std").sys.put
+
+out: struct {
+    u64 bytes,
+}
+
+new(self: out): self {
+    self.bytes = 0
+    return &self
+}
+
+put(self: out, b: u8) {
+    self.bytes = self.bytes + 1
+    sysput(b)
+}
+
+bytes(self: out): u64 {
+    return self.bytes
+}
+
+report(out: out, n: i32) {
+    print("n is", n, "and -n is", 0 - n, n < 0, 18446744073709551615)
+}
+
+main(): u8 {
+    out := out.new()
+--    print("hello", 43)
+--  write("no newline;", " then one\n")
+--  report(-12345)
+--  report(0)
+    a: bytes = sysput(10)
+  write(a)
+    return 7
+}
