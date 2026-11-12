@@ -170,6 +170,8 @@ typedef struct
     uint32_t nscopes;
     uint32_t scopes_cap;
     int errors;
+    int quiet;        // > 0: diagnostics are counted in quiet_errors, not reported (comptime)
+    int quiet_errors;
     uint64_t phase_ns[PHASE__COUNT]; // time spent per phase
     uint32_t names_resolved;         // names and invocations the body checker led to a declaration
     uint32_t calls_resolved;
@@ -178,6 +180,7 @@ typedef struct
     uint8_t timing; // --time: measure the per-function phases too
     uint8_t cache;  // --cache: skip checking the bodies of files that have not changed
     uint8_t show_mir; // --mir: print each function's MIR as it is generated
+    uint8_t kinds;    // --sig: note what each function does, for its kind (sema/check.c)
     uint8_t stats;    // --stats: backends report what they produced (sizes, memory)
     const MachineTarget *target; // see target_get()
     uint8_t target_given;        // --target named it
@@ -355,6 +358,7 @@ int domain_config_bool(uint16_t domain, const char *key, int fallback);
 uint64_t domain_config_int(uint16_t domain, const char *key, uint64_t fallback);
 // Could a wildcard import of this file (`import(x).*`) supply `name`?
 int module_wildcard_provides(Unit *u, const char *name, size_t len);
+SymId module_domain_function(const Unit *u, const Token *name); // declared in the domain's mod.modal
 
 // cache.c: Go's build cache, at the granularity of a file. Check-only runs.
 uint64_t hash_bytes(const void *data, size_t len, uint64_t seed);
@@ -400,9 +404,41 @@ typedef enum
     STD_NONE,
     STD_PRINT,
     STD_SYS_PUT, // one byte to the system output
+    STD_ASSERT,  // std.debug.assert(cond): at module level the compiler checks it, in a body the program
+    STD_SIZEOF,  // std.mem.sizeof(T or value): bytes in the target's C layout, a constant
 } StdMember;
 int sema_std_member(const Unit *u, SymId binding);
+// `sizeof(T)` at node `call`: its value (an unsized constant). 0 if call is not one.
+int sema_sizeof(const Unit *u, NodeId call, uint64_t *out);
+// `assert(cond)` at node `call`: 1 if call is one.
+int sema_is_assert(const Unit *u, NodeId call);
+// `n` naming an unsized module-level constant (`n := 5`, docs/comptime.md §3.1): its exact value as
+// 64 bits, and whether it is negative. 0 if id names no such constant.
+int sema_unsized_value(const Unit *u, NodeId id, uint64_t *bits, int *negative);
+int mir_assert_message(Unit *u, NodeId call, char *text, size_t cap); // what a failed assert says
 void sema_check(Unit *u);
+void sema_kinds_reset(void); // a fresh compilation: no function facts yet
+// Compile time (sema/comptime.c, docs/comptime.md step 1): module-level initializers the compiler
+// runs. comptime_unit evaluates those of u (after its declarations, before its bodies).
+void comptime_reset(void);
+void comptime_unit(Unit *u);
+int sema_comptime_value(SymId s, uint64_t *out); // the value the compiler computed for s
+// A string or struct value the compiler computed: its slots in the target's C layout, and for
+// each slot that holds a string, its bytes (str[j] NULL: slot j is plain bytes).
+typedef struct
+{
+    uint32_t n;
+    const uint64_t *slots;
+    const uint8_t *const *str;
+    const uint32_t *len;
+} ComptimeAggregate;
+const ComptimeAggregate *sema_comptime_aggregate(SymId s); // NULL: none
+// Checks fn's body again (quietly) and lowers it for the compiler to run; 0 if that failed.
+int sema_lower_for_comptime(SymId fn);
+void comptime_capture(Unit *u, SymId fn); // check.c hands it the function it just checked
+// A function's kind (docs/comptime.md §2): "both", "run time  (why, where)", "compile time  (...)",
+// or "" when its body was not checked. Written into buf when it says why.
+const char *sema_fn_kind(SymId fn, char *buf, size_t size);
 // Clauses (literal patterns: `u8 fact(u8 0): 1`).
 int sema_pattern(Unit *u, NodeId param, SymId owner, uint64_t *value, int loud);
 SymId sema_next_clause(Unit *u, SymId fn); // tried when fn's patterns do not match; 0: none
@@ -420,5 +456,6 @@ void target_set(const MachineTarget *t);
 const MachineTarget *target_get(void);  // the target set, or the host's
 Layout type_layout(TypeId t);    // C's layout on the target
 uint32_t field_offset_of(SymId field);
+uint32_t layout_member_offset(SymId strct, NodeId member); // a field declaration's offset
 
 #endif // MODAL_V2_CX_H

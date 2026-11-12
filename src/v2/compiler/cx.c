@@ -443,6 +443,11 @@ void diag_tok(Unit *u, const Token *t, const char *level, const char *fmt, ...)
 
 void diag_vtok(Unit *u, const Token *t, const char *level, const char *fmt, va_list ap)
 {
+    if (cx.quiet)
+    {
+        cx.quiet_errors += level[0] == 'e';
+        return;
+    }
 
     // After MAX_REPORTED errors the rest are counted but not printed: a mistake repeated
     // across a large file should not bury the first reports or cost seconds of output.
