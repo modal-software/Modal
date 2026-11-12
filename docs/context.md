@@ -89,8 +89,9 @@ Consequences:
 - Types: `u8 u16 u32 u64 i8 i16 i32 i64 int bool`, `[]T` (`[]u8` is the string type),
   `*T`, struct names, dotted paths (treated as external).
 - String escapes: `\n \t \r \0 \\ \"`. Anything else is an error.
-- There is **no control flow** yet (`if`, loops) and no typed local declaration; a local
-  is always `name := expr`.
+- There is **no control flow** yet (`if`, loops). Locals are declared like module-level
+  variables (`name: T = v`, `T name [= v]`) or bound with `name := expr`, which is immutable
+  (§16).
 
 ### 2.2 Who owns a method
 
@@ -167,9 +168,11 @@ Rules:
 
 - `name := <literal>` is **configuration**; `name := import(...)` **binds a module** into
   the domain's face.
-- Config names are a closed set: `implicit_self`, `nil_return`, `profile`, `version`. An
-  unknown name or wrong value kind is an error.
-- Only `implicit_self` is acted on (a bare `n1` in a method resolves to `self.n1`).
+- Config names are a closed set (`sema/module.c`): `implicit_self`, `nil_return`, `profile`,
+  `version`, `stack`, `output_buffer`, `max_code`, `max_ram`, `flash_origin`, `flash_size`,
+  `ram_origin`, `ram_size`. An unknown name or wrong value kind is an error.
+- Acted on: `implicit_self` (a bare `n1` in a method resolves to `self.n1`), the budgets and
+  sizes (§14.4), the memory map (§14.6). `nil_return`, `profile`, `version` are accepted only.
 - Config is not inherited by subfolders yet.
 
 ### 3.2 Contract
@@ -329,17 +332,21 @@ modal-v2 [options] file.modal
   (no option)      check only: errors, or one line saying what was verified
   -o FILE          generate code into FILE
   --run            generate, build with the backend's toolchain (cc, or $CC), and run
-  --backend NAME   backend to generate with (default: c)
+  --backend NAME   backend to generate with (default: c); also -b NAME
   --backends       list the registered backends
+  --target NAME    arm64-macos, arm64-linux, x86_64-macos, x86_64-linux, arm64-none, x86_64-none
   --ast            print the syntax tree of every loaded file (implies --eager)
   --syms           print the symbol table with visibility
   --sig            print the derived contract of every domain
   --stats          print token, node, symbol and memory counts
   --time           print the time spent in each phase
   --eager          parse every body up front and keep the whole tree
+  --repeat N       compile N times in one process (measuring; --time shows the fastest)
+  --mir            print the MIR of every function generated
+  --cache          skip checking files that did not change (check-only runs)
 ```
 
-Makefile targets: `make v2`, `make run_v2`, `make test_v2`.
+Makefile targets: `make` (builds `./modal`), `make test`, `make bench [N=…]`, `make stencils`.
 
 ---
 
@@ -428,7 +435,7 @@ changes many interdependent files; apply the whole zip.
 
 ## 9. Known limits and unfinished work
 
-- No control flow, no typed local declarations.
+- No control flow (typed locals exist since §16).
 - Overloads are selected by argument count, not argument types.
 - The implicit `nil` in return types is not modelled; `nil` and "returns nothing" are two
   type ids (`T_NIL`, `T_VOID`).
@@ -468,7 +475,7 @@ In the order that unlocks the most:
 2. Multi-file code generation in the C backend (so `main.modal` compiles).
 3. A small typed intermediate language, then a QBE-text backend for native code.
 4. Contract file on disk: breaking-change detection and skipping unchanged domains.
-5. Overload selection by argument types; typed locals.
+5. Overload selection by argument types.
 6. Parallel scanning and parsing of files.
 
 ---
@@ -898,8 +905,531 @@ Cortex-M backend with register allocation, is deferred.
 - The generator from the earlier 2.9 MB benchmark was not kept; `big` replaces it, so its
   numbers are not comparable with §13's.
 - Seen while writing it: for `big`, `--stats` reports more memory in use (44,771 KB) than
-  taken (40,496 KB). The two counters measure different things at that size; to look at with
-  §4.3.
+  taken (40,496 KB). Explained in §15.4: "in use" counts capacity handed out, written or not.
+
+### 15.4 Compiler memory: a shared page, a smaller name table (p.md §4.3)
+
+- **The premise was measured first, and it does not hold here.** p.md §2.1 put the cost of
+  the first function and of `native_begin` on first-touch page faults. Touching the first
+  32 KB of every region before the timers start saves 2–4 µs of secret.modal's ~0.1 ms.
+  Code generation adds ~10,000 instructions (884K → 894K for the whole process, dyld
+  included) and no page faults over checking alone. The ~60 µs emit shows is cold caches and
+  a CPU that has barely started, in a process that lives ~1 ms. So this step is about
+  memory, not time.
+- **Eight regions share one 16 KB page:** code, MIR, function ranges, calls, runtime calls, C
+  library calls, branches and the list stage. Each starts in a 1–2 KB slice of it, and on the
+  first push that does not fit, moves to its own reservation. Allocations already made in the
+  slice stay where they are (the slice is never given to anyone else); an array still growing
+  is copied out by `region_grow_array` (at most once, at most the slice). Only regions whose
+  every user reaches its arrays through a pointer `region_grow_array` reassigns, and keeps no
+  pointer across a growth (audited: `emit.c`, `lower.c`, the parser's `list_at` callers).
+- **Not shared:** arena, tokens, nodes, symbols, types, scopes, names, symbol names. Code keeps
+  pointers into them (`SYM(id)`, `NODE(u, id)`, arena data), so moving them could change
+  output in a path no test runs. Sharing them would reach p.md's one page, but not under
+  the ground rule.
+- **Move test:** `-DREGION_SHARE_TEST=N` gives each shared region an N-byte slice on pages of
+  its own, made `PROT_NONE` once copied out of, so a pointer kept across the move faults
+  instead of reading stale bytes. Run with N = 1, 2, 4, 16 and 64 KB: the suite unchanged at
+  every N, the examples identical, the `big` executable byte-identical at every N, 52 fuzz
+  programs identical (N = 2 KB). This found a real bug in the first version: a region that
+  left its slice was handed a slice again instead of its own reservation.
+- **Name table:** starts at 128 slots (1 KB; the 23 keywords, then doubling), not 1,024
+  (8 KB). Name ids follow insertion order, not the table, so output cannot change.
+- **`--stats`** counts the shared page once and says which regions are still in it.
+- **Measured** (`make bench`): taken at peak, secret.modal 256 → **144 KB**, hello 240 → 160,
+  structs 272 → 176; in use 43.1 → **36.1 KB** (arena 20.5 → 13.5 KB, one page instead of two);
+  compiler RSS 1.9 → 1.8 MB, page faults 319 → 312. `big` unchanged (41.2 MB RSS; +16 KB for
+  the shared page, which its regions leave at once).
+- **Verified:** 61 files byte-identical to the previous compiler's (every example, both CPUs,
+  Linux, bare metal, objects); suite unchanged; ASan/UBSan clean.
+- **What the remaining "in use" is:** tokens 5.4 KB and nodes 5.5 KB (the program's own),
+  the arena's source text, side tables sized to the nodes, and per-symbol tables at the
+  64-entry minimum of `region_grow_array`. p.md's 4.3 KB needs on-demand scanning (tokens
+  alone are 3 KB); that changes no behaviour, but is a scanner/parser rework of its own, and
+  the numbers do not ask for it.
+
+## 16. Locals declared with their type
+
+- **The module level's forms, in a block,** under the same rule (type first mutable, type last
+  immutable): `name: T = value` (immutable; it needs its value), `T name = value`, and `T name`
+  (mutable, starting at zero). `name := value` stays, mutable as before, its type taken from
+  the value.
+- **Parsing:** `local_decl_at` decides from the first tokens: `name:` / `name,` cannot start an
+  expression, nor can a type followed by a name on the same line (`u8 x`, `pkg.T x`, `[]u8 s`,
+  `*T p`); `*p = 3` stays an assignment. `parse_local` reuses the module level's parsers; the
+  node is `AST_FIELD_DECL` (a = type, b = value).
+- **Refused in a block, each with its fix:** several names (`a, b: T = v` would compute the
+  shared value once per name), `name: T` without a value, a struct, a function (use a
+  literal), a device (`@`).
+- **Checking:** the value must fit the declared type, as at module level (no implicit
+  widening: `u64 t = a` with `a: u8` is an error), and constants are range-checked.
+  Assigning an immutable local says "local 'a' is immutable" (parameters say "parameter").
+- **Backends:** the checker gives the node the declared type, and the lowering and the C
+  backend convert the value to it, as they do for `:=`. With no value: zero (a struct, every
+  slot).
+- **Tested:** `examples/run/locals.modal` on C, arm64, x86-64 and Linux ELF (both CPUs);
+  `examples/errors/locals.modal` and `locals_syntax.modal`; 82 fuzz programs whose functions
+  return through typed locals of every form, identical across in-memory, exec and C;
+  existing programs compile byte-identically (51 files, C and native).
+
+## 17. Checker fixes, and run-time behaviour made the same everywhere
+
+- **`:=` is immutable everywhere** (owner's decision): assigning one says "bound with
+  `n := ...`; declare it `T n = ...`". `examples/run/structs.modal` was the one program that
+  reassigned one (`rec u = r` now).
+- **`:=` literals are range-checked** (`x := 3000000000` does not fit the `int` it becomes).
+- **A body with a return type must reach a `return`** (with no control flow yet: a `return`
+  among its statements, or in a block among them). A literal is named by its binding.
+- **`< > <= >=` order numbers only;** bools, strings and structs are refused by the checker.
+  Unary `-` on unsigned stays: it wraps, like `0 - x`.
+- **The C backend's arithmetic is no longer undefined:** signed `+ - *` (and `u16 * u16`, which
+  C promotes to `int`) were computed in C's own types. Now they are computed in `uint64_t` and
+  converted back, which is the native code's wrap. UBSan reported 3 errors on the old output of
+  a test program and none on the new one.
+- **Division is defined on every backend** (docs/guards.md):
+  - a divisor that is not a known non-zero constant is checked in the MIR (`JNZ` then
+    `MIR_TRAP`);
+  - the trap writes the output so far, then `file:line:col: division by zero`, and the
+    status is 1;
+  - `INT_MIN / -1` wraps (the `DIV` stencil macro, which costs nothing for unsigned);
+  - the C backend's `m_div_<type>` does the same;
+  - a literal zero divisor is a compile error.
+- **Ending through `exit`:** `__builtin_setjmp` does not exist for arm64 in Apple's clang, so a
+  trap calls `exit(1)`:
+  - macOS: the system's `exit`, imported only by programs that can trap (the Mach-O writer
+    now imports only the C functions a program calls);
+  - Linux: an `exit_group` stub;
+  - bare metal: the halt, with the status in x0 / edi;
+  - `elfrun` now patches every system call and halt it finds, not only the first.
+- **A trap does not count as output** for the output buffer, so a board program does not grow
+  4 KB because it divides.
+- **Verified:**
+  - `examples/run/divide.modal` gives the same bytes and status on C, arm64, x86-64 and
+    Linux ELF (both CPUs);
+  - bare metal halts with 1;
+  - `examples/errors/checks.modal` for the checker;
+  - `make fuzz` (`src/v2/tools/fuzz.py`, now kept in the tree): 224 programs (8 trapping)
+    identical across C, in-memory, exec and x86-64;
+  - native executables of every example without a division are byte-identical to the last
+    commit's (31 files);
+  - ASan/UBSan clean.
+
+## 18. The macOS arm64 executable has a floor of ~16.6 KB (p.md §4.6, B1), measured
+
+Experiments with a modified writer (outside the tree) and a hand-built probe; every file
+passed `codesign -v` unless noted.
+
+| Layout | File | Result |
+|---|---|---|
+| today: `__TEXT` padded to 16 KB, `__LINKEDIT` at 16 KB | 16,704 B | runs |
+| `__TEXT` file size = its real end (not a page), `__LINKEDIT` at 16 KB | 16,704 B | runs |
+| only the first 4 KB hashed (codeLimit 4096; `codesign` calls it invalid) | 16,576 B | runs |
+| `__LINKEDIT` at offset 0, overlapping `__TEXT` | 1,520 B | killed (SIGKILL) |
+| `__LINKEDIT` right after the code (16-byte aligned) | 1,520 B | killed |
+| `__LINKEDIT` at 4 KB | 4,320 B | killed |
+| `__LINKEDIT` at 0, overlapping, file over 16 KB | 16,640 B | killed |
+| static: `LC_UNIXTHREAD`, direct system calls, `__LINKEDIT` at 16 KB | 16,640 B | killed |
+| static, no `__LINKEDIT`, header + code + signature | 800 B | killed ("main executable failed strict validation") |
+| dyld + `LC_MAIN`, no imports, `__LINKEDIT` at 16 KB (probe) | 16,640 B | runs |
+
+- **The kernel's rules, as measured:**
+  - an arm64 executable must use dyld;
+  - dyld needs a `__LINKEDIT` at a 16 KB-aligned file offset that does not overlap `__TEXT`;
+  - so the smallest file that runs is 16,384 B plus `__LINKEDIT`.
+- **Where hello stands:** 16,704 B, within 64 B of the probe. **2 KB is not reachable on
+  macOS arm64 as an executable file**; that number is for Linux and bare metal (where hello
+  is 1.3 KB today).
+- **Other macOS targets:** x86-64 macOS uses 4 KB pages, and its hello is 4,320 B.
+- **What still shrinks on macOS:** the code and RAM inside the page (B2, B3), and the start-up
+  cost, not the file.
+
+## 19. The MIR optimizer and constant programs (p.md B2, B3)
+
+- **`mir/opt.c`:** one function at a time, after `finish_frame` and before `keep_if_small`, so
+  an inlined body is already optimized and its constants then meet the caller's. Each pass is
+  conservative:
+  - **fold:** constants through copies, arithmetic (the lowering's own `compute`, exported as
+    `mir_compute`, so the same wrap as the stencils) and memory (a store then a load of the
+    same place and width); a branch on a known value; a divisor guard that cannot fire.
+    Knowledge is per straight-line block.
+  - **output:** a known number or bool written as text; runs of constant text, spaces and
+    newlines merged into one string.
+  - **stores:** a store overwritten before anything could read it; stores into a frame struct
+    whose address is only ever stored through.
+  - **dce:** a pure instruction whose result is not read before it is overwritten, or before
+    the function ends (window slots are read only by a CALL).
+  - Slots whose address is taken are never tracked.
+- **Device registers:** a load or store of a field placed with `@` is marked
+  `MIR_MEM_DEVICE` (and a struct copy of a register block). It is never forwarded, merged or
+  removed, and it is a barrier. A device can arrive as an ordinary `self`, so without the mark
+  the optimizer could not tell a register from memory.
+- **Direct output:** a program whose only output is constant text, written at most 16 times
+  with no recursion, writes each string straight to the system (`rt_write_direct`, the
+  `entry_direct` stencils). There is no 4 KB buffer, and no `rt_put` / `rt_flush`.
+- **Constant programs:** when `main`'s optimized MIR only writes constant text and returns a
+  constant, and there are no module variables, the entry is that text and that status. It is
+  hand-written per CPU (`const_entry`): `write(1, text, n)`, then the status. main, the runtime
+  and the value stack are not in the program.
+- **Measured** (`make bench`, Linux sizes from `-o`):
+
+| | before | after |
+|---|---|---|
+| secret: code / RAM | 1,116 B / 4,576 B | **40 B / 128 B** |
+| hello: code / RAM | 492 B / 4,320 B | **56 B / 128 B** |
+| counter, literals, locals: code | 2,824 / 1,120 / 2,616 B | 1,852 / 56 / 1,956 B |
+| hello / secret, arm64 Linux ELF | 692 / 1,316 B | **256 / 240 B** |
+| structs, patterns: code | 5,816 / 5,820 B | 5,816 / 5,488 B (struct copies and recursion: next) |
+| big (3 MB): emit | 23.6 ms | 29.5 ms (the optimizer on 54,000 functions: to win back) |
+
+- **Verified:**
+  - suite (179);
+  - `make fuzz` with struct programs (`FUZZ_KIND=struct`: fields stored several times, read
+    back, copied and passed): 400+ programs identical across C, in-memory, exec and x86-64;
+  - ASan/UBSan on the examples and on 33 fuzz programs;
+  - every constant program on arm64, x86-64, both Linux ELFs and in memory, exit status
+    included.
+- **What is left for code size:**
+  - struct copies (`structs.modal`);
+  - frame size not recomputed after dead slots;
+  - the 108 B `zero` stencil;
+  - register-indexed slot loads (`movz` + `ldr [x0, x8, lsl 3]` instead of `ldr [x0, #off]`);
+  - the generic entry when the program is not constant.
+
+## 20. Register allocation, exact output buffer, scalar fields (p.md §4.4, §4.5, §4.7)
+
+- **Register allocation (`backend/native/regalloc.c`), linear scan** (Poletto & Sarkar) over
+  the MIR's frame slots:
+  - **Which slots:** a slot whose address is never taken (`ADDR`), that no `ZERO` block covers,
+    that is not part of a call window, and is below 4096. Everything else stays in the frame.
+  - **Liveness** by basic blocks, iterated to a fixed point (loops from output routines settle
+    in two passes). A slot's range is the hull of every point where it is live or named.
+  - **Two classes:**
+    - *preserved* registers (arm64 x19–x28, x86-64 rbx rbp r12–r15) for ranges a call out
+      crosses. The C calling convention keeps them, so every stencil, runtime function and C
+      function leaves them intact; a Modal function saves the ones it uses, in pairs to keep
+      the stack aligned.
+    - *scratch* registers (arm64 x3–x8 and x12–x15, x86-64 r8–r11) for ranges no call out
+      crosses. Nothing is saved, so most leaf functions have no prologue.
+  - **Fused compare and branch:** a comparison read only by the branch after it gets no slot;
+    the pair becomes `cmp` + `b.cond` (`cbz`/`cbnz` against 0) or `cmp` + `jcc`.
+  - Parameters live at entry are loaded first; a slot no instruction names (a parameter only
+    passed back) gets no register.
+- **Generation (`emit.c`, "registers"):** a function with registers is encoded instruction by
+  instruction, in 1–4 machine instructions each.
+  - **Frame access:** slots in the frame are read at short offsets (`ldr x9, [x0, #s*8]`,
+    `mov rax, [rdi + s*8]`). That is also the register-indexed load p.md listed as left.
+  - **Stencils still used:** output, traps, and division on x86-64 (`idiv` needs rax and rdx,
+    and faults on INT64_MIN / -1).
+  - **Direct calls:** move `f` up by the frame, `bl`/`call`, then move it back. That is 4–5
+    instructions against the call stencil's 18, and the callee returns with `f` and `c`
+    unchanged because every stencil passes them on.
+  - **The value rule:** values stay canonical (zero- or sign-extended), so arithmetic is done
+    in 64 bits and the result is extended from its width again. That is the same wrap as the
+    stencils and the C backend.
+  - **Always on:** every function gets registers. Generating each small function both ways
+    showed the stencil form shorter only for a lone `ret`, and that now gets no register
+    either. `MODAL_REGS=0` turns registers off, to compare.
+- **Frames without register-only slots:** a slot that lives only in a register loses its place
+  in the frame, and the slots above it (the call window included) move down.
+  - **What keeps its place:** parameters (the caller writes them), the result (the caller reads
+    it), slots in no register, and on x86-64 the operands of a division done by its stencil
+    from the frame.
+  - **Where that is known:** `MirFunc.param_slots`, which the lowering now records.
+  - **Effect:** value stacks are 55–80% smaller (counter 152 → 56 B, device 184 → 80 B,
+    divide 72 → 16 B). Together with the exact output buffer, RAM is below the no-register
+    figure, despite the saved registers.
+- **The machine stack is counted exactly:** saved registers and the call frame of each
+  function on the deepest chain (`StackNeed.machine`), not a maximum times the depth.
+- **§4.4, exact output buffer:**
+  - Each function's most output is computed: a string's length from the `str` before it in
+    its block, a number 20 characters, a bool 5. It is unknown for a string from elsewhere or
+    a function that loops.
+  - The call graph sums it, counting each call site, and unknown under recursion.
+  - When the total fits `output_buffer`, the buffer is exactly that. The program still
+    flushes once at the end, so its output and order are unchanged.
+- **§4.4, runtime frame:** the deepest chain of runtime functions from the stencil that calls
+  them, down to the system call. Before, it was the sum of every runtime function, without the
+  calling stencil's frame.
+- **§4.5, scalar fields (`mir/opt.c` fields):** a load or store through the address of this
+  function's own struct, at a whole slot, becomes the slot itself. A narrower field at the start
+  of a slot becomes `norm` from its width, since both targets are little-endian. When the address
+  has no other use left, dce removes it and the slots are plain values again.
+- **§4.5, runtime for size:** the runtime functions are compiled `minsize` (clang's `-Oz`, for
+  them only).
+- **Compile time:** `plan_binop` called `strlen` on its table for every operator, about 10 ms
+  on big. Without it, emit with registers takes 26.5 ms, against 29.5 ms before registers.
+- **Measured:** arm64 code and RAM from `--stats`; RAM includes the exact output buffer in both
+  columns. The x86-64 code is in the next table.
+
+| program | no registers | registers |
+|---|---|---|
+| structs | 5,716 B | **3,576 B** |
+| patterns | 5,464 B | **3,832 B** |
+| device | 2,052 B / RAM 512 B | **952 B** / RAM **432 B** |
+| context | 1,852 B / RAM 576 B | **1,196 B** / RAM **528 B** |
+| counter | 1,828 B / RAM 672 B (4,096 B buffer before) | **1,324 B** / RAM **608 B** |
+| locals | 1,924 B | **1,492 B** |
+| blink (arm64-none) | 2,112 B / RAM 1,296 B | **896 B** / RAM 1,328 B |
+| big (3 MB): emit / RAM | 29.5 ms / 7,376 B (before this step) | **27.1 ms / 6,496 B** |
+
+| x86-64 code | no registers | registers |
+|---|---|---|
+| structs | 5,152 B | **3,380 B** |
+| patterns | 4,532 B | **3,084 B** |
+| device | 1,984 B | **984 B** |
+
+  - Linux arm64 ELF: structs 5,916 → 3,776 B, device 2,252 → 1,152 B.
+  - Constant programs are unchanged: secret 40 B of code, now 64 B of RAM (the runtime
+    estimate is gone).
+- **p.md §4.7, the other two items:**
+  - *Superinstructions:* replaced by the direct encoding (a fused compare and branch is one).
+  - *Compact holes everywhere:* the direct encoding uses exact immediates.
+
+  Stencils remain for what calls out, where a hole's size does not matter.
+- **Verified:**
+  - suite: 179 passing, also with registers forced on every function before that became the
+    rule;
+  - `make fuzz` with a new generator, `FUZZ_KIND=pressure`: more values live than registers,
+    across calls. Over 2,000 programs across mix, struct, scalar and pressure, with registers
+    on, forced and off, all identical across C, in memory, exec and x86-64;
+  - ASan/UBSan: every example on four targets, with registers forced.
+
+## 21. Values split from slots, direct runtime calls, identical-code folding (p.md B5)
+
+- **Webs (regalloc.c, step 2).** The lowering reuses a temporary slot for unrelated values:
+  every string address of a `print` goes through one slot, for example. One range for all of
+  them crossed every write, so the slot needed a preserved register.
+  - Each value that dies inside its block now gets a name of its own (`RA_VIRTUAL | k`). A value
+    still live when its block ends keeps the slot's name, since the next blocks read it.
+  - Liveness runs again over the names. A split value that gets no register uses its slot's
+    place in the frame, which no other value of that slot needs at the same time.
+  - The result's slots are never split, because the return reads them by slot. A function in
+    which no slot is written twice is not split at all (no second pass).
+- **Direct runtime calls.** In a function that calls no other Modal function (a leaf), `f`
+  and `c` live in x19/x20 (rbx/r14).
+  - Each output or trap call is `mov x1, value; mov x0, x20; bl rt_*`, then `f` and `c` are
+    moved back: 20 B, against 56–76 B for the write stencil. On x86-64 it's 17 B against 41–47 B.
+  - Leaf functions only: there, the two registers cost what the write stencil's own frame did,
+    at the same moment. In a function that calls others they would stay saved under every
+    nested call, which is RAM along the deepest chain.
+- **arm64 link register:** a function that calls out saves x30 once, in its prologue, paired
+  with a saved register when the count is odd, instead of around each call.
+- **Identical-code folding** (gold/lld `--icf`, in the shake): two kept functions with the same
+  bytes, and the same calls, runtime calls and C calls at the same places, are one. The later
+  one is dropped and its callers go to the first. `--stats` prints how many were folded.
+  `examples/run/same.modal` has two (the suite checks it), and the fuzzer adds renamed copies.
+- **Compile time:** emit on big is 29.5 ms, the same as before register allocation. The
+  per-function scans are merged into one, and `main` is found once instead of per function.
+- **Measured** (arm64 `--stats`; "before" is §20):
+
+| program | code §20 → now | RAM §20 → now |
+|---|---|---|
+| counter | 1,324 → **1,052 B** | 608 → **576 B** |
+| locals | 1,492 → **1,096 B** | 592 → **544 B** |
+| divide | 1,428 → **1,100 B** | 512 → 512 B |
+| globals | 1,056 → **892 B** | 448 → 464 B |
+| patterns | 3,832 → **3,632 B** | — (recursive) |
+| structs | 3,576 → **3,072 B** | — (recursive) |
+| blink (arm64-none) | 896 → **832 B** | 1,328 → 1,360 B |
+| x86-64: counter / structs | 1,116 / 3,380 → **964 / 3,172 B** | |
+
+  - `examples/budget/mod.modal`'s `max_code` went from 1500 to 1200: deep.modal fits 1,500 B
+    now (1,452 B), and the example is there to be over it.
+  - deep.modal's RAM is 624 → 672 B. Its function `a` keeps four locals live across a print,
+    and they live in saved registers now; its value stack is 72 → 40 B.
+- **Verified:**
+  - suite: 185 passing, 6 of them new (`same` on every backend, and folding);
+  - fuzz: over 1,300 programs across mix (with renamed copies), struct, scalar and pressure,
+    with registers on and off; 0 differ;
+  - ASan/UBSan: every example on four targets. It found pointer arithmetic on a `NULL` call
+    list in the folding code, now fixed.
+- **What is left of B5:** the optimized-MIR cache and specialization of constant-argument
+  calls, for which comptime is the natural base. Also machine outlining, string pooling, and
+  tail and partial inlining (none of the examples has their patterns).
+
+## 22. Function kinds in the contract (comptime step 0)
+
+- **What the checker notes** (`sema/check.c`, "function kinds"), per body:
+  - its effects, each with the byte offset of its first occurrence. That is an offset, not a
+    token, because a deferred body's tokens are gone once it is checked. The effects are:
+    output (`print`, `write`, `std.sys.put`, an `out`), a device register (a field placed with
+    `@`, or a device), and a mutable module variable (read or written);
+  - the functions it calls, plus the next pattern clause, since a clause that does not match
+    goes on to it.
+- **The closure** (`sema_fn_kind`):
+  - callee lists are built once by counting sort;
+  - a memoized walk gives every function's kind exactly where there is no cycle;
+  - a fixed point passed back along the edges settles cycles. Mutual recursion through
+    clauses was the case that needed it;
+  - the reason is found breadth first: the nearest function that has the effect itself, and
+    the callee of this function that leads there.
+- **`--sig`:**
+  - each contract line gets a column: `both`, `run time  (prints, through 'log',
+    kinds.modal:10)`, or `compile time  (declared in mod.modal)`;
+  - a file no contract covers, such as the entry file, gets a `== functions: path` listing;
+  - nothing generated depends on it yet.
+- **Cost:** checking is unchanged on big (18.4 ms in total), and `--sig` on big takes 0.1 s.
+- **Verified:**
+  - `examples/kinds.modal` covers both, prints, through a callee, a mutable variable, and a
+    cycle through pattern clauses. With `device.modal` for registers, that's 6 suite checks
+    (191 passing);
+  - ASan/UBSan on `--sig` of every example, with `--repeat`.
+
+## 23. The compiler runs code: module-level initializers (comptime step 1)
+
+- **What works:**
+  - `limit: u64 = fact(10)`, `a := area(7)` and `u64 total = limit / 1000` are computed while
+    compiling;
+  - the C, arm64, x86-64 and Linux backends then use the number, as if it were written there:
+    a constant is folded, and a variable's first value is stored by main's prologue;
+  - a module-level `x := expr` now has its value's type (it was "anything" before, the gap in
+    the type audit).
+- **When:** after a file's declarations are checked and before its bodies (`comptime_unit`
+  in `sema_check`). Every signature is known by then, and so is every earlier constant.
+- **The engine (`sema/comptime.c`):** an interpreter over the MIR, the instructions the
+  machine backends generate from.
+  - Arithmetic is `mir_compute`, the wrap every backend has; INT_MIN / -1 wraps as it does in
+    the program.
+  - Memory is its own value stack, so struct values and methods on them work. Any other
+    pointer is refused.
+  - Strings it makes are its own blocks.
+- **Callees, on demand:** a function the evaluation calls is checked again, quietly. That's a
+  new `cx.quiet`: its errors are reported in its own turn, not twice. It is then lowered (the
+  capture replaces `codegen_function` for that check), and its MIR is kept in the arena for
+  the rest of the compilation.
+- **No capabilities** (docs/comptime.md §2). Output, a device register, a mutable module
+  variable and a division by zero each stop the evaluation, with an error at the declaration
+  that names the function: `'a' cannot be computed by the compiler: 'log' prints (it runs
+  only in the program)`.
+- **Budgets:** `comptime_steps` (1,000,000) and `comptime_depth` (1,000) in mod.modal.
+- **The differential test** (`make fuzz`): mixed programs bind random calls at module level
+  and print `ct <module value == the same call at run time>`.
+  - `ct false` is a difference, beyond the four backends agreeing.
+  - In 200 generated programs, 105 ran such calls: 200 comparisons, all equal. The 21 the
+    compiler refused divide by zero.
+- **Found on the way:** the lowering kept bodies for inlining, globals and output routines
+  from the last compile in the same process (`--repeat`). The compiler lowers while checking
+  now, so `mir_reset` runs with each compile; ASan found it.
+- **Memory:**
+  - kind facts are recorded only for `--sig`;
+  - the shake releases its tables (identical-code folding needed 3.7 MB on big);
+  - big uses 41.1 MB in use, against 42.5 MB before.
+- **Verified:**
+  - suite: 200 passing. `comptime.modal` runs on every backend and on Linux ELF, and 4 checks
+    cover the refusals;
+  - fuzz: 0 differ across mix, struct, scalar and pressure, with registers on and off;
+  - ASan/UBSan on the comptime examples with `--run`, native, x86-64 Linux, `--sig` and
+    `--repeat`.
+- **Not yet:** all four done in §24 (string and struct values, `mod.modal` functions, a callee in a
+  file not checked yet, `assert` / `sizeof`).
+
+---
+
+## 24. Strings and structs from the compiler, mod.modal, assert and sizeof, folded calls
+
+Comptime steps 1 and 2 (docs/comptime.md), and what p.md B5 left: calls with constant arguments.
+
+- **Strings and structs leave the compiler** (`sema/comptime.c`):
+  - `p := pt.make(-7)`, `title := name(1)`, `[]u8 status = name(0)`. A module-level `:=` now has
+    the type of a string or struct value too (it was "external");
+  - the result's slots are kept, in the target's C layout. Each string field is found from the
+    type (`portable`), and its bytes are copied out of the interpreter's block;
+  - the lowering writes a struct as constants and strings into its slots, at each use. A string
+    variable's first value is stored by main's prologue;
+  - the C backend writes a designated initializer (`{.x = ..., .name = {(const uint8_t *)"...", 5}}`),
+    every byte in octal. A struct constant is not `const` in C, since methods take its address
+    as `self`;
+  - refused, with the reason: a reference (it would point into the compiler), a block of
+    device registers, a mutable module variable holding a struct (not supported yet), and a
+    string on a target whose pointers are not 8 bytes.
+- **mod.modal functions run in the compiler:**
+  - every file of the domain sees them by name, after its own declarations
+    (`module_domain_function`);
+  - a call from a body is an error: "'square' is declared in mod.modal, so it runs only in the
+    compiler. To use its value here, bind it at module level";
+  - from another domain they are not part of the face (like C's `static`);
+  - they are never handed to a backend.
+  - `examples/run/compiled/` runs them on C, arm64 and x86-64.
+- **A callee in a file that is not checked yet:** its declarations are checked first, quietly,
+  then its body (`sema_lower_for_comptime`). This is what makes mod.modal work, since it is
+  checked last.
+- **Unsized constants:**
+  - `n := 5` and `k := n * 3 + 1` at module level are unsized. Their value is the checker's
+    exact one (`sema_unsized_value`);
+  - the range check sees through the name: `f(n)` with `n := 300` is "300 does not fit u8";
+  - a constant outside -2^63 .. 2^64 - 1 is an error at its declaration;
+  - the C backend writes the number where the name is used, so C types it as it types the
+    literal. The native backends give it the literal's variant (`c_variant`).
+  - A local `x := n` is an `int`, as `x := 5` is.
+- **assert and sizeof** are std functions (`import("std").debug.assert`,
+  `import("std").mem.sizeof`); the two keywords are gone from the scanner.
+  - The parser: a module-level `name(...)` or `a.b(...)` that ends its line is a statement. A
+    declaration always has a body, so the two never meet; a body that opens on the next line is
+    still a declaration.
+  - At module level (`statement` in comptime.c), the compiler runs it:
+    - `assertion failed: sizeof(header) == 12 (8 == 12)`: both sides of a comparison, signed
+      when the operands are;
+    - a call made for the asserts inside it fails with where: `'checks' fails at
+      asserts.modal:10:5: assertion failed: neg(3) > 0`;
+    - output there is refused, as for initializers.
+  - In a body, it is a run-time guard. The MIR checks the condition and calls `trap` with
+    `file:line:col: assertion failed: <condition>`, so the output so far comes first, then
+    status 1. The C backend calls `m_trap` with the same text.
+  - `sizeof(T or value)` is an unsized constant of the target's layout. The checker,
+    `const_value`, and the C backend fold it.
+- **Calls with constant arguments are computed (B5):**
+  - in the optimizer's `fold`, a `MIR_CALL` whose argument slots are all known runs in the same
+    interpreter, and the call becomes `const` (a void one goes away). On anything the
+    interpreter refuses (output, a trap, a mutable variable, a budget), the call stays: it is an
+    optimization, never an error;
+  - a fold has a budget of 20,000 steps and a compilation 2,000,000;
+  - results are kept per (function, arguments), in 64 entries;
+  - only int, bool and void results are folded (a string would point into the compiler);
+  - the callee's argument slots come from its signature (`mir_param_slots`), so it is lowered
+    for the compiler only when every argument is known. The first version lowered every
+    callee early: emit on big went 35 → 71 ms;
+  - lowering inside a lowering: `mir_nest_begin` / `mir_nest_end` save the lowering state.
+    The nested functions are lowered after the caller's MIR in the region. When the region
+    moves to a reservation of its own meanwhile, the nested start follows it; without this,
+    patterns.modal ran out of memory;
+  - one level only, and none inside a quiet (compile-time) lowering;
+  - `--stats` says how many calls were computed.
+- **Memory:**
+  - the interpreter's value stack starts at 8 KB and is given 4 times more when an
+    evaluation needs it, which then runs again; it cannot grow in place, since it holds
+    addresses into itself. A fold has a fixed 8 KB;
+  - lowered functions are found through a small map, not a 64 B table per symbol;
+  - in use: comptime.modal 72 KB (a first version took 715 KB, with fixed 512 KB and 64 KB stacks
+    and a 90 KB memo); big 41.25 MB (41.14 MB without folds; 46.9 MB with the per-symbol table).
+- **Measured** (arm64 `--stats`, `--time` best of 3):
+
+| program | before | now |
+|---|---|---|
+| big: code / RAM | 16,680 / 6,336 B | **52 / 64 B** (the three chains computed) |
+| big: emit / total | 35 / 56 ms | **31.5 / 52 ms** |
+| comptime.modal: calls computed | — | 2 |
+| patterns.modal: calls computed | — | 12 |
+
+- **Examples changed so that they still cover what they test:**
+  - `same.modal`, `patterns.modal` and `board/blink.modal` pass one argument through a
+    mutable module variable. Their calls would otherwise be computed: no folding left to
+    see, no recursion left in the image;
+  - blink's RAM is 1,360 → 1,376 B, the variable's slot.
+- **Verified:**
+  - suite: 217 passing. The 8 failures are as before this work: `main.modal` uses `nil` as
+    a type, `add.modal` is v1 syntax, and the owner's edit of `output.modal` prints 43, not
+    42;
+  - new: guards.modal (every backend and both ELFs), compiled/ (3 backends), and 11 error
+    checks;
+  - fuzz: 0 differ in 991 programs (mix, struct, scalar, pressure, registers on and off). In
+    a sample of 40, 49 calls were computed;
+  - ASan/UBSan: the suite (217), the fuzzer, and big with `--repeat`.
+- **Not yet:**
+  - partial specialization: a copy of a function for some constant arguments. It costs code
+    size, so it needs a policy;
+  - a cross-run cache of optimized MIR (p.md §5.4, incremental builds);
+  - target and config values at compile time, arrays;
+  - `assert` to a `fault` context (guards.md step 3).
 
 ---
 

@@ -1,6 +1,7 @@
 # Modal: compile-time evaluation
 
 Status: 2026-11-12. This replaces the earlier keyword version. It is the design, then the steps.
+Steps 0–2 are done except target and config values (context.md §22–24).
 Companions: `docs/p.md` (performance), `docs/guards.md` (faults), `docs/context.md` (record).
 
 ---
@@ -91,7 +92,9 @@ the machine that has what it needs**. Each function's needs are inferred over th
 - **`mod.modal` is the compiler's file.** It already holds what the compiler evaluates
   (configuration, imports). Functions declared there are compile time only and internal to
   the domain, the way C's `static` keeps a function inside its file. It is the position rule
-  at the level of files.
+  at the level of files. Done (context.md §24): every file of the domain calls them by name
+  from a module-level position; a call from a body, or from another domain, is an error; they
+  are never generated.
 - **Compile-time capabilities are deterministic inputs only:** the source files, the target
   description and the configuration. Compile time cannot print, read the clock, or reach the
   network. So results can be cached by the hash of their inputs, and a rebuild with the same
@@ -120,7 +123,10 @@ Every module-level binding is compile time:
 - `limit: u64 = e` and `limit := e` are compile-time constants, embedded as data.
 - `u64 count = e` is a run-time variable whose initial value the compiler computes.
 - **Integer constants stay unsized** until they meet a type, like a literal. That way
-  `n := 5` then `f(n)` with a `u8` parameter works exactly as `f(5)` does (today it does not).
+  `n := 5` then `f(n)` with a `u8` parameter works exactly as `f(5)` does, and `n := 300` passed
+  to a `u8` is the same range error as `f(300)`. The value is exact (the checker's 128-bit
+  arithmetic, as for literal expressions) and must fit some integer type (-2^63 to 2^64 - 1).
+  Done (context.md §24).
 
 ### 3.2 Parameters (generics without a marker)
 
@@ -164,7 +170,20 @@ by §2.2: an `import` inside a body is an error that says to bind it at module l
 `assert` and `sizeof` stop being reserved keywords and become std functions. At module level,
 `assert(...)` runs in the compiler and a failure is a compile error at that line, with both
 sides of a comparison. In a body it is a run-time guard (`docs/guards.md`). One function, and
-the position chooses the time.
+the position chooses the time. Done (context.md §24):
+
+```
+assert := import("std").debug.assert
+sizeof := import("std").mem.sizeof
+
+assert(sizeof(header) == 12)   -- error: assertion failed: sizeof(header) == 12 (8 == 12)
+tables()                       -- a call at module level runs for the asserts inside it
+```
+
+- A module-level call statement is one that ends its line (`name(...)` with nothing after the
+  `)`): a declaration always has a body, so the two never meet.
+- `sizeof(T)` takes a type (`u32`, a struct) or a value, and is an unsized constant from the
+  target's layout.
 
 ---
 
@@ -185,9 +204,9 @@ the position chooses the time.
   (zenc skips silently; revo has no limit).
 - **Errors that a running program would hit are compile errors**, with the chain of calls:
   division by zero, a budget, a pattern with no clause.
-- **Results:**
+- **Results** (all done, context.md §23–24):
   - integers and bool become immediates;
-  - strings and `[]u8` become bytes in the code (as string literals are today);
+  - strings and `[]u8` become bytes in the code (as string literals are);
   - structs of these become their fields, in the target's C layout;
   - a pointer is an error, since it would point into the compiler.
 - **Cache:** per (function content hash, arguments), joining `--cache`.
@@ -205,12 +224,13 @@ These are implemented after the binary work of p.md. Each is usable on its own.
    next pattern clause). `--sig` closes that over the call graph, a cycle included, and says
    why: `step(n: u8): u8   run time  (prints, through 'log', kinds.modal:10)`. A file outside
    any contract gets a `== functions:` listing.
-1. ~~**The MIR interpreter and module-level initializers** (`limit: u64 = fact(10)`)~~ done
-   for numbers and bools (context.md §23); then functions in `mod.modal`, and string and
-   struct values. Verified by a differential that cannot be gamed: generated
-   programs print `f(args)` from a body and the same call bound at module level, and they must
-   agree on C, arm64, x86-64 and Linux.
-2. **`assert`, `sizeof`,** target and config values. Arrays (`[N]T`, with `N` a compile-time
-   value) are designed here: the main embedded use is a table computed once, in flash.
+1. ~~**The MIR interpreter and module-level initializers** (`limit: u64 = fact(10)`)~~ done:
+   numbers and bools (context.md §23); string and struct values, functions in `mod.modal`,
+   callees in files not checked yet, unsized integer constants (§24). Verified by a
+   differential that cannot be gamed: generated programs print `f(args)` from a body and the
+   same call bound at module level, and they must agree on C, arm64, x86-64 and Linux.
+2. ~~**`assert`, `sizeof`**~~ done (§24). Left of this step: target and config values. Arrays
+   (`[N]T`, with `N` a compile-time value) are designed here: the main embedded use is a table
+   computed once, in flash.
 3. **`type` parameters** and specialization.
 4. **Lambdas** as compile-time arguments.

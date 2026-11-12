@@ -108,7 +108,10 @@ and a failure is a compile error. In a body it is a run-time check that traps wi
    (the call graph already knows which ones), trapping with kind `stack`.
 3. **The `fault` context:** routing, the boundary (resetting the value stack's top, and the
    native stack to the boundary's frame), and the target defaults.
-4. **`assert` as a std function** (with comptime step 2), and `--stats` listing the fault points.
+4. ~~**`assert` as a std function**~~ done (context.md §24): in a body it traps with
+   `file:line:col: assertion failed: <condition>`, status 1, the same on every backend; at
+   module level a failure is a compile error. Left: `--stats` listing the fault points, and the
+   `fault` context (step 3) receiving it with kind `assert`.
 
 ## 4. Open question for the owner
 

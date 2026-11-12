@@ -28,9 +28,19 @@ Done (details in context.md):
 | §4.1 | `--run` in memory (native), `posix_spawn` + build cache (C): 116 ms → 1.71 ms | §15.1 |
 | §4.2 | writer: hardware SHA-256, constant hash for padding pages, one allocation, one `write`; emit 0.139 → 0.079 ms | §15.2 |
 | §4.8 | `make bench`: every number of this file in one table | §15.3 |
+| §4.3 | eight regions in one shared page, name table from 128 slots: taken 256 → 144 KB, in use 43.1 → 36.1 KB | §15.4 |
+| B1 | macOS arm64 floor measured: ~16.6 KB (dyld required, `__LINKEDIT` 16 KB-aligned) | §18 |
+| B2, B3 | MIR optimizer, direct output, constant programs: secret code 1,116 → 40 B, RAM 4,576 → 128 B | §19 |
+| §4.7 | register allocation (linear scan, two register classes, fused compare-branch, direct calls): code −25–55% (structs 5,716 → 3,576 B, device 2,052 → 952 B) | §20 |
+| §4.4 | exact output buffer from the call graph (counter 4,096 → 168 B), runtime frame = deepest chain | §20 |
+| §4.5 | scalar fields (a frame struct's whole-slot fields become its slots), runtime compiled for size | §20 |
+| B5 | values split from slots (webs), direct runtime calls in leaves, identical-code folding: counter 1,324 → 1,052 B, structs 3,576 → 3,072 B | §21 |
+| comptime 0, 1 | function kinds in `--sig`; module-level initializers computed by the compiler (MIR interpreter) | §22, §23 |
+| comptime 1, 2 | string and struct values, `mod.modal` functions, unsized constants, `assert` / `sizeof` | §24 |
+| B5 | calls with constant arguments computed by the compiler (big: code 16,680 → 52 B, RAM 6,336 → 64 B, emit 35 → 31.5 ms) | §24 |
 
-Not done: step 4 (register allocation / Cortex-M backend, skipped by decision), interrupts
-(need QEMU or a board to verify).
+Not done: the Cortex-M backend (register allocation, its base, is done: §20), interrupts (need
+QEMU or a board to verify).
 
 ---
 
@@ -64,7 +74,7 @@ timer prints, so read them as proportions):
 | Part | Time | Why |
 |---|---|---|
 | Mach-O writer | **226–459 µs** | SHA-256 in software over the file twice (UUID + page hashes, ~33 KB at ~12 cycles/byte), the 16 KB page padding written one byte per call into a `realloc`ed buffer, then creating the file (APFS) |
-| first function lowered and emitted | 20–120 µs | first touch of fresh regions: page faults, not work |
+| first function lowered and emitted | 20–120 µs | first touch of fresh regions: page faults, not work (measured later, context.md §15.4: pre-touching every region saves only 2–4 µs; it is cold caches, not faults) |
 | `native_begin` | 23–51 µs | the same: regions and tables touched for the first time |
 | every other function | 1–3 µs each | the real work |
 | stack analysis, shake, runtime, fix-ups | ~15 µs | |
@@ -101,12 +111,12 @@ to the symbol capacity).
 |---|---|---|---|
 | `--run`, end to end | 116 ms → **1.71 ms** (0.6 ms over a 1.10 ms process start; done, §4.1) | ≤ 1 ms over process start | > 100× |
 | `emit` | 0.30–0.74 ms (0.139 ms best of 30 on the M4) → **0.079 ms** after §4.2; the rest is §4.3's page faults | ≤ 0.07 ms | 8× |
-| machine code | 1,116 B | ≤ 140 B | 8× |
-| executable, macOS arm64 | 16,688 B | ≤ 2,100 B (if §4.6 works; otherwise 16 KB is the system's floor) | 8× |
-| executable, Linux / bare metal | 1,316 B | ≤ 170 B | 8× |
-| program RAM | 4,576 B | ≤ 458 B | 10× |
-| compiler memory taken | 256 KB | ≤ 25.6 KB (on 16 KB pages: 16 KB, one page) | 10× |
-| compiler memory in use | 43.1 KB | ≤ 4.3 KB | 10× |
+| machine code | 1,116 B → **40 B** (secret; done, §19) | ≤ 140 B | 8× |
+| executable, macOS arm64 | 16,688 B | **floor measured: ~16.6 KB** (dyld required, `__LINKEDIT` 16 KB-aligned; context.md §18). 2 KB applies to Linux/bare metal | — |
+| executable, Linux / bare metal | 1,316 B → **240 B** (secret, arm64 Linux; 176 B of it is the ELF header and its two program headers) | ≤ 170 B | 8× |
+| program RAM | 4,576 B → **64 B** (secret; done, §19, §20) | ≤ 458 B | 10× |
+| compiler memory taken | 256 KB → **144 KB** (§4.3; the rest needs regions that must not move, see context.md §15.4) | ≤ 25.6 KB (on 16 KB pages: 16 KB, one page) | 10× |
+| compiler memory in use | 43.1 KB → **36.1 KB** | ≤ 4.3 KB | 10× |
 
 Two floors are not ours to remove and are said here so no step pretends otherwise:
 starting a process costs ~1–3 ms (kernel + dyld), and a macOS arm64 Mach-O that maps its
@@ -267,6 +277,11 @@ A direction to study and test against real programs, built from what Modal alrea
 Why it fits: predictable (every release point and check is visible in the source), fast (no
 collector, no reference counts), and light to write (no lifetimes, no `defer` boilerplate).
 
+### 5.1b Compile-time evaluation
+
+Its own plan: `docs/comptime.md` (`comptime e` at the use, evaluated by an interpreter over the
+MIR, compile time as a target with no capabilities).
+
 ### 5.2 Seeing the machine (C-like transparency)
 
 `--asm`: each source line, its MIR, and the exact machine code of each stencil, side by side
@@ -309,7 +324,11 @@ system calls, bare-metal `_start`).
 
 1. ~~§4.1: `--run` in memory, plus `posix_spawn` for the C backend.~~ Done (context.md §15.1).
 2. ~~§4.2 and §4.8: the writer and the bench script.~~ Done (context.md §15.2, §15.3).
-3. §4.3: one reservation for the regions, sized tables.
+3. ~~§4.3: one reservation for the regions, sized tables.~~ Done as far as the ground rule allows (context.md §15.4).
 
-Then §4.4, §4.5 (the MIR rework), §4.6 (experiment). §4.7's register allocation waits for your
-decision.
+~~Then §4.4, §4.5 (the MIR rework), §4.6 (experiment), §4.7's register allocation.~~ Done
+(context.md §18, §19, §20). Left of them:
+- §4.5's SSA-named operands: liveness over slots served the allocator, so they were not needed.
+- Narrow fields not at a slot's start: MIR has no bit insertion.
+- Recursive programs still take `stack` (512 KB by default) for their value stack: their
+  depth is not known when compiling.
