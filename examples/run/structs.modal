@@ -66,7 +66,7 @@ main(): u8 {
     pass(pass(t)).show()
     print(pass(s).d(), swap(s, r).d())
     print(pick(5, r))
-    u := r
+    rec u = r
     u = s.bump(1)
     u.show()
     return 0

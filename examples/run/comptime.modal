@@ -48,6 +48,9 @@ u64 total = limit / 1000    -- a variable whose first value the compiler compute
 good := tagged.mark(-300)   -- a struct the compiler computed: its fields are data
 empty: tagged = tagged.mark(0)
 title := name(1)            -- a string the compiler computed
+n := 5                      -- unsized, as the literal is: it becomes what it meets
+huge := n * 3000000000000000000
+u8 inc(u8 b): b + 1
 []u8 status = name(0)       -- a variable whose first string the compiler computed
 
 main(): u8 {
@@ -59,5 +62,6 @@ main(): u8 {
     print(title, status, "|")
     status = title
     print(status)
+    print(inc(n), n, huge)      -- a u8 argument, then printed as a literal would be
     return 0
 }

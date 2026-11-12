@@ -29,11 +29,10 @@ report(out: out, n: i32) {
 
 main(): u8 {
     out := out.new()
---    print("hello", 43)
---  write("no newline;", " then one\n")
---  report(-12345)
---  report(0)
-    a: bytes = sysput(10)
-  write(a)
+    print("hello", 43)
+    write("no newline;", " then one\n")
+    report(-12345)
+    report(0)
+    sysput(10)
     return 7
 }
