@@ -3,7 +3,7 @@ CC = gcc
 TARGET = jma
 LIBS = -lm -lpthread -ldl
 
-SRCS = ./src/v2/main.c ./src/v2/compiler/cx.c ./src/v2/compiler/syntax/scanner.c ./src/v2/compiler/syntax/parser/parser.c ./src/v2/compiler/syntax/parser/parse_decl.c ./src/v2/compiler/syntax/parser/parse_expr.c ./src/v2/compiler/syntax/parser/parse_stmt.c ./src/v2/compiler/ast/ast.c ./src/v2/compiler/ast/symbol.c ./src/v2/compiler/sema/resolve.c ./src/v2/compiler/sema/module.c ./src/v2/compiler/sema/check.c ./src/v2/compiler/sema/types.c ./src/v2/compiler/sema/layout.c ./src/v2/compiler/sema/cache.c ./src/v2/compiler/backend/registry.c ./src/v2/compiler/backend/c/emit.c ./src/v2/compiler/backend/native/emit.c ./src/v2/compiler/backend/native/macho.c ./src/v2/compiler/backend/native/elf.c ./src/v2/compiler/backend/native/run.c ./src/v2/compiler/backend/native/arch_arm64.c ./src/v2/compiler/backend/native/arch_x86_64.c ./src/v2/compiler/mir/lower.c
+SRCS = ./src/v2/main.c ./src/v2/compiler/cx.c ./src/v2/compiler/syntax/scanner.c ./src/v2/compiler/syntax/parser/parser.c ./src/v2/compiler/syntax/parser/parse_decl.c ./src/v2/compiler/syntax/parser/parse_expr.c ./src/v2/compiler/syntax/parser/parse_stmt.c ./src/v2/compiler/ast/ast.c ./src/v2/compiler/ast/symbol.c ./src/v2/compiler/sema/resolve.c ./src/v2/compiler/sema/module.c ./src/v2/compiler/sema/check.c ./src/v2/compiler/sema/types.c ./src/v2/compiler/sema/layout.c ./src/v2/compiler/sema/cache.c ./src/v2/compiler/sema/comptime.c ./src/v2/compiler/backend/registry.c ./src/v2/compiler/backend/c/emit.c ./src/v2/compiler/backend/native/emit.c ./src/v2/compiler/backend/native/macho.c ./src/v2/compiler/backend/native/elf.c ./src/v2/compiler/backend/native/run.c ./src/v2/compiler/backend/native/regalloc.c ./src/v2/compiler/backend/native/arch_arm64.c ./src/v2/compiler/backend/native/arch_x86_64.c ./src/v2/compiler/mir/lower.c ./src/v2/compiler/mir/opt.c
 NATIVE = ./src/v2/compiler/backend/native
 HDRS = $(wildcard ./src/v2/compiler/*.h ./src/v2/compiler/*/*.h ./src/v2/compiler/*/*/*.h)
 # -flto: the sources are optimized as one program (about 7% faster: hot helpers inline
@@ -57,6 +57,10 @@ test: modal
 # The numbers of docs/p.md (times best of N, sizes, memory, RSS): a markdown table.
 bench: modal
 	sh ./src/v2/tools/bench.sh $(N)
+
+# Random programs, run by every backend: output and status must agree (src/v2/tools/fuzz.py).
+fuzz: modal
+	python3 -I ./src/v2/tools/fuzz.py $(or $(N),100) $(or $(SEED),1)
 
 test_parser3: src/v2/tests/ll1_parsing_3.c
 	$(CC) -Wall -Wextra -O2 -std=c17 -pthread src/v2/tests/ll1_parsing_3.c -o src/v2/tests/test_parser3
