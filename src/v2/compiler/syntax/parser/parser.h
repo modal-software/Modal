@@ -79,6 +79,8 @@ static inline uint32_t tok_idx(const Parser *p, const Token *t)
 // after which nothing of it is on the list.
 int parse_declaration(Parser *p, DeclContext ctx, NodeList *into);
 NodeId parse_define(Parser *p);
+int local_decl_at(const Token *t);            // a statement here declares a local
+int parse_local(Parser *p, NodeList *into);   // `name: T = v`, `T name [= v]`, onto `into`
 NodeId parse_type(Parser *p);
 int type_starts_at(const Token *t);
 NodeId parse_params(Parser *p, int *has_self);

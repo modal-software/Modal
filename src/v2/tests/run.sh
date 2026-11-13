@@ -136,7 +136,7 @@ else
     echo "FAIL  unknown backend is rejected"
     fail=1
 fi
-for prog in hello counter context patterns globals literals structs output; do
+for prog in hello counter context patterns globals literals structs output locals divide same comptime guards; do
     if $BIN --run $EX/run/$prog.modal 2>&1 | cmp -s - $EX/run/$prog.expected; then
         echo "ok    $prog.modal compiles to C and prints the expected output"
     else
@@ -192,12 +192,24 @@ fi
 rm -f "$DC" "$DC.o"
 
 expect_output "an immutable module binding cannot be assigned" "globals.modal:17:.*'limit' is immutable" $EX/errors/globals.modal
+L=$EX/errors/locals.modal
+expect_output "an immutable local cannot be assigned" "locals.modal:4:.*local 'a' is immutable" $L
+expect_output "a local's value is checked against its type" "locals.modal:5:.*300 does not fit u8" $L
+K=$EX/errors/checks.modal
+expect_output "a body that can end without return" "checks.modal:2:.*'f' returns u8, but its body can reach its end" $K
+expect_output "a := binding is immutable" "checks.modal:8:.*'n' is immutable (bound with" $K
+expect_output "a := literal is range-checked" "checks.modal:9:.*3000000000 does not fit int" $K
+expect_output "bools have no order" "checks.modal:10:.*'<' cannot be applied to bool and bool" $K
+L=$EX/errors/locals_syntax.modal
+expect_output "an immutable local needs its value" "locals_syntax.modal:3:.*immutable local needs its value" $L
+expect_output "a local declares one name" "locals_syntax.modal:4:.*a local declares one name" $L
+expect_output "a struct is not declared in a function" "locals_syntax.modal:5:.*declared at module level" $L
 
 expect_output "a closure is reported" "closure.modal:2:.*a closure" $EX/errors/closure.modal -o ${TMPDIR:-/tmp}/modal-test-closure-$$.c
 
 # the native backend (copy-and-patch): same output and exit status as the C backend
 if [ "$(uname -m)" = arm64 ] || [ "$(uname -m)" = aarch64 ]; then
-    for prog in hello counter context patterns globals literals structs output; do
+    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards; do
         if $BIN --backend native --run $EX/run/$prog.modal 2>&1 | cmp -s - $EX/run/$prog.expected; then
             echo "ok    $prog.modal compiles to arm64 by copy-and-patch and prints the expected output"
         else
@@ -227,7 +239,7 @@ if [ "$(uname -m)" = arm64 ] || [ "$(uname -m)" = aarch64 ]; then
 fi
 # x86-64: on an x86-64 host, or on Apple Silicon through Rosetta
 if [ "$(uname -m)" = x86_64 ] || arch -x86_64 /usr/bin/true 2>/dev/null; then
-    for prog in hello counter context patterns globals literals structs output; do
+    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards; do
         if $BIN --backend x86_64 --run $EX/run/$prog.modal 2>&1 | cmp -s - $EX/run/$prog.expected; then
             echo "ok    $prog.modal compiles to x86-64 by copy-and-patch and prints the expected output"
         else
@@ -249,7 +261,7 @@ for cpu in arm64 x86_64; do
     else
         continue
     fi
-    for prog in hello counter context patterns globals literals structs output; do
+    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards; do
         if $BIN --target $cpu-linux -o "$ELF" $EX/run/$prog.modal >/dev/null 2>&1 &&
             $runner "$ELF" 2>&1 | cmp -s - $EX/run/$prog.expected; then
             echo "ok    $prog.modal as a Linux $cpu ELF prints the expected output"
@@ -290,16 +302,48 @@ for cpu in arm64 x86_64; do
 done
 # memory budgets: the value stack sized from the call graph; mod.modal's max_code / max_ram
 BG=${TMPDIR:-/tmp}/modal-test-budget-$$
-expect_output "the value stack is sized exactly from the call graph" "^memory .*value stack 152 B (19 slots, exact)" $EX/run/counter.modal --backend native -o "$BG" --stats
+expect_output "a function that needs nothing runs at both times" "twice(n: u8): u8 *both$" $EX/kinds.modal --sig
+expect_output "a function that prints is run time, where" "log(n: u8) *run time  (prints, kinds.modal:10)" $EX/kinds.modal --sig
+expect_output "the kind follows the calls" "step(n: u8): u8 *run time  (prints, through 'log', kinds.modal:10)" $EX/kinds.modal --sig
+expect_output "a mutable module variable is run time" "count(): u8 *run time  (a mutable module variable, kinds.modal:19)" $EX/kinds.modal --sig
+expect_output "a cycle of calls has one kind" "u8 down(u8 0) *run time  (prints, through 'down'" $EX/kinds.modal --sig
+expect_output "a device register is run time" "send(self: pl011, b: u8) *run time  (a device register, device.modal:19)" $EX/run/device.modal --sig
+CT=$EX/errors/comptime.modal
+expect_output "compile time cannot print" "comptime.modal:14:.*'a' cannot be computed by the compiler: 'log' prints" $CT
+expect_output "compile time sees only the first value of a mutable variable" "comptime.modal:15:.*'count' uses a mutable module variable" $CT
+expect_output "compile time has a depth budget" "comptime.modal:16:.*nest deeper than comptime_depth = 1000" $CT
+expect_output "a division by zero at compile time is an error" "comptime.modal:17:.*'half' divides by zero" $CT
+AS=$EX/errors/asserts.modal
+expect_output "a failed assert at module level is a compile error, with both sides" "asserts.modal:13:.*assertion failed: sizeof(header) == 12 (8 == 12)" $AS
+expect_output "a failed assert shows signed values" "asserts.modal:14:.*neg(5) >= 0 (-5 >= 0)" $AS
+expect_output "an assert inside a function called at module level fails at compile time" "asserts.modal:15:.*'checks' fails at .*asserts.modal:10:5: assertion failed: neg(3) > 0" $AS
+expect_output "assert needs a bool" "asserts_types.modal:3:.*assert needs a bool" $EX/errors/asserts_types.modal
+expect_output "sizeof takes one argument" "asserts_types.modal:4:.*sizeof takes one type or value" $EX/errors/asserts_types.modal
+expect_output "an unsized constant is range-checked where it meets a type" "unsized.modal:5:.*300 does not fit u8" $EX/errors/unsized.modal
+expect_output "an unsized constant must fit some integer type" "unsized.modal:2:.*'big' is too large for any integer type" $EX/errors/unsized.modal
+expect_output "a mod.modal function is compile time only" "compiled/main.modal:3:.*'square' is declared in mod.modal, so it runs only in the compiler" $EX/errors/compiled/main.modal
+expect_output "a mod.modal function is internal to its domain" "outside.modal:2:.*'twice' is a function of inner's mod.modal" $EX/errors/compiled/outside.modal
+for backend in c native x86_64; do
+    [ $backend = native ] && ! { [ "$(uname -m)" = arm64 ] || [ "$(uname -m)" = aarch64 ]; } && continue
+    [ $backend = x86_64 ] && ! { [ "$(uname -m)" = x86_64 ] || arch -x86_64 /usr/bin/true 2>/dev/null; } && continue
+    if $BIN --backend $backend --run $EX/run/compiled/main.modal 2>&1 | cmp -s - $EX/run/compiled/main.expected; then
+        echo "ok    mod.modal functions run in the compiler ($backend)"
+    else
+        echo "FAIL  mod.modal functions run in the compiler ($backend)"
+        fail=1
+    fi
+done
+expect_output "identical functions are folded into one" "^functions .* 1 folded into an identical one" $EX/run/same.modal --backend native -o "$BG" --stats
+expect_output "the value stack is sized exactly from the call graph" "^memory .*value stack 16 B (2 slots, exact)" $EX/run/counter.modal --backend native -o "$BG" --stats
 expect_output "a recursive program says which function has no known depth" "'fact' calls itself" $EX/run/patterns.modal --backend native -o "$BG" --stats
 expect_output "a program within its budgets compiles" "^ok: .*small.modal" $EX/budget/small.modal --backend native -o "$BG"
-expect_output "code over max_code is an error" "deep.modal:21:.*code is [0-9]* bytes, over max_code = 1500" $EX/budget/deep.modal --backend native -o "$BG"
-expect_output "memory over max_ram is an error, with what it is made of" "deep.modal:21:.*over max_ram = 512 (mod.modal): value stack 160, output buffer 64, 3 nested calls" $EX/budget/deep.modal --backend native -o "$BG"
+expect_output "code over max_code is an error" "deep.modal:21:.*code is [0-9]* bytes, over max_code = 1200" $EX/budget/deep.modal --backend native -o "$BG"
+expect_output "memory over max_ram is an error, with what it is made of" "deep.modal:21:.*over max_ram = 512 (mod.modal): value stack 40, output buffer 64, 3 nested calls" $EX/budget/deep.modal --backend native -o "$BG"
 rm -f "$BG"
 BM=${TMPDIR:-/tmp}/modal-test-bare-$$
 expect_output "bare metal needs a memory map" "bare.modal:2:.*runs without a system: its mod.modal gives the memory map" $EX/errors/bare.modal --target arm64-none -o "$BM"
 expect_output "bare metal has no system output: print needs an out" "hello.modal:5:.*arm64-none has no system output" $EX/run/hello.modal --target arm64-none -o "$BM"
-expect_output "the memory map is the budget" "^memory .*ram 1264 B" $EX/board/blink.modal --target arm64-none -o "$BM" --stats
+expect_output "the memory map is the budget" "^memory .*ram 1376 B" $EX/board/blink.modal --target arm64-none -o "$BM" --stats
 rm -f "$BM"
 expect_output "an unknown target is rejected with the known ones" "unknown target 'mips'. Known targets: arm64-macos" $EX/run/hello.modal --target mips
 OUT=${TMPDIR:-/tmp}/modal-test-$$.c

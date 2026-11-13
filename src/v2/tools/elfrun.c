@@ -172,8 +172,8 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    // The code is position-independent: any address will do. Room after it for two jumps.
-    size_t size = (memsz + 64 + 0x3fff) & ~(size_t)0x3fff;
+    // The code is position-independent: any address will do. Room after it for the jumps.
+    size_t size = (memsz + 16 * 16 + 0x3fff) & ~(size_t)0x3fff;
     uint8_t *mem = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (mem == MAP_FAILED)
     {
@@ -187,72 +187,84 @@ int main(int argc, char **argv)
     static const uint32_t sys_write[] = {0xd2800808u, 0xd4000001u, 0xd65f03c0u};
     static const uint32_t sys_exit[] = {0xd2800bc8u, 0xd4000001u};
     static const uint32_t halt[] = {0xd503207fu, 0x17ffffffu}; // wfi; b .-4 (bare metal)
-    uint8_t *w = find(mem, filesz, sys_write, sizeof(sys_write));
-    uint8_t *x = find(mem, filesz, sys_exit, sizeof(sys_exit));
-    uint8_t *h = find(mem, filesz, halt, sizeof(halt));
-    if (!(w && x) && !h)
+    int linux = find(mem, filesz, sys_write, sizeof(sys_write)) && find(mem, filesz, sys_exit, sizeof(sys_exit));
+    if (!linux && !find(mem, filesz, halt, sizeof(halt)))
     {
         fprintf(stderr, "elfrun: neither the Linux system layer nor a bare-metal halt was found\n");
         return 2;
     }
-    // ldr x16, #8; br x16; .quad target  (once or twice)
-    void *targets[2] = {(void *)write, (void *)finish};
-    uint8_t *at[2] = {w, x ? x + 4 : NULL};
-    if (!(w && x)) // bare: only the halt, which becomes the end of the run (w0: main's result)
+    // Every place a system call (or the halt) is: _start's, and the one a trap ends through.
+    // Each becomes `b` to a trampoline: ldr x16, #8; br x16; .quad target.
+    struct
     {
-        targets[0] = (void *)finish;
-        at[0] = h;
-        at[1] = NULL;
-    }
-    for (int k = 0; k < 2 && at[k]; k++)
+        const void *pattern;
+        size_t size, at;
+        void *target;
+    } sites[] = {
+        {sys_write, sizeof(sys_write), 0, (void *)write},
+        {sys_exit, sizeof(sys_exit), 4, (void *)finish},
+        {halt, sizeof(halt), 0, (void *)finish}, // bare: the end of the run (w0: the status)
+    };
+    int ntramp = 0;
+    for (int k = linux ? 0 : 2; k < (linux ? 2 : 3); k++)
     {
-        uint8_t *t = tramp + 16 * k;
-        uint32_t code[2] = {0x58000050u, 0xd61f0200u};
-        memcpy(t, code, 8);
-        memcpy(t + 8, &targets[k], 8);
-        uint32_t b = 0x14000000u | ((uint32_t)((t - at[k]) / 4) & 0x03ffffffu);
-        memcpy(at[k], &b, 4);
+        for (uint8_t *m = mem; (m = find(m, filesz - (size_t)(m - mem), sites[k].pattern, sites[k].size));
+             m += sites[k].size)
+        {
+            uint8_t *t = tramp + 16 * ntramp++;
+            uint32_t code[2] = {0x58000050u, 0xd61f0200u};
+            memcpy(t, code, 8);
+            memcpy(t + 8, &sites[k].target, 8);
+            uint8_t *at = m + sites[k].at;
+            uint32_t b = 0x14000000u | ((uint32_t)((t - at) / 4) & 0x03ffffffu);
+            memcpy(at, &b, 4);
+        }
     }
 #else
     static const uint8_t sys_write[] = {0xb8, 0x01, 0x00, 0x00, 0x00, 0x0f, 0x05, 0xc3};
-    static const uint8_t sys_exit[] = {0x89, 0xc7, 0xb8, 0xe7, 0x00, 0x00, 0x00, 0x0f, 0x05};
+    static const uint8_t sys_exit[] = {0xb8, 0xe7, 0x00, 0x00, 0x00, 0x0f, 0x05}; // status in edi
     static const uint8_t halt[] = {0x89, 0xc7, 0xf4, 0xeb, 0xfd}; // mov edi, eax; hlt; jmp .-1
-    uint8_t *w = find(mem, filesz, sys_write, sizeof(sys_write));
-    uint8_t *x = find(mem, filesz, sys_exit, sizeof(sys_exit));
-    uint8_t *h = find(mem, filesz, halt, sizeof(halt));
-    if (!(w && x) && !h)
+    int linux = find(mem, filesz, sys_write, sizeof(sys_write)) && find(mem, filesz, sys_exit, sizeof(sys_exit));
+    if (!linux && !find(mem, filesz, halt, sizeof(halt)))
     {
         fprintf(stderr, "elfrun: neither the Linux system layer nor a bare-metal halt was found\n");
         return 2;
     }
-    // movabs rax, target; jmp rax  (once or twice); the jumps replace the instruction that
-    // sets eax. Bare: the halt's `mov edi, eax` is replaced, so the trampoline does it first.
-    void *targets[2] = {(void *)write, (void *)finish};
-    uint8_t *at[2] = {w, x ? x + 2 : NULL};
-    int bare = !(w && x);
-    if (bare)
+    // Every place a system call (or the halt) is becomes a jump (5 bytes) to a trampoline:
+    // movabs rax, target; jmp rax. The halt's `mov edi, eax` is what the jump replaces, so its
+    // trampoline does it first.
+    struct
     {
-        targets[0] = (void *)finish;
-        at[0] = h;
-        at[1] = NULL;
-    }
-    for (int k = 0; k < 2 && at[k]; k++)
+        const uint8_t *pattern;
+        size_t size;
+        void *target;
+        int keep_status;
+    } sites[] = {
+        {sys_write, sizeof(sys_write), (void *)write, 0},
+        {sys_exit, sizeof(sys_exit), (void *)finish, 0},
+        {halt, sizeof(halt), (void *)finish, 1},
+    };
+    int ntramp = 0;
+    for (int k = linux ? 0 : 2; k < (linux ? 2 : 3); k++)
     {
-        uint8_t *t = tramp + 16 * k;
-        if (bare)
+        for (uint8_t *m = mem; (m = find(m, filesz - (size_t)(m - mem), sites[k].pattern, sites[k].size));
+             m += sites[k].size)
         {
-            *t++ = 0x89; // mov edi, eax
-            *t++ = 0xc7;
+            uint8_t *t0 = tramp + 16 * ntramp++, *t = t0;
+            if (sites[k].keep_status)
+            {
+                *t++ = 0x89; // mov edi, eax
+                *t++ = 0xc7;
+            }
+            t[0] = 0x48;
+            t[1] = 0xb8;
+            memcpy(t + 2, &sites[k].target, 8);
+            t[10] = 0xff;
+            t[11] = 0xe0;
+            int32_t rel = (int32_t)(t0 - (m + 5));
+            m[0] = 0xe9;
+            memcpy(m + 1, &rel, 4);
         }
-        t[0] = 0x48;
-        t[1] = 0xb8;
-        memcpy(t + 2, &targets[k], 8);
-        t[10] = 0xff;
-        t[11] = 0xe0;
-        t -= bare ? 2 : 0;
-        int32_t rel = (int32_t)(t - (at[k] + 5));
-        at[k][0] = 0xe9;
-        memcpy(at[k] + 1, &rel, 4);
     }
 #endif
     if (mprotect(mem, size, PROT_READ | PROT_EXEC) != 0)

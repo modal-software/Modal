@@ -64,6 +64,10 @@ for f in examples/secret.modal examples/run/hello.modal examples/run/output.moda
     reps=200
     runs=$N
     [ "$name" = big ] && reps=20 && runs=$(( N < 10 ? N : 10 ))
+    if ! $BIN --backend native -o "$W/ok-$name" "$f" >/dev/null 2>&1; then
+        echo "| $name | does not compile: $($BIN "$f" 2>&1 | grep -m1 error | cut -c1-90) |"
+        continue
+    fi
     check=$($BIN --time --repeat $reps "$f" 2>/dev/null | awk '$1 == "total" { print $2 }')
     emit=$(phase_best emit "$f")
     compile=$("$BESTOF" "$runs" $BIN --backend native -o "$W/exe-$name" "$f")

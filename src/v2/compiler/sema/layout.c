@@ -201,3 +201,10 @@ uint32_t field_offset_of(SymId field)
     }
     return field_off[field] - 1;
 }
+
+uint32_t layout_member_offset(SymId strct, NodeId member)
+{
+    uint32_t off = 0;
+    struct_layout_at(strct, member, &off);
+    return off;
+}

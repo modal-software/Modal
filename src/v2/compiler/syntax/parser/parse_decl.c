@@ -491,6 +491,98 @@ static NodeId parse_type_first(Parser *p)
     return field;
 }
 
+// ---- locals --------------------------------------------------------------------------------
+//
+// In a block, a local is declared the way a module-level variable is, and the same rule says
+// whether it can be assigned to:
+//   name: T = value     immutable (type last); it needs its value
+//   T name = value      mutable (type first)
+//   T name              mutable, starting at zero
+// (and `name := value`, the type taken from the value). The node is the module level's
+// AST_FIELD_DECL: a = type, b = value.
+
+// Does a statement starting at `t` declare a local? `name:` or `name,` cannot start an
+// expression; a type followed by a name on the same line (`u8 x`, `pkg.T x`, `[]u8 s`, `*T p`)
+// cannot either. `*p = 3` stays an assignment: no name follows the type.
+int local_decl_at(const Token *t)
+{
+    if (t->kind == TOK_IDENTIFIER && !t[1].nl && (t[1].kind == TOK_COLON || t[1].kind == TOK_COMMA))
+    {
+        return 1;
+    }
+    const Token *k = t;
+    while (k->kind == TOK_STAR || (k->kind == TOK_LBRACKET && k[1].kind == TOK_RBRACKET))
+    {
+        k += k->kind == TOK_STAR ? 1 : 2;
+    }
+    if (k->kind != TOK_IDENTIFIER)
+    {
+        return 0;
+    }
+    k++;
+    while (k->kind == TOK_DOT && !k->nl && k[1].kind == TOK_IDENTIFIER)
+    {
+        k += 2;
+    }
+    return k->kind == TOK_IDENTIFIER && !k->nl;
+}
+
+// One local onto `into` (see above). Returns 0 after reporting what is wrong with it.
+int parse_local(Parser *p, NodeList *into)
+{
+    Unit *u = p->unit;
+    uint32_t first = into->count;
+    const Token *t = p->current;
+    if (t->kind == TOK_IDENTIFIER && (t[1].kind == TOK_COLON || t[1].kind == TOK_COMMA))
+    {
+        if (!parse_type_last(p, into))
+        {
+            return 0;
+        }
+    }
+    else
+    {
+        NodeId decl = parse_type_first(p);
+        if (!decl || p->panic)
+        {
+            return 0;
+        }
+        node_list_push(u, into, decl);
+    }
+
+    const char *wrong = NULL;
+    const AstNode *d = list_at(into, first);
+    if (into->count - first > 1)
+    {
+        wrong = "a local declares one name: `a: T = value`, then `b: T = value` (one value "
+                "shared by several names would be computed again for each)";
+    }
+    else if (d->kind == AST_STRUCT_DECL)
+    {
+        wrong = "a struct is declared at module level, not inside a function";
+    }
+    else if (d->kind == AST_METHOD_DECL)
+    {
+        wrong = "a function inside a function is a literal: `name := (params) T { ... }`";
+    }
+    else if (d->flags & AST_F_PLACED)
+    {
+        wrong = "a device (`name: T @ address`) is declared at module level";
+    }
+    else if (!(d->flags & AST_F_MUT) && !d->b)
+    {
+        wrong = "an immutable local needs its value: `name: T = value` (or `T name`, mutable, "
+                "for one that starts at zero)";
+    }
+    if (wrong)
+    {
+        parser_error_at(p, TOK(u, d->tok), "%s", wrong);
+        list_truncate(into, first);
+        return 0;
+    }
+    return 1;
+}
+
 // name := value
 NodeId parse_define(Parser *p)
 {
@@ -672,9 +764,31 @@ int parse_declaration(Parser *p, DeclContext ctx, NodeList *into)
     return 1;
 }
 
+// `assert(sizeof(header) == 16)`, `std.debug.assert(ok)`: a call that ends its line, at module
+// level. It is a statement the compiler runs (docs/comptime.md §1). A declaration of that shape
+// would have no body, so the two never meet.
+static int call_statement_at(Parser *p, const Token *t)
+{
+    while (t->kind == TOK_IDENTIFIER && t[1].kind == TOK_DOT && !t[1].nl)
+    {
+        t += 2;
+    }
+    if (t->kind != TOK_IDENTIFIER || t[1].kind != TOK_LPAREN || t[1].nl || !t[1].match)
+    {
+        return 0;
+    }
+    const Token *after = TOK(p->unit, t[1].match) + 1;
+    // (a body that opens on the next line still makes it a declaration)
+    return after->kind == TOK_EOF || (after->nl && after->kind != TOK_BODY && after->kind != TOK_LBRACE);
+}
+
 static NodeId parse_declaration_one(Parser *p, DeclContext ctx)
 {
     const Token *t = p->current;
+    if (ctx == DECL_TOP && t->kind == TOK_IDENTIFIER && call_statement_at(p, t))
+    {
+        return parse_expression(p);
+    }
 
     switch (t->kind)
     {

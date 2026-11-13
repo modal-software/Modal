@@ -20,10 +20,11 @@ static int usage(const char *argv0)
             "  check only (default): report errors, or one line saying what was verified\n"
             "  -o FILE          generate code into FILE\n"
             "  --run            generate, build with the backend's toolchain, and run\n"
-            "  --backend NAME   backend to generate with (default: %s)\n"
+            "  --backend NAME   backend to generate with (default: %s); also -b NAME\n"
             "  --backends       list the registered backends\n"
             "  --target NAME    machine and system to build for (native backend): arm64-macos,\n"
-            "                   arm64-linux, x86_64-macos, x86_64-linux (default: this Mac)\n"
+            "                   arm64-linux, x86_64-macos, x86_64-linux, and bare metal\n"
+            "                   arm64-none, x86_64-none (default: this Mac)\n"
             "  --ast            print the syntax tree of every loaded file\n"
             "  --syms           print the symbol table with visibility\n"
             "  --sig            print the derived contract of every domain\n"
@@ -269,6 +270,7 @@ int main(int argc, char **argv)
         else if (strcmp(argv[i], "--sig") == 0)
         {
             show_sig = 1;
+            cx.kinds = 1;
         }
         else if (strcmp(argv[i], "--stats") == 0)
         {

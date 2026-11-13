@@ -1,4 +1,5 @@
 // parse_stmt.c (v2): blocks and statements. A statement ends at a newline, a ';' or the '}'.
+// A statement that declares a local (`name: T = v`, `T name`) is parsed by parse_local.
 #include "v2/compiler/syntax/parser/parser.h"
 
 static int at_statement_end(const Parser *p)
@@ -60,13 +61,23 @@ NodeId parse_block(Parser *p)
             continue;
         }
 
-        NodeId stmt = parse_statement(p);
+        if (local_decl_at(p->current))
+        {
+            parse_local(p, &stmts);
+        }
+        else
+        {
+            NodeId stmt = parse_statement(p);
+            if (!p->panic)
+            {
+                node_list_push(u, &stmts, stmt);
+            }
+        }
         if (p->panic)
         {
             parser_synchronize(p);
             continue;
         }
-        node_list_push(u, &stmts, stmt);
 
         if (!at_statement_end(p))
         {

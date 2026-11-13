@@ -514,7 +514,15 @@ static int may_see(Unit *u, uint32_t tok, SymId id)
                     name->len, TSTART(name), domain_name(owner->domain));
             return 0;
         }
-        return 1; // what mod.modal binds or defines is the domain's face
+        if (s->kind == SYM_METHOD) // compile time only, like C's `static` (docs/comptime.md §2.2)
+        {
+            diag_at(u, tok, "error",
+                    "'%.*s' is a function of %s's mod.modal: it runs in the compiler for domain '%s' "
+                    "only. To share it, define it in a module of the domain",
+                    name->len, TSTART(name), domain_name(owner->domain), domain_name(owner->domain));
+            return 0;
+        }
+        return 1; // the modules mod.modal binds are the domain's face
     }
     if (s->kind != SYM_STRUCT) // a type travels as an opaque type; nothing else leaves the file
     {
@@ -874,6 +882,27 @@ uint64_t domain_config_int(uint16_t domain, const char *key, uint64_t fallback)
     return fallback;
 }
 
+// A function the domain's mod.modal declares: every file of the domain sees it by its name, after
+// its own declarations (docs/comptime.md §2.2). It runs only in the compiler, so it stays
+// inside the domain, as C's `static` keeps a function inside its file.
+SymId module_domain_function(const Unit *u, const Token *name)
+{
+    if (u->is_manifest)
+    {
+        return 0; // its own scope already has them
+    }
+    for (uint16_t i = 0; i < cx.nunits; i++)
+    {
+        const Unit *m = &cx.units[i];
+        if (m->is_manifest && m->domain == u->domain && !m->broken)
+        {
+            SymId s = scope_find_token(m->scope, name);
+            return s && SYM(s)->kind == SYM_METHOD ? s : 0;
+        }
+    }
+    return 0;
+}
+
 int module_wildcard_provides(Unit *u, const char *name, size_t len)
 {
     for (NodeId d = NODE(u, u->root)->a; d; d = NEXT(u, d))
@@ -894,6 +923,17 @@ int module_wildcard_provides(Unit *u, const char *name, size_t len)
         }
     }
     return 0;
+}
+
+// One line of a contract: the signature, then its kind in a column (two spaces at least).
+static void sig_line(const char *indent, const char *sig, const char *kind)
+{
+    int w = printf("%s%s", indent, sig);
+    if (*kind)
+    {
+        printf("%*s%s", w <= 38 ? 40 - w : 2, "", kind);
+    }
+    putchar('\n');
 }
 
 // The derived contract: what other domains can rely on. Nobody writes this by hand.
@@ -920,7 +960,8 @@ void contract_print(void)
             }
             else if (n->kind == AST_METHOD_DECL || (n->kind == AST_DEFINE && !decl_chain(m, d)))
             {
-                printf("%s\n", ast.sig_str(m, d, sig, sizeof(sig)));
+                sig_line("", ast.sig_str(m, d, sig, sizeof(sig)),
+                         n->kind == AST_METHOD_DECL ? "compile time  (declared in mod.modal)" : "");
             }
         }
 
@@ -947,11 +988,43 @@ void contract_print(void)
                 }
                 else if (s->owner && (s->flags & SYM_F_EXPOSED))
                 {
-                    printf("  %s\n", ast.sig_str(u, s->decl, sig, sizeof(sig)));
+                    char why[160];
+                    sig_line("  ", ast.sig_str(u, s->decl, sig, sizeof(sig)), sema_fn_kind(id, why, sizeof(why)));
                 }
             }
         }
         putchar('\n');
+    }
+
+    // Files no contract covers (no mod.modal binds them, as an entry file): their functions and
+    // kinds, which is what a reader of this file can rely on.
+    for (uint16_t j = 0; j < cx.nunits; j++)
+    {
+        Unit *u = &cx.units[j];
+        if (u->is_manifest || u->bound)
+        {
+            continue;
+        }
+        int header = 0;
+        for (SymId id = 1; id < cx.syms.size; id++)
+        {
+            const Symbol *s = SYM(id);
+            if (s->unit != u->id || s->kind != SYM_METHOD || (s->flags & SYM_F_LITERAL))
+            {
+                continue;
+            }
+            if (!header)
+            {
+                printf("== functions: %s\n", u->path);
+                header = 1;
+            }
+            char why[160];
+            sig_line("  ", ast.sig_str(u, s->decl, sig, sizeof(sig)), sema_fn_kind(id, why, sizeof(why)));
+        }
+        if (header)
+        {
+            putchar('\n');
+        }
     }
 }
 
@@ -1019,6 +1092,8 @@ void module_body_nodes(Unit *u, NodeId from)
 
 void modules_link(void)
 {
+    sema_kinds_reset();
+    comptime_reset();
     link_new_units();
 
     // Each file: the module paths of its declarations, then its bodies one at a time.

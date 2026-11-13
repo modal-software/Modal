@@ -24,8 +24,7 @@ static const Keyword keywords[] = {
     {"await", 5, TOK_AWAIT},
     {"write", 5, TOK_WRITE},
     {"const", 5, TOK_CONST},
-    {"assert", 6, TOK_ASSERT},
-    {"sizeof", 6, TOK_SIZEOF},
+    // assert and sizeof are std functions, not keywords (docs/comptime.md §3.5)
     {"struct", 6, TOK_STRUCT},
     {"import", 6, TOK_IMPORT},
     {"return", 6, TOK_RETURN},
