@@ -117,7 +117,7 @@ static int live_after(const Opt *o, size_t i, MirSlot s)
         {
             return 1;
         }
-        if (in->op == MIR_LABEL || in->op == MIR_JZ || in->op == MIR_JNZ)
+        if (in->op == MIR_LABEL || MIR_BRANCHES(in))
         {
             return 1;
         }
@@ -570,7 +570,7 @@ static int dead_stores(Opt *o)
                 break;
             }
             if (in->op == MIR_LOAD || in->op == MIR_STORE || in->op == MIR_CALL ||
-                in->op == MIR_LABEL || in->op == MIR_JZ || in->op == MIR_JNZ || in->op == MIR_RET ||
+                in->op == MIR_LABEL || MIR_BRANCHES(in) || in->op == MIR_RET ||
                 in->op == MIR_TRAP || in->op == MIR_WRITE || kills(in, st->a) ||
                 (st->a < o->nslots && o->addressed[st->a]))
             {

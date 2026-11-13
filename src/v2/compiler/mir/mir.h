@@ -51,8 +51,8 @@ typedef enum
     MIR_GSTORE, // module-level variable imm = a
     MIR_TRAP,   // end the program: a holds the address of its message (a division by zero);
                 // sub MIR_TRAP_PART: write that message part to the error output, and go on
-    MIR_JUMP,   // go to label imm. Made after the optimizer only (a tail call to the function
-                // itself becomes a loop: mir/lower.c, self_loops), so the optimizer never sees one
+    MIR_JUMP,   // go to label imm (a match's arm to its end; a tail call to the function itself,
+                // which self_loops makes a loop)
     MIR__COUNT,
 } MirOp;
 

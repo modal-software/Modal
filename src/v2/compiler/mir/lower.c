@@ -550,7 +550,7 @@ static MirSlot splice(const Inlinable *k, const MirSlot *args, int nargs)
         {
             written[in.d] = 1;
         }
-        if (in.op == MIR_LABEL || in.op == MIR_JZ || in.op == MIR_JNZ)
+        if (in.op == MIR_LABEL || MIR_BRANCHES(&in))
         {
             out->imm = in.imm + labels;
         }
@@ -1139,10 +1139,16 @@ static int contains_call(NodeId id)
 
 // The value of `id` where a value of type `want` is expected: converted between integer types,
 // and a struct given where a reference is wanted passes its reference.
+static MirSlot lower_match(NodeId id, TypeId want);
+
 static MirSlot lower_as(NodeId id, TypeId want)
 {
     Unit *u = L.u;
     TypeId have = u->types[id];
+    if (NODE(u, id)->kind == AST_MATCH && have != T_VOID) // each arm's value made in `want`
+    {
+        return lower_match(id, want);
+    }
     if (type_kind(want) == T_PTR && type_kind(have) == T_STRUCT)
     {
         return lower_struct_addr(id);
@@ -2651,6 +2657,146 @@ static void miss_unless_text(MirSlot s, uint32_t tok, uint32_t miss)
     L.top = top;
 }
 
+// Go to `miss` unless the value in `slot` (of type t) is one the pattern takes.
+static void pattern_test(const Pattern *pat, TypeId t, MirSlot slot, uint32_t miss)
+{
+    if (pat->kind == PATTERN_TEXT)
+    {
+        miss_unless_text(slot, pat->tok, miss);
+        return;
+    }
+    int v = int_variant(t);
+    if (pat->kind == PATTERN_VALUE)
+    {
+        miss_if(MB_NE, v, slot, mir_normalize(pat->lo, v), miss);
+        return;
+    }
+    int is_signed = v >= MV_I8;
+    uint64_t lo = mir_normalize(pat->lo, v), hi = mir_normalize(pat->hi, v);
+    uint64_t min = is_signed ? mir_normalize(1ull << ((8u << (v - MV_I8)) - 1), v) : 0;
+    uint64_t max = mir_normalize(is_signed ? (1ull << ((8u << (v - MV_I8)) - 1)) - 1
+                                           : ~0ull >> (64 - (8u << (v - MV_U8))), v);
+    if (lo != min)
+    {
+        miss_if(MB_LT, v, slot, lo, miss);
+    }
+    if (hi != max)
+    {
+        miss_if(MB_GT, v, slot, hi, miss);
+    }
+}
+
+// ---- arms (docs/std.md §8) ------------------------------------------------------------------------
+//
+// Each arm: its tests go on to the next arm when the value is not one it takes, a name binds the
+// value's slot, then the result. On the parameters (a function body of arms) each result is the
+// return; on a value, it goes to the match's slot (a value) or is a statement, and the arm goes to
+// the end. The last arm has no test when the arms above leave it only its values (MATCH_LAST_FREE).
+static MirSlot lower_match(NodeId id, TypeId want)
+{
+    Unit *u = L.u;
+    const AstNode *m = NODE(u, id);
+    MirSlot subj[16];
+    TypeId types[16];
+    int ns = 0;
+    if (m->a)
+    {
+        types[0] = u->types[m->a];
+        MirSlot v = lower_as(m->a, types[0]);
+        subj[0] = temp();
+        into(v, subj[0]);
+        ns = 1;
+    }
+    else
+    {
+        SymId fn = L.f->sym;
+        MirSlot slot = SYM(fn)->owner != 0;
+        for (NodeId p = sema_fn_params(u, fn); p && ns < 16; p = NEXT(u, p))
+        {
+            TypeId pt = sema_param_type(u, fn, p);
+            const AstNode *pn = NODE(u, p);
+            const Token *name = TOK(u, pn->tok);
+            if (!(pn->flags & AST_F_CONTEXT) && !is_self_token(TSTART(name), (int)name->len))
+            {
+                types[ns] = pt;
+                subj[ns++] = slot;
+            }
+            slot += slots_of(pt);
+        }
+    }
+    int value = m->a && want != T_VOID && want != T_NONE;
+    if (value && slots_of(want) != 1)
+    {
+        unsupported(m->tok, "a match whose value is a struct");
+        return temp();
+    }
+    MirSlot r = value ? temp() : 0;
+    uint32_t end = new_label(), top = L.top;
+    for (NodeId arm = m->b; arm; arm = NEXT(u, arm))
+    {
+        const AstNode *a = NODE(u, arm);
+        int last = !NEXT(u, arm);
+        uint32_t next = last ? 0 : new_label();
+        int locals = L.nlocals;
+        int k = 0;
+        for (NodeId pat = a->a; pat && k < ns; pat = NEXT(u, pat), k++)
+        {
+            const AstNode *pn = NODE(u, pat);
+            if (pn->kind == AST_IDENT)
+            {
+                push_local(token_name(TOK(u, pn->tok)), subj[k]);
+                continue;
+            }
+            Pattern pt;
+            if (!(last && (m->aux & MATCH_LAST_FREE)) && sema_arm_pattern(u, pat, types[k], &pt))
+            {
+                pattern_test(&pt, types[k], subj[k], next);
+            }
+        }
+        NodeId res = a->b;
+        int kind = NODE(u, res)->kind;
+        int statement = kind == AST_BLOCK || kind == AST_RETURN || kind == AST_ASSIGN || kind == AST_FIELD_DECL;
+        if (!m->a) // on the parameters: the result is the return
+        {
+            if (!statement && L.ret != T_VOID)
+            {
+                lower_return(res);
+            }
+            else
+            {
+                lower_stmt(res);
+                if (!L.f->n || L.f->code[L.f->n - 1].op != MIR_RET)
+                {
+                    inst(MIR_RET);
+                }
+            }
+        }
+        else
+        {
+            if (value)
+            {
+                into(lower_as(res, want), r);
+            }
+            else
+            {
+                lower_stmt(res);
+            }
+            if (!last)
+            {
+                inst(MIR_JUMP)->imm = end;
+            }
+        }
+        L.nlocals = locals;
+        L.top = top;
+        if (next)
+        {
+            place_label(next);
+        }
+    }
+    place_label(end);
+    return value ? r : temp();
+}
+
 static void region_start(void);
 
 int mir_lower(Unit *u, SymId fn, MirFunc *out)
@@ -2719,31 +2865,7 @@ int mir_lower(Unit *u, SymId fn, MirFunc *out)
             continue;
         }
         // The clause's test: an argument its pattern does not take sends the call on.
-        TypeId pt = sema_param_type(u, fn, p);
-        if (pat.kind == PATTERN_TEXT)
-        {
-            miss_unless_text(slot, pat.tok, miss);
-            continue;
-        }
-        int v = int_variant(pt);
-        if (pat.kind == PATTERN_VALUE)
-        {
-            miss_if(MB_NE, v, slot, mir_normalize(pat.lo, v), miss);
-            continue;
-        }
-        int is_signed = v >= MV_I8;
-        uint64_t lo = mir_normalize(pat.lo, v), hi = mir_normalize(pat.hi, v);
-        uint64_t min = is_signed ? mir_normalize(1ull << ((8u << (v - MV_I8)) - 1), v) : 0;
-        uint64_t max = mir_normalize(is_signed ? (1ull << ((8u << (v - MV_I8)) - 1)) - 1
-                                               : ~0ull >> (64 - (8u << (v - MV_U8))), v);
-        if (lo != min)
-        {
-            miss_if(MB_LT, v, slot, lo, miss);
-        }
-        if (hi != max)
-        {
-            miss_if(MB_GT, v, slot, hi, miss);
-        }
+        pattern_test(&pat, sema_param_type(u, fn, p), slot, miss);
     }
 
     if (u->id == 0 && SYM(fn)->owner == 0 && scope_find(u->scope, "main", 4) == fn)
