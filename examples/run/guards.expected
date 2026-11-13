@@ -1,2 +1,2 @@
 48 8 24 36
-./examples/run/guards.modal:28:5: assertion failed: n < 4
+./examples/run/guards.modal:27:5: assert(n < 4) is false

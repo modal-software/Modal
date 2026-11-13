@@ -1,8 +1,7 @@
 -- assert and sizeof are std functions, and the position decides when they run
 -- (docs/comptime.md §3.5): at module level the compiler checks them, in a body the program does.
 print := import("std").io.print
-assert := import("std").debug.assert
-sizeof := import("std").mem.sizeof
+assert := import("std").assert
 
 header: struct {
     u8 kind,

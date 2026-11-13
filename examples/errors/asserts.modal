@@ -1,5 +1,4 @@
-assert := import("std").debug.assert
-sizeof := import("std").mem.sizeof
+assert := import("std").assert
 
 header: struct {
     u8 kind,
