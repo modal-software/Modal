@@ -1,0 +1,30 @@
+-- arm mistakes: values no arm takes, arms that never run, results of different types
+[]u8 size(u8 n) {
+    0: "none"
+    1..9: "small"
+}
+[]u8 twice(u8 n) {
+    1..9: "small"
+    5: "five"
+    n: "other"
+}
+u8 pick([]u8 s) {
+    "a": 1
+}
+u8 mixed(u8 n) {
+    0..255: 1
+    n: 2
+}
+main(): u8 {
+    bool b = true
+    x := b {
+        true: 1
+        false: "no"
+    }
+    i8 k = 0
+    y := k {
+        -128..-1: 1
+        1..127: 2
+    }
+    return 0
+}
