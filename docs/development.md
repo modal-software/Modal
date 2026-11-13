@@ -244,9 +244,15 @@ worse, say so; don't present that version as the "before".
     callee's frame takes this one's place.
   - In C, `M_TAIL` is used only with the same prototype and numbers and bools as parameters
     (musttail's rule, and no pointer can reach the frame).
-- **MIR_JUMP exists only after the optimizer** (self_loops in lower.c). opt.c does not handle it,
-  so a pass that makes jumps must run after `mir_optimize`. Branch checks use `MIR_BRANCHES` and
-  `MIR_NO_FALLTHROUGH`, never `op == MIR_JZ || op == MIR_JNZ`.
+- **MIR_JUMP** (an arm to its match's end; self_loops' loops). Branch checks use `MIR_BRANCHES`
+  and `MIR_NO_FALLTHROUGH`, never `op == MIR_JZ || op == MIR_JNZ`: a site that forgets the jump
+  treats the code after it as reached.
+- **A module-level `{` is one token** (TOK_BODY: a function body, tokenized when it is checked).
+  Syntax that puts a brace after a value at module level (a match) needs it tokenized first; that
+  moves the token array under the parser's pointers, so it is not done yet.
+- **Arms and patterns share one description:** `Pattern` (`sema_pattern_of` for a parameter,
+  `sema_arm_pattern` for an arm), `pattern_test` in lower.c, `emit_pattern_cond` in the C
+  backend. A new kind of pattern goes into all three, and into the checker's `Cover`.
 - **Pattern clauses reach the native backend joined** (`mir_clause_hold` / `mir_clause_merge`): a
   clause with a next one is held, copied to the arena, until the next is lowered. Its `--mir`
   therefore comes after the next clause's. What is still held at the end is generated as it was.

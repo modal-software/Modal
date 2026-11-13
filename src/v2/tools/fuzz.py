@@ -70,8 +70,16 @@ def program():
         types_of[name + "_copy"] = t
         roll = random.random()
         if roll < 0.15:  # a loop: the recursion is a tail call (a jump), with an accumulator
-            out.append("%s %s(%s 0, %s acc): acc" % (t, name, t, t))
-            out.append("%s %s(%s n, %s acc): %s(n - 1, %s)" % (t, name, t, t, name, expr(["n", "acc"], 2, False)))
+            step = "%s(n - 1, %s)" % (name, expr(["n", "acc"], 2, False))
+            if random.random() < 0.5:  # as clauses
+                out.append("%s %s(%s 0, %s acc): acc" % (t, name, t, t))
+                out.append("%s %s(%s n, %s acc): %s" % (t, name, t, t, step))
+            else:  # as arms on the parameters, sometimes with a range first
+                lo = random.randint(1, 9)
+                out += ["%s %s(%s n, %s acc) {" % (t, name, t, t), "    0, acc: acc"]
+                if random.random() < 0.5:
+                    out.append("    1..%d, acc: acc + %d" % (lo, lo))
+                out += ["    n, acc: %s" % step, "}"]
             fns.append((name, 2, "tail"))
         elif roll < 0.4:
             out.append("%s %s(%s 0): %s" % (t, name, t, random.randint(0, 9)))

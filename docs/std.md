@@ -2,7 +2,8 @@
 
 Status: 2026-11-13. The design (the owner chose "core primitives + std in Modal"), then the
 steps. Steps 1–3 are done (context.md §26). Step 4's optimizer prerequisites are done (§28); its
-swap waits on arrays (§6). Step 5 is designed (§7), not built. Companions: `docs/development.md` §2 (the core/std
+swap waits on arrays (§6, in progress, §9). Step 5: the owner decided `nil` and the overload rule,
+and its first part is built (§7, context.md §29). Literal patterns and arms: §8. Companions: `docs/development.md` §2 (the core/std
 rule), `docs/comptime.md`, `docs/guards.md`.
 
 ---
@@ -118,7 +119,10 @@ the compiler's namespaces, so no std file is read for them (`compiler_namespace`
    - ~~division by a constant as a multiplication~~ (native; C compilers already do it);
    - left: arrays (§6), then `print` desugared to std functions, and `rt_write_*` /
      `m_write_*` / `sink_*` deleted.
-5. **`print` and `write` as std functions:** designed in §7, for the owner to decide. Not built.
+5. **`print` and `write` as std functions** (§7). The owner chose `nil` and "the first overload
+   it fits". ~~Part 1, overloads chosen by type, and `nil`~~ done (context.md §29); std's `assert`
+   is now `nil` and arms. Left: parts 2 (`rest: args`, `any`) and 3 (a context of the caller's
+   type), then `print` in std.
 
 ## 6. The speed gate, measured (2026-11-13)
 
@@ -146,7 +150,7 @@ compiler's. What is left is the algorithm, not the optimizer:
   does not move them to the flush path): a separate cost, worth taking if `put` is ever the hot
   path.
 
-## 7. `print` and `write` in std: the design (step 5, for the owner)
+## 7. `print` and `write` in std: the design (step 5)
 
 One proposal. Three features of the language, each useful alone, make `print` an ordinary std
 function. None is a keyword or a sigil; each follows a rule that already exists.
@@ -201,5 +205,80 @@ With these, `rt_write_*`, `m_write_*`, the generated `sink_*` MIR and the checke
 go, and `print` keeps its name and path. Order: 1 is needed by 2 and 3 and is the smallest; 2 is
 comptime.md step 3; 3 is a small extension of the context rule once 2 exists.
 
-Open for the owner: `nil`/`void` (needed first, by 1); the names `args` and `any`; and whether an
-unsized literal should instead take the widest overload (`u64` before `u8`).
+Decided by the owner (2026-11-13): `nil` is the "no result" type, and an unsized literal takes the
+first overload it fits. Still open: the names `args` and `any`.
+
+## 8. Literal patterns and arms
+
+Built (context.md §29). One rule carries all of it: **a literal stands where a name would be**, and
+then it is a test.
+
+**The patterns:**
+
+| pattern | takes | example |
+|---|---|---|
+| a number, `-` a number | that value | `u64 fact(u64 0): 1` |
+| `lo..hi`, `lo..` | every value from lo to hi, both included; from lo up | `1..9`, `100..` |
+| a string | those bytes | `u8 command([]u8 "help"): 1` |
+| `true`, `false` | that bool | |
+| a name | any value, bound to that name | `n: ...` |
+
+**Arms** are clauses without their head: `pattern: result`, tried in order.
+
+```
+u8 command([]u8 s) {      -- a body of arms matches the parameters (self and contexts aside)
+    "help": 1
+    "quit": 2
+    s: 0                  -- a name: the rest, named
+}
+kind := c {               -- `value { arms }` matches a value; a match is a value or a statement
+    48..57: "digit"
+    c: "other"
+}
+c > 40 {                  -- on a bool: if / else, with no keyword
+    true: print("above")
+    false: {}
+}
+u64 sum(u64 n, u64 acc) { -- several parameters: one pattern each
+    0, acc: acc
+    n, acc: sum(n - 1, acc + n)   -- a tail call: a loop
+}
+```
+
+**Explicit for the developer:** every decision the arms make is visible, and the compiler says
+what is wrong in terms of values:
+- **Every value is taken, or the program does not compile.** For numbers and bools the compiler
+  joins the arms' ranges and names what is missing: `not every value is taken: no arm takes
+  10..255`. For strings, the last arm is a name.
+- **An arm that can never run is an error**, not dead code: `this arm never runs: the arms
+  above already take every value it takes`. That includes a catch-all after literals that
+  already cover the type.
+- **A catch-all has a name**, which binds the value (`s: 0`); there is no anonymous wildcard.
+  When literals cover the whole type, none is needed, and the last arm has no test at all.
+- **A match used as a value gives one type**; the error names the arm that differs.
+- **No fall-through at run time:** with every value taken, there is nothing to trap.
+
+**Cost:** the same tests as clauses (a compare and a branch per literal, two per range; a string
+is its length, then eight bytes at a time), and no call. Arms on the parameters are one function,
+so a loop written with them is a loop in registers.
+
+**Limits now:** a match at module level (the scanner keeps a module-level `{` as a function body;
+put the match in a function and bind the call); guards (`n if n > 3`), which would need a keyword
+or a sigil and are left out while ranges cover the cases; tuple subjects (`(a, b) { ... }`)
+outside a function's parameters. Next for speed: string arms dispatched by length first, and dense
+number arms as a jump table.
+
+## 9. Arrays (in progress)
+
+The design, following the position rule:
+- `[N]T`: N elements of T, N known at compile time (a literal or a constant). `[24]u8 buf` is a
+  mutable local, zeroed; `a[i]` reads, `a[i] = v` writes, with a bounds check that traps like a
+  division by zero (and is a compile error for a constant index).
+- **An array parameter is a reference**, mutable when written type-first (`[24]u8 buf`), read-only
+  type-last (`buf: [24]u8`). Loops are recursion, so a loop that fills an array is a function
+  that takes it: copying it on every turn is what this avoids.
+- `s[i]` on a `[]u8` reads a byte (read only), bounded by its length.
+- Later modalities (the owner's list): `[..N]T` (a length from 0 to N, in place), and grow-only,
+  shrink-only and grow-and-shrink arrays, which need an allocator (the `arena` context).
+
+Done: the type, parsing, checking of indexes and element assignment. Not yet: code generation.

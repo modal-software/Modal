@@ -41,6 +41,7 @@ Done (details in context.md):
 | std 1–3 | primitives (`sizeof`, `u8(x)`, `trap`, `site`), std as Modal files (assert), C backend without stdio; assert as a call costs no measurable time | §26 |
 | comptime 2 | `import("target")` and mod.modal values at compile time; the interpreter keeps its own call stack (no C recursion per Modal call) | §27 |
 | std 4 (prerequisites) | tail calls as jumps on every backend, pattern clauses joined so a clause loop is a loop in registers (100M turns: 290 → 23.5 ms, and no crash past ~16K turns); inline byte sink; unsigned division by a constant as a multiplication. Formatting in Modal is 2.1× the C stencil: waits on arrays (std.md §6) | §28 |
+| std 5 (part 1), patterns | `nil`; overloads by type; range and string patterns; arms (`value { ... }`, bodies of arms) with coverage errors; a loop written as arms is one function and a loop | §29 |
 
 Not done: the Cortex-M backend (register allocation, its base, is done: §20), interrupts (need
 QEMU or a board to verify).

@@ -75,6 +75,14 @@ NodeId parse_expression(Parser *p)
     {
         return parse_arm_block(p, e);
     }
+    if (e && p->current->kind == TOK_BODY && !p->current->nl)
+    {
+        // At module level the scanner keeps every `{` as a function body, not yet tokenized.
+        parser_error_at(p, p->current,
+                        "a match at module level is not supported yet: write it in a function "
+                        "(`R pick(T n) { 0: ... n: ... }`) and bind the call (`x := pick(v)`)");
+        return 0;
+    }
     return e;
 }
 

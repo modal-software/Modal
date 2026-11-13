@@ -1638,6 +1638,54 @@ optimization. Since this section every backend runs them in constant stack.
   the stack overflow guard for the calls that stay calls (guards.md step 2); `print` as std
   (designed, std.md §7, for the owner).
 
+## 29. nil, overloads by type, literal patterns and arms (std.md step 5 part 1, §8)
+
+The owner's decisions (2026-11-13): `nil` is the "no result" type; an unsized literal takes the
+first overload it fits; more literal patterns, with arms so that a function is not written once
+per literal, and every case made explicit to the developer.
+
+- **`nil`** is a predeclared type name for "no result" (T_VOID, `prim_type`). `nil f(...)` is
+  type-first, so it can be overloaded and have pattern clauses (`nil count(u64 0) {}`).
+  `examples/main.modal` (one of the known failures) gets past `nil` now and stops at its own type
+  error on line 19.
+- **Overloads by type:** definitions with as many parameters but other types are other functions.
+  Clauses group by count and types (`same_group`, `same_types` in resolve.c). A call whose set has
+  several groups types its arguments once, then takes the first group head, in the order written,
+  that every argument fits, an unsized literal also within range (`in_bounds`): `show(7)` is
+  `u8`, `show(300)` is `u64`. No match: `no definition of 'show' takes (u16): it takes (u8),
+  (bool)`. C names stay distinct (the clause index counts every definition of the count).
+- **Patterns:** ranges `lo..hi` and `lo..` (both ends included; negative ends too) and strings, as
+  parameters and in arms. One description, `Pattern` (`sema_pattern_of`, `sema_arm_pattern`);
+  tests in MIR (`pattern_test`: a range is one or two compares, the type's own ends skipped; a
+  string its length then eight bytes at a time) and in C (`emit_pattern_cond`, no memcmp).
+  Errors: an empty range, a string for a number, an end that does not fit.
+- **Arms** (`AST_MATCH`, `AST_ARM`, `AST_PATTERN`): a body whose first line is `literal:` is arms on
+  the parameters; `value { arms }` after a whole expression on the same line matches a value, as a
+  value or a statement (on a bool, if / else).
+  - The checker's `Cover` joins each subject's ranges: `not every value is taken: no arm takes
+    10..255`, `this arm never runs ...` (also a catch-all after full coverage), one result type
+    for a value match. With literals that cover the type, the last arm is marked
+    `MATCH_LAST_FREE` and has no test.
+  - MIR: `lower_match`, the tests jumping to the next arm, MIR_JUMP to the end (now made before
+    the optimizer too, which handles it). Arms on the parameters return, so `sum` written as arms
+    is one function and its tail call a loop: no clause joining needed.
+  - C: a GNU statement expression for a match on a value, an if / else chain of returns on the
+    parameters, `M_TAIL` in arms.
+  - Not yet: a match at module level (an error says to use a function), guards, tuple subjects.
+- **std's `assert`** is `nil assert(bool ok, site: site) { true: {}  false: trap(...) }`. The
+  same messages, in a body and at module level.
+- **Arrays** (std.md §9): `[N]T` type (with a length in the type table), parsing of types, typed
+  locals and parameters, checking of indexes, element assignment and `s[i]` on `[]u8`. No code
+  generation yet.
+- **Verified:** suite 255 passing (new: `run/matching.modal`, `run/arms.modal` on five
+  backends; `errors/literals.modal`, `errors/arms.modal`, ten checks); the 8 known failures and
+  `loops.modal`'s stale expected file only. The fuzzer writes tail loops as arms too.
+  Fuzz: 0 differ in 5 rounds (scalar, mix, scalar with MODAL_REGS=0, struct, pressure: 501
+  programs).
+- **A mistake on the way, fixed:** the new error checks first overwrote the existing
+  `examples/errors/patterns.modal`; it was restored from git and the checks moved to
+  `errors/literals.modal`.
+
 ---
 
 ## Appendix A. The owner's original specification inputs

@@ -136,7 +136,7 @@ else
     echo "FAIL  unknown backend is rejected"
     fail=1
 fi
-for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching; do
+for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms; do
     if $BIN --run $EX/run/$prog.modal 2>&1 | cmp -s - $EX/run/$prog.expected; then
         echo "ok    $prog.modal compiles to C and prints the expected output"
     else
@@ -209,7 +209,7 @@ expect_output "a closure is reported" "closure.modal:2:.*a closure" $EX/errors/c
 
 # the native backend (copy-and-patch): same output and exit status as the C backend
 if [ "$(uname -m)" = arm64 ] || [ "$(uname -m)" = aarch64 ]; then
-    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching; do
+    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms; do
         if $BIN --backend native --run $EX/run/$prog.modal 2>&1 | cmp -s - $EX/run/$prog.expected; then
             echo "ok    $prog.modal compiles to arm64 by copy-and-patch and prints the expected output"
         else
@@ -239,7 +239,7 @@ if [ "$(uname -m)" = arm64 ] || [ "$(uname -m)" = aarch64 ]; then
 fi
 # x86-64: on an x86-64 host, or on Apple Silicon through Rosetta
 if [ "$(uname -m)" = x86_64 ] || arch -x86_64 /usr/bin/true 2>/dev/null; then
-    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching; do
+    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms; do
         if $BIN --backend x86_64 --run $EX/run/$prog.modal 2>&1 | cmp -s - $EX/run/$prog.expected; then
             echo "ok    $prog.modal compiles to x86-64 by copy-and-patch and prints the expected output"
         else
@@ -261,7 +261,7 @@ for cpu in arm64 x86_64; do
     else
         continue
     fi
-    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching; do
+    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms; do
         if $BIN --target $cpu-linux -o "$ELF" $EX/run/$prog.modal >/dev/null 2>&1 &&
             $runner "$ELF" 2>&1 | cmp -s - $EX/run/$prog.expected; then
             echo "ok    $prog.modal as a Linux $cpu ELF prints the expected output"
@@ -317,7 +317,7 @@ AS=$EX/errors/asserts.modal
 expect_output "a failed assert at module level is a compile error, with both sides" "asserts.modal:12:.*assert(sizeof(header) == 12) is false (8 == 12)" $AS
 expect_output "a failed assert shows signed values" "asserts.modal:13:.*assert(neg(5) >= 0) is false (-5 >= 0)" $AS
 expect_output "an assert inside a function called at module level fails at compile time" "asserts.modal:14:.*'assert' fails at .*asserts.modal:9:5: assert(neg(3) > 0) is false" $AS
-expect_output "assert (std, in Modal) needs a bool" "asserts_types.modal:2:.*argument 1 of 'assert' is int, but it takes bool" $EX/errors/asserts_types.modal
+expect_output "assert (std, in Modal) needs a bool" "asserts_types.modal:2:.*argument 1 of 'assert' is int, but parameter 'ok' is bool" $EX/errors/asserts_types.modal
 expect_output "sizeof takes one argument" "asserts_types.modal:3:.*sizeof takes one type or value" $EX/errors/asserts_types.modal
 expect_output "an unsized constant is range-checked where it meets a type" "unsized.modal:5:.*300 does not fit u8" $EX/errors/unsized.modal
 expect_output "an unsized constant must fit some integer type" "unsized.modal:2:.*'big' is too large for any integer type" $EX/errors/unsized.modal
@@ -325,6 +325,12 @@ expect_output "a range pattern must take some value" "literals.modal:2:.*this ra
 expect_output "a string pattern needs a []u8 parameter" "literals.modal:4:.*a string pattern needs a \\[\\]u8 parameter" $EX/errors/literals.modal
 expect_output "a range's end must fit the parameter" "literals.modal:8:.*the pattern 300 does not fit u8" $EX/errors/literals.modal
 expect_output "overloads are chosen by the argument types" "literals.modal:16:.*no definition of 'show' takes .u16.: it takes .u8., .bool." $EX/errors/literals.modal
+expect_output "arms: a value no arm takes is named" "arms.modal:2:.*no arm takes 10..255" $EX/errors/arms.modal
+expect_output "arms: an arm covered by the ones above never runs" "arms.modal:8:.*this arm never runs" $EX/errors/arms.modal
+expect_output "arms: strings end with a name" "arms.modal:11:.*end with an arm that names the value" $EX/errors/arms.modal
+expect_output "arms: a catch-all after full coverage never runs" "arms.modal:16:.*this arm never runs: the arms above already take every value" $EX/errors/arms.modal
+expect_output "arms: a value match gives one type" "arms.modal:22:.*this arm gives .*u8, but the arms above give a number" $EX/errors/arms.modal
+expect_output "arms: signed coverage names the gap" "arms.modal:25:.*no arm takes 0" $EX/errors/arms.modal
 expect_output "comptime_depth is configuration of the domain" "budget_ct/main.modal:3:.*nest deeper than comptime_depth = 5" $EX/errors/budget_ct/main.modal
 expect_output "configuration is a compile-time value" "ctvalues/main.modal:3:.*'max_ram' is configuration of the domain, a compile-time value" $EX/errors/ctvalues/main.modal
 expect_output "a target fact is a compile-time value" "ctvalues/main.modal:6:.*'ptr_size' is a fact of the target" $EX/errors/ctvalues/main.modal
