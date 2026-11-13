@@ -21,6 +21,9 @@ typedef struct Parser
     int panic;            // set by an error, cleared by synchronisation: one report per mistake
     int depth;            // recursion guard
     int paren_depth;      // > 0 inside ( ) or [ ]: newlines do not end the expression there
+    const Token *cond_open; // the `(` that starts an `if`'s value: a grouping, never a function literal
+    int if_then;            // > 0 while parsing an `if`'s branch: an `else` after arms is that if's
+    int no_literal;         // parsing an `if`'s values: `name {` there is the value then its block
 } Parser;
 
 // A list being parsed. Its elements wait on a stage (nested lists stack on it) and are laid out
@@ -91,6 +94,7 @@ NodeId parse_statement(Parser *p);
 NodeId parse_block(Parser *p);
 int arm_at(const Token *t);                   // a literal pattern then `:` / `,` / `..` starts an arm
 NodeId parse_arm_block(Parser *p, NodeId subject); // `{ arms }`, matching subject (0: the parameters)
+NodeId parse_if(Parser *p, int value);             // `if cond branch [else branch]`, `if value { arms }`
 
 // parse_expr.c
 NodeId parse_expression(Parser *p);

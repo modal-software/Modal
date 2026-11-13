@@ -12,6 +12,7 @@ const uint8_t ast_child_mask[AST__COUNT] = {
     [AST_RETURN] = 1,     [AST_ASSIGN] = 3,      [AST_BIN_OP] = 3,     [AST_UNARY_OP] = 1,
     [AST_CALL] = 3,       [AST_INDEX] = 3,       [AST_SELECTOR] = 1,   [AST_PAREN_GROUP] = 1,
     [AST_IMPORT_ALL] = 1, [AST_IMPORT_PICK] = 3,  [AST_SIG] = 3,
+    [AST_STRUCT_LIT] = 1, [AST_FIELD_INIT] = 1,
 };
 
 void node_array_grow(Unit *u)
@@ -60,6 +61,8 @@ static const char *ast_kind_name(AstNodeKind kind)
         [AST_IMPORT_ALL] = "import-all",
         [AST_IMPORT_PICK] = "import-pick",
         [AST_IMPORT_ITEM] = "item",
+        [AST_STRUCT_LIT] = "struct-literal",
+        [AST_FIELD_INIT] = "field-init",
     };
     return kind < AST__COUNT && names[kind] ? names[kind] : "?";
 }

@@ -184,6 +184,10 @@ typedef struct
     const char *std_dir; // where std's .modal files are ($MODAL_STD, or std/ next to the compiler); NULL: none
     uint8_t kinds;    // --sig: note what each function does, for its kind (sema/check.c)
     uint8_t stats;    // --stats: backends report what they produced (sizes, memory)
+    uint8_t warn;     // --warn: print warnings (otherwise they are only counted, in warnings)
+    uint8_t audit;    // --audit: record dependencies, reach and run-time stops (sema/audit.c)
+    uint8_t trap_codes; // a binary written with -o: guards say `trap N`, the place is in <out>.traps
+    int warnings;
     const MachineTarget *target; // see target_get()
     uint8_t target_given;        // --target named it
 } context;
@@ -354,6 +358,7 @@ void module_check_paths(Unit *u, NodeId from, NodeId to);
 void contract_print(void); // derived public signatures of every loaded domain
 SymId module_member(Unit *u, NodeId base, uint32_t name_tok); // `base.name` through imports
 SymId module_binding_function(SymId binding); // the function `f := import(x).f` names, or 0
+SymId module_binding_target(SymId binding);   // what `x := import(y).x` names, or 0
 const char *domain_name(uint16_t domain);
 
 // What a mod.modal says for a domain; `fallback` when it does not say.
@@ -418,11 +423,17 @@ enum
     PRIM_SIZEOF,  // sizeof(T or value)
     PRIM_CONVERT, // u8(x): to the call's type, wrapping
     PRIM_TRAP,    // trap(a, b, ...): its strings to the error output, then stop
+    // Type queries (std.md §11): constants of the target's layout, folded where they are used.
+    PRIM_ALIGNOF,  // alignof(T or value)
+    PRIM_OFFSETOF, // offsetof(T.field)
+    PRIM_FIELDSOF, // fieldsof(T or value): how many fields (0: not a struct)
+    PRIM_TYPEID,   // typeid(T or value): a number per type of the program, no name
 };
 int sema_primitive(const Unit *u, NodeId call);
 // The text of a `site` (AST_SITE at node id): `file:line:col: <the call as written>`.
 int sema_site_text(const Unit *u, NodeId site, char *text, size_t cap);
-// `sizeof(T)` at node `call`: its value (an unsized constant). 0 if call is not one.
+// A type query at node `call` (sizeof, alignof, offsetof, fieldsof, typeid): its value (an
+// unsized constant). 0 if call is not one.
 int sema_sizeof(const Unit *u, NodeId call, uint64_t *out);
 // `assert(cond)` at node `call`: 1 if call is one.
 // `n` naming an unsized module-level constant (`n := 5`, docs/comptime.md §3.1): its exact value as
@@ -451,6 +462,15 @@ void comptime_capture(Unit *u, SymId fn); // check.c hands it the function it ju
 // A function's kind (docs/comptime.md §2): "both", "run time  (why, where)", "compile time  (...)",
 // or "" when its body was not checked. Written into buf when it says why.
 const char *sema_fn_kind(SymId fn, char *buf, size_t size);
+void audit_use(SymId member, uint16_t domain); // --audit: `domain` uses `member` (another domain's)
+void audit_print(void);
+// The place a guard names (`path:line:col`, or a call as written): with trap_codes, "trap N" goes
+// in the program instead and the text in the map. Writes what the program carries into out.
+size_t trap_place(const char *text, size_t len, char *out, size_t cap);
+const char *trap_code_text(uint32_t n); // the text of trap N, or NULL
+int trap_codes_write(const char *path); // <out>.traps; 0 when there are none
+void audit_call(SymId from, SymId to); // --audit: a call, inlined or not
+void audit_comptime(SymId fn);         // --audit: the compiler ran fn
 // Clauses (literal patterns: `u8 fact(u8 0): 1`).
 int sema_pattern(Unit *u, NodeId param, SymId owner, uint64_t *value, int loud);
 // What a pattern parameter matches: one value, a range (both ends included, in the parameter's
@@ -468,10 +488,16 @@ typedef struct
     uint32_t tok;    // PATTERN_TEXT: the string literal
 } Pattern;
 int sema_pattern_of(Unit *u, NodeId param, SymId owner, Pattern *out, int loud);
-int sema_arm_pattern(Unit *u, NodeId pat, TypeId type, Pattern *out); // an arm's (0: a name)
+// Do two parameters of clauses with the same types take a value in common? (no pattern: all)
+int sema_params_overlap(Unit *u, NodeId a, NodeId b, SymId owner);
+int sema_arm_pattern(Unit *u, NodeId pat, TypeId type, Pattern *out); // an arm's (0: `_`, a run-time name)
+NodeId sema_arm_name(Unit *u, NodeId pat, TypeId type); // a run-time name pattern: its AST_IDENT (else 0)
 // AST_MATCH aux: MATCH_LAST_FREE: the arms above cover every value but the last arm's, so the
 // last needs no test (the compiler proved it).
 #define MATCH_LAST_FREE 1
+// MATCH_STATEMENT: written as a statement (`if c { ... }` on its own line): it may leave values
+// untaken, and then does nothing for them (a warning with --warn). A value match takes them all.
+#define MATCH_STATEMENT 2
 // A string literal's bytes, escapes decoded; returns the length (at most cap are written).
 size_t sema_pattern_text(const Unit *u, uint32_t tok, uint8_t *out, size_t cap);
 SymId sema_next_clause(Unit *u, SymId fn); // tried when fn's patterns do not match; 0: none
@@ -490,5 +516,9 @@ const MachineTarget *target_get(void);  // the target set, or the host's
 Layout type_layout(TypeId t);    // C's layout on the target
 uint32_t field_offset_of(SymId field);
 uint32_t layout_member_offset(SymId strct, NodeId member); // a field declaration's offset
+// What the program does with a field (std.md §10): FIELD_KEPT, FIELD_UNREAD (nothing reads it: it
+// has no bytes, its writes are dropped) or FIELD_CONSTANT (always *value: reads are the constant).
+enum { FIELD_KEPT, FIELD_UNREAD, FIELD_CONSTANT };
+int layout_field_use(SymId field, uint64_t *value);
 
 #endif // MODAL_V2_CX_H

@@ -1,5 +1,7 @@
 #include "v2/compiler/backend/backend.h"
 #include "v2/compiler/mir/mir.h"
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 // name -> Init. Several names may share one Init (Go maps both "mips" and "mipsle" to
@@ -106,12 +108,16 @@ void codegen_failure_clear(SymId fn) // reported once
     }
 }
 
+static void note_trap_codes(const MirFunc *f);
+
 static void emit_mir(MirFunc *f)
 {
     if (cx.show_mir)
     {
         mir_print(f, stdout);
     }
+    audit_function(f);
+    note_trap_codes(f);
     codegen.backend->function_mir(&codegen.job, f);
 }
 
@@ -201,4 +207,98 @@ int codegen_finish(void)
 int codegen_run(void)
 {
     return codegen.backend->run ? codegen.backend->run(&codegen.job) : -1;
+}
+
+// ---- trap codes ------------------------------------------------------------------------------
+//
+// A binary written with -o carries no source: the place a guard reports (and an assert's call as
+// written) is `trap N`, and <out>.traps maps each N to its text. `--run` keeps the text: nothing
+// leaves the machine. The compiler keeps the table, so a guard run at compile time still reports
+// its place (sema/comptime.c).
+static char **trap_texts;
+static uint8_t *trap_used; // in the code generated (not only run by the compiler)
+static uint32_t ntraps, ctraps;
+
+// The codes a generated function carries: those go in the map.
+static void note_trap_codes(const MirFunc *f)
+{
+    for (size_t i = 0; cx.trap_codes && i < f->nstrings; i++)
+    {
+        unsigned n = 0;
+        if (f->strings[i].len > 5 && memcmp(f->strings[i].bytes, "trap ", 5) == 0 &&
+            sscanf((const char *)f->strings[i].bytes + 5, "%u", &n) == 1 && n >= 1 && n <= ntraps)
+        {
+            trap_used[n - 1] = 1;
+        }
+    }
+}
+
+size_t trap_place(const char *text, size_t len, char *out, size_t cap)
+{
+    if (!cap)
+    {
+        return 0;
+    }
+    if (!cx.trap_codes)
+    {
+        size_t n = len < cap - 1 ? len : cap - 1;
+        memcpy(out, text, n);
+        out[n] = 0;
+        return n;
+    }
+    for (uint32_t i = 0; i < ntraps; i++) // the same place twice (a function lowered again): one code
+    {
+        if (strlen(trap_texts[i]) == len && memcmp(trap_texts[i], text, len) == 0)
+        {
+            int k = snprintf(out, cap, "trap %u", i + 1);
+            return k < 0 ? 0 : (size_t)k >= cap ? cap - 1 : (size_t)k;
+        }
+    }
+    if (ntraps == ctraps)
+    {
+        ctraps = ctraps ? ctraps * 2 : 32;
+        trap_texts = realloc(trap_texts, ctraps * sizeof(*trap_texts));
+        trap_used = realloc(trap_used, ctraps);
+    }
+    trap_used[ntraps] = 0;
+    char *copy = malloc(len + 1);
+    memcpy(copy, text, len);
+    copy[len] = 0;
+    trap_texts[ntraps++] = copy;
+    int k = snprintf(out, cap, "trap %u", ntraps);
+    return k < 0 ? 0 : (size_t)k >= cap ? cap - 1 : (size_t)k;
+}
+
+const char *trap_code_text(uint32_t n)
+{
+    return n >= 1 && n <= ntraps ? trap_texts[n - 1] : NULL;
+}
+
+int trap_codes_write(const char *path)
+{
+    uint32_t used = 0;
+    for (uint32_t i = 0; i < ntraps; i++)
+    {
+        used += trap_used[i];
+    }
+    if (!used)
+    {
+        remove(path); // an old map of a binary that has no guards now
+        return 0;
+    }
+    FILE *f = fopen(path, "w");
+    if (!f)
+    {
+        return -1;
+    }
+    fprintf(f, "-- the places of the guards in this binary (`trap N` in its output)\n");
+    for (uint32_t i = 0; i < ntraps; i++)
+    {
+        if (trap_used[i])
+        {
+            fprintf(f, "trap %u\t%s\n", i + 1, trap_texts[i]);
+        }
+    }
+    fclose(f);
+    return 1;
 }

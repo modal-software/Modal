@@ -144,6 +144,8 @@ int scan_all(const char *filename, const char *src, size_t len, int eager, Token
 // Returns the number of lexical errors in the body.
 int scan_body(const char *filename, const char *src, const Token *body, TokenVec *out);
 
+extern int scan_quiet; // 1: errors are counted, not printed
+
 // Line and column (1-based) of a position in `src`.
 void source_pos(const char *src, const char *at, int *line, int *col);
 

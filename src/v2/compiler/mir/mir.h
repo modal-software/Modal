@@ -154,6 +154,7 @@ typedef struct MirFunc
 // lowered yet. The function lives in its own region until the next call.
 int mir_lower(Unit *u, SymId fn, MirFunc *out);
 
+void audit_function(const MirFunc *f); // --audit: its calls, writes and guards (sema/audit.c)
 void mir_reset(void); // a fresh compilation: no kept bodies, globals or output routines
 
 // A module-level initializer as a function returning it (slot 0), for the compiler to run.

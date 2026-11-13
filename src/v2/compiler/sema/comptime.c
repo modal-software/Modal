@@ -258,6 +258,7 @@ void comptime_capture(Unit *u, SymId fn)
 
 static const CtFunc *function(SymId fn)
 {
+    audit_comptime(fn);
     CtFunc *f = ct_func(fn); // (its address stays: each is allocated on its own)
     if (f->state == 0)
     {
@@ -568,6 +569,18 @@ static int run(Vm *vm, SymId sym, const CtFunc *f, size_t fp)
                 break;
             }
             vm->trapped = 1;
+            unsigned code = 0;
+            int used = 0;
+            if (sscanf(vm->trap_text, "trap %u%n", &code, &used) == 1 && trap_code_text(code))
+            {
+                // in the compiler the place is known: `trap N` back to the text it stands for
+                char whole[sizeof(vm->trap_text)];
+                int k = snprintf(whole, sizeof(whole), "%s%.*s", trap_code_text(code), vm->trap_len - used,
+                                 vm->trap_text + used);
+                k = k < 0 ? 0 : k >= (int)sizeof(whole) ? (int)sizeof(whole) - 1 : k;
+                memcpy(vm->trap_text, whole, (size_t)k);
+                vm->trap_len = k;
+            }
             int len = vm->trap_len;
             const char *text = vm->trap_text;
             len -= len && text[len - 1] == '\n';

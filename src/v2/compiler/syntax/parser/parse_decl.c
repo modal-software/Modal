@@ -26,8 +26,9 @@ int type_starts_at(const Token *t)
     case TOK_STAR:
     case TOK_STRUCT:
         return 1;
-    case TOK_LBRACKET:
-        return t[1].kind == TOK_RBRACKET;
+    case TOK_LBRACKET: // `[]T`, or `[N]T` with N a number or a constant's name
+        return t[1].kind == TOK_RBRACKET ||
+               ((t[1].kind == TOK_NUMBER || t[1].kind == TOK_IDENTIFIER) && t[2].kind == TOK_RBRACKET);
     default:
         return 0;
     }
@@ -539,7 +540,7 @@ int local_decl_at(const Token *t)
 {
     if (t->kind == TOK_IDENTIFIER && !t[1].nl && (t[1].kind == TOK_COLON || t[1].kind == TOK_COMMA))
     {
-        return !(t[1].kind == TOK_COLON && t[2].kind == TOK_LBRACE); // `c: {` is a match
+        return !(t[1].kind == TOK_COLON && t[2].kind == TOK_LBRACE); // `c: {`: the old match form, reported by parse_expression
     }
     const Token *k = t;
     for (;;)
@@ -833,6 +834,11 @@ static NodeId parse_declaration_one(Parser *p, DeclContext ctx)
 {
     const Token *t = p->current;
     if (ctx == DECL_TOP && t->kind == TOK_IDENTIFIER && call_statement_at(p, t))
+    {
+        return parse_expression(p);
+    }
+    // `point{ x, y }` alone on its line: the face of point's data (the members seen outside it)
+    if (ctx == DECL_TOP && t->kind == TOK_IDENTIFIER && t[1].kind == TOK_LBRACE && t->off + t->len == t[1].off)
     {
         return parse_expression(p);
     }

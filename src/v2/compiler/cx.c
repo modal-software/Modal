@@ -450,6 +450,11 @@ void diag_vtok(Unit *u, const Token *t, const char *level, const char *fmt, va_l
         cx.quiet_errors += level[0] == 'e';
         return;
     }
+    if (level[0] == 'w' && !cx.warn) // kept for --warn (and, later, the build's setting)
+    {
+        cx.warnings++;
+        return;
+    }
 
     // After MAX_REPORTED errors the rest are counted but not printed: a mistake repeated
     // across a large file should not bury the first reports or cost seconds of output.

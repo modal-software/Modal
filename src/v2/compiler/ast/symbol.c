@@ -247,25 +247,16 @@ static const char *sym_kind_name(uint8_t kind)
     }
 }
 
-// How far a symbol can be seen:
-//   inside  only within its struct
-//   domain  within its folder
-//   public  from other domains
+// How far a symbol is seen (std.md §10): public when another domain uses it, domain otherwise.
+// mod.modal's values are the domain's configuration. (--syms runs after checking, so the uses
+// are all known.)
 static const char *visibility(const Unit *u, const Symbol *s)
 {
-    if (s->owner)
-    {
-        if (!(s->flags & SYM_F_EXPOSED))
-        {
-            return "inside";
-        }
-        return u->bound ? "public" : "domain";
-    }
-    if (u->is_manifest)
+    if (u->is_manifest && !s->owner)
     {
         return s->kind == SYM_CONST ? "config" : "public";
     }
-    return (s->kind == SYM_STRUCT && u->bound) ? "public" : "domain";
+    return (s->flags & SYM_F_PUBLIC) ? "public" : "domain";
 }
 
 // Symbols are appended in declaration order, so a linear pass prints each unit as written.

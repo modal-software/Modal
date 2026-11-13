@@ -20,6 +20,7 @@
 // then each function as the checker hands it over, then the entry point.
 #include "v2/compiler/backend/backend.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 typedef struct
@@ -35,12 +36,8 @@ typedef struct
 
 static void emit_expr(Emit *e, NodeId id);
 static void emit_match(Emit *e, NodeId id);
+static void emit_match_as(Emit *e, NodeId id, int returned);
 
-static int same_name(const Unit *u, uint32_t a, uint32_t b)
-{
-    const Token *x = TOK(u, a), *y = TOK(u, b);
-    return x->len == y->len && memcmp(TSTART(x), TSTART(y), x->len) == 0;
-}
 
 // ---- output helpers --------------------------------------------------------------------------
 
@@ -185,6 +182,19 @@ static void out_fn_name(Emit *e, SymId fn)
     }
 }
 
+// A struct's C name: m_<name>, or m_u<file>_<name> for one declared in another file.
+static void out_struct_name(Emit *e, SymId st)
+{
+    PUT(e, "m_");
+    if (SYM(st)->unit != 0)
+    {
+        char prefix[16];
+        snprintf(prefix, sizeof(prefix), "u%u_", (unsigned)SYM(st)->unit);
+        put(e, prefix);
+    }
+    out_sym_name(e, st);
+}
+
 // A parameter's C name: v_<name>, or v__<index> for a pattern, which has no name.
 static void out_param_name(Emit *e, NodeId param, int index)
 {
@@ -215,8 +225,12 @@ static void out_type(Emit *e, TypeId t, uint32_t at)
     }
     else if (k == T_STRUCT)
     {
-        PUT(e, "m_");
-        out_sym_name(e, type_ref(t));
+        out_struct_name(e, type_ref(t));
+    }
+    else if (k == T_PTR && type_kind(type_ref(t)) == T_ARRAY) // *[N]T: a pointer to its first element
+    {
+        out_type(e, type_ref(type_ref(t)), at);
+        PUT(e, " *");
     }
     else if (k == T_PTR)
     {
@@ -500,8 +514,8 @@ static void emit_call(Emit *e, NodeId id)
             TypeId base = u->types[callee->a];
             if (type_kind(base) == T_TYPE) // T.m(...): a fresh zero value
             {
-                PUT(e, "&(m_");
-                out_sym_name(e, type_ref(base));
+                PUT(e, "&(");
+                out_struct_name(e, type_ref(base));
                 PUT(e, "){0}");
             }
             else
@@ -592,10 +606,17 @@ static void emit_tail(Emit *e, NodeId call);
 static int c_statement(const Unit *u, NodeId r)
 {
     int k = NODE(u, r)->kind;
-    return k == AST_BLOCK || k == AST_RETURN || k == AST_ASSIGN || k == AST_FIELD_DECL;
+    return k == AST_BLOCK || k == AST_RETURN || k == AST_ASSIGN || k == AST_FIELD_DECL || k == AST_IF;
 }
 
 static void emit_match(Emit *e, NodeId id)
+{
+    emit_match_as(e, id, 0);
+}
+
+// returned: `return if n { ... }`, written as a statement whose arms return (a call there is a
+// tail call, as in a body of arms).
+static void emit_match_as(Emit *e, NodeId id, int returned)
 {
     Unit *u = e->u;
     const AstNode *m = NODE(u, id);
@@ -606,17 +627,20 @@ static void emit_match(Emit *e, NodeId id)
     TypeId ret = e->fn ? sema_fn_ret(&cx.units[SYM(e->fn)->unit], e->fn) : T_VOID;
     if (m->a)
     {
-        types[0] = u->types[m->a];
-        snprintf(temps[0], sizeof(temps[0]), "m_s%u", id);
-        subj[ns++] = (Subject){0, 0, temps[0]};
-        PUT(e, "({ ");
-        out_type(e, types[0], m->tok);
-        put(e, " ");
-        put(e, temps[0]);
-        PUT(e, " = ");
-        emit_as(e, m->a, types[0]);
-        PUT(e, "; ");
-        if (type != T_VOID && type != T_NONE)
+        put(e, returned ? "{ " : "({ "); // (put: PUT takes literals only)
+        for (NodeId v = m->a; v && ns < 16; v = NEXT(u, v), ns++) // one temporary per value
+        {
+            types[ns] = u->types[v] == T_INT_LIT ? T_I64 : u->types[v]; // (as the checker matched it)
+            snprintf(temps[ns], sizeof(temps[ns]), "m_s%u_%d", id, ns);
+            subj[ns] = (Subject){0, 0, temps[ns]};
+            out_type(e, types[ns], m->tok);
+            put(e, " ");
+            put(e, temps[ns]);
+            PUT(e, " = ");
+            emit_as(e, v, types[ns]);
+            PUT(e, "; ");
+        }
+        if (!returned && type != T_VOID && type != T_NONE)
         {
             out_type(e, type, m->tok);
             char r[24];
@@ -648,59 +672,32 @@ static void emit_match(Emit *e, NodeId id)
         for (NodeId pat = a->a; pat && k < ns; pat = NEXT(u, pat), k++)
         {
             Pattern pt;
-            NodeId test = NODE(u, pat)->kind == AST_IDENT ? NODE(u, pat)->a : pat; // `d 1..9`: its test
-            if (test && !(last && (m->aux & MATCH_LAST_FREE)) && sema_arm_pattern(u, test, types[k], &pt))
+            NodeId name;
+            if (last && (m->aux & MATCH_LAST_FREE))
+            {
+                continue;
+            }
+            if (sema_arm_pattern(u, pat, types[k], &pt)) // `_`: none
             {
                 put(e, tests ? " && " : "if (");
                 emit_pattern_cond(e, &pt, types[k], subj[k]);
                 tests++;
             }
+            else if ((name = sema_arm_name(u, pat, types[k]))) // a value known when the program runs
+            {
+                put(e, tests ? " && " : "if (");
+                out_subject(e, subj[k]);
+                PUT(e, " == (");
+                emit_as(e, name, types[k]);
+                PUT(e, ")");
+                tests++;
+            }
         }
         put(e, tests ? ") {\n" : "{\n");
-        k = 0;
-        for (NodeId pat = a->a; pat && k < ns; pat = NEXT(u, pat), k++) // the names it binds
-        {
-            const AstNode *pn = NODE(u, pat);
-            if (pn->kind != AST_IDENT)
-            {
-                continue;
-            }
-            int same = !m->a && same_name(u, pn->tok, NODE(u, subj[k].param)->tok);
-            if (same && !pn->b)
-            {
-                continue; // the parameter itself
-            }
-            char via[32] = "";
-            if (same) // a copy of a parameter under its own name: through a temporary
-            {
-                snprintf(via, sizeof(via), "m_b%u", pat);
-                out_type(e, types[k], pn->tok);
-                put(e, " ");
-                put(e, via);
-                PUT(e, " = ");
-                out_subject(e, subj[k]);
-                PUT(e, ";\n");
-            }
-            out_type(e, types[k], pn->tok);
-            PUT(e, " v_");
-            out_tok(e, pn->tok);
-            PUT(e, " = ");
-            if (same)
-            {
-                put(e, via);
-            }
-            else
-            {
-                out_subject(e, subj[k]);
-            }
-            PUT(e, "; (void)v_");
-            out_tok(e, pn->tok);
-            PUT(e, ";\n");
-        }
         NodeId r = a->b;
         int saved = e->indent;
         e->indent = 2;
-        if (!m->a && !c_statement(u, r) && ret != T_VOID) // on the parameters: the return
+        if ((!m->a || returned) && !c_statement(u, r) && ret != T_VOID) // on the parameters: the return
         {
             if (tail_call(e, r))
             {
@@ -714,14 +711,16 @@ static void emit_match(Emit *e, NodeId id)
                 PUT(e, ";\n");
             }
         }
-        else if (m->a && type != T_VOID && type != T_NONE)
+        else if (m->a && !returned && type != T_VOID && type != T_NONE)
         {
             char line[32];
-            snprintf(line, sizeof(line), "m_r%u = ", id);
+            snprintf(line, sizeof(line), "m_r%u = (", id);
             out_indent(e);
             put(e, line);
+            out_type(e, type, m->tok); // said out loud: the arm's value wraps into the match's type
+            PUT(e, ")(");
             emit_as(e, r, type);
-            PUT(e, ";\n");
+            PUT(e, ");\n");
         }
         else
         {
@@ -741,7 +740,7 @@ static void emit_match(Emit *e, NodeId id)
         e->indent = saved;
         put(e, last ? "}\n" : "} else ");
     }
-    if (m->a)
+    if (m->a && !returned)
     {
         if (type != T_VOID && type != T_NONE)
         {
@@ -758,6 +757,80 @@ static void emit_match(Emit *e, NodeId id)
     {
         PUT(e, "}");
     }
+}
+
+// `"file:line:col: <what>\n"`, as a C string.
+static void out_place(Emit *e, uint32_t tok, const char *what)
+{
+    Unit *u = e->u;
+    int line, col;
+    source_pos(u->src, TSTART(TOK(u, tok)), &line, &col);
+    PUT(e, "\"");
+    for (const char *c = u->path; *c; c++)
+    {
+        if (*c == '"' || *c == '\\')
+        {
+            put_c(e, '\\');
+        }
+        put_c(e, *c);
+    }
+    char pos[160];
+    snprintf(pos, sizeof(pos), ":%d:%d: %s\\n\"", line, col, what);
+    put(e, pos);
+}
+
+// a[i]: the element, its index checked unless the checker proved it (std.md §9).
+static void emit_index(Emit *e, NodeId id)
+{
+    Unit *u = e->u;
+    const AstNode *n = NODE(u, id);
+    TypeId at = u->types[n->a];
+    if (at == T_STR)
+    {
+        char tmp[32];
+        snprintf(tmp, sizeof(tmp), "m_i%u", id);
+        PUT(e, "({ m_str ");
+        put(e, tmp);
+        PUT(e, " = ");
+        emit_expr(e, n->a);
+        PUT(e, "; ");
+        put(e, tmp);
+        PUT(e, ".ptr[m_index((uint64_t)(");
+        emit_expr(e, n->b);
+        PUT(e, "), ");
+        put(e, tmp);
+        PUT(e, ".len, ");
+        out_place(e, n->tok, "index out of range (past the string's end)");
+        PUT(e, ")]; })");
+        return;
+    }
+    emit_expr(e, n->a);
+    at = type_kind(at) == T_PTR ? type_ref(at) : at; // `p: *[N]T`: indexed in place
+    const AstNode *ix = NODE(u, n->b);
+    uint64_t k;
+    if (ix->kind == AST_NUMBER_LIT && number_value(TSTART(TOK(u, ix->tok)), TOK(u, ix->tok)->len, &k, NULL) &&
+        k < type_len(at))
+    {
+        char lit[32];
+        snprintf(lit, sizeof(lit), "[%llu]", (unsigned long long)k);
+        put(e, lit);
+        return;
+    }
+    if (n->aux & INDEX_SAFE)
+    {
+        PUT(e, "[(uint64_t)(");
+        emit_expr(e, n->b);
+        PUT(e, ")]");
+        return;
+    }
+    PUT(e, "[m_index((uint64_t)(");
+    emit_expr(e, n->b);
+    char len[96];
+    snprintf(len, sizeof(len), "), %lluull, ", (unsigned long long)type_len(at));
+    put(e, len);
+    snprintf(len, sizeof(len), "index out of range (0 to %llu)", (unsigned long long)type_len(at) - 1);
+    out_place(e, n->tok, len);
+    PUT(e, ")]");
 }
 
 static void emit_expr(Emit *e, NodeId id)
@@ -870,10 +943,38 @@ static void emit_expr(Emit *e, NodeId id)
         emit_expr(e, n->a);
         PUT(e, ")");
         break;
+    case AST_STRUCT_LIT: // a compound literal: C zeroes what it does not name (here, nothing)
+        PUT(e, "((");
+        out_type(e, u->types[id], n->tok);
+        PUT(e, "){");
+        for (NodeId f = n->a; f; f = NEXT(u, f))
+        {
+            SymId field = u->refs[f];
+            if (!field)
+            {
+                continue;
+            }
+            PUT(e, " .");
+            out_tok(e, NODE(u, f)->tok);
+            PUT(e, " = ");
+            emit_as(e, NODE(u, f)->a, sema_value_type(&cx.units[SYM(field)->unit], field));
+            put_c(e, NEXT(u, f) ? ',' : ' ');
+        }
+        PUT(e, "})");
+        break;
     case AST_UNARY_OP:
         if (t->kind == TOK_AMP && is_self_ident(u, n->a))
         {
             PUT(e, "self"); // &self: the reference itself
+            break;
+        }
+        if (t->kind == TOK_AMP && type_kind(u->types[n->a]) == T_ARRAY) // &a: its first element's address
+        {
+            PUT(e, "((");
+            out_type(e, type_ref(u->types[n->a]), n->tok);
+            PUT(e, " *)");
+            emit_expr(e, n->a);
+            PUT(e, ")");
             break;
         }
         if (t->kind == TOK_MINUS && type >= T_U8 && type <= T_INT) // wraps, as `0 - x` does
@@ -1008,9 +1109,32 @@ static void emit_expr(Emit *e, NodeId id)
     case AST_MATCH:
         emit_match(e, id);
         break;
+    case AST_IF:
+    {
+        const AstNode *br = NODE(u, n->b);
+        TypeId ret = e->fn ? sema_fn_ret(&cx.units[SYM(e->fn)->unit], e->fn) : T_VOID;
+        int saved = e->indent;
+        PUT(e, "if (");
+        emit_as(e, n->a, T_BOOL);
+        PUT(e, ") {\n");
+        e->indent = saved + 1;
+        emit_stmt(e, br->a, ret);
+        e->indent = saved;
+        out_indent(e);
+        PUT(e, "}");
+        if (br->b)
+        {
+            PUT(e, " else {\n");
+            e->indent = saved + 1;
+            emit_stmt(e, br->b, ret);
+            e->indent = saved;
+            out_indent(e);
+            PUT(e, "}");
+        }
+        break;
+    }
     case AST_INDEX:
-        unsupported(e, n->tok, "indexing");
-        PUT(e, "0");
+        emit_index(e, id);
         break;
     default:
         unsupported(e, n->tok, "this expression");
@@ -1077,6 +1201,33 @@ static void emit_tail(Emit *e, NodeId call)
     PUT(e, ";\n");
 }
 
+// An array local: its elements packed, at zero or copied from `init`'s (`c := a` is a copy).
+static void emit_array_local(Emit *e, NodeId id, TypeId t, NodeId init)
+{
+    Unit *u = e->u;
+    const AstNode *n = NODE(u, id);
+    out_indent(e);
+    out_type(e, type_ref(t), n->tok);
+    PUT(e, " v_");
+    out_tok(e, n->tok);
+    char len[96];
+    snprintf(len, sizeof(len), "[%u] = {0};\n", type_len(t));
+    put(e, len);
+    if (!init)
+    {
+        return;
+    }
+    out_indent(e);
+    PUT(e, "{ const ");
+    out_type(e, type_ref(t), n->tok);
+    PUT(e, " *m_s = ");
+    emit_expr(e, init);
+    snprintf(len, sizeof(len), "; for (uint64_t m_k = 0; m_k < %uu; m_k++) v_", type_len(t));
+    put(e, len);
+    out_tok(e, n->tok);
+    PUT(e, "[m_k] = m_s[m_k]; }\n");
+}
+
 static void emit_stmt(Emit *e, NodeId id, TypeId ret)
 {
     Unit *u = e->u;
@@ -1101,6 +1252,11 @@ static void emit_stmt(Emit *e, NodeId id, TypeId ret)
         {
             return; // the literal was emitted as a function of its own; calls name it directly
         }
+        if (type_kind(u->types[id]) == T_ARRAY)
+        {
+            emit_array_local(e, id, u->types[id], n->a);
+            return;
+        }
         out_indent(e);
         out_type(e, u->types[id], n->tok);
         PUT(e, " v_");
@@ -1110,6 +1266,11 @@ static void emit_stmt(Emit *e, NodeId id, TypeId ret)
         PUT(e, ";\n");
         return;
     case AST_FIELD_DECL: // a local with its type: its value converted to it, or zero
+        if (type_kind(u->types[id]) == T_ARRAY) // its elements start at zero, or are init's
+        {
+            emit_array_local(e, id, u->types[id], n->b);
+            return;
+        }
         out_indent(e);
         out_type(e, u->types[id], n->tok);
         PUT(e, " v_");
@@ -1126,9 +1287,28 @@ static void emit_stmt(Emit *e, NodeId id, TypeId ret)
         PUT(e, ";\n");
         return;
     case AST_RETURN:
+        if (n->a && NODE(u, n->a)->kind == AST_UNARY_OP && TOK(u, NODE(u, n->a)->tok)->kind == TOK_AMP &&
+            NODE(u, NODE(u, n->a)->a)->kind == AST_STRUCT_LIT) // `return &point{ ... }`: built in self
+        {
+            out_indent(e);
+            PUT(e, "*self = ");
+            emit_expr(e, NODE(u, n->a)->a);
+            PUT(e, ";\n");
+            out_indent(e);
+            PUT(e, "return self;\n");
+            return;
+        }
         if (n->a && tail_call(e, n->a))
         {
             emit_tail(e, n->a);
+            return;
+        }
+        if (n->a && NODE(u, n->a)->kind == AST_MATCH && NODE(u, n->a)->a && ret != T_VOID &&
+            type_kind(ret) != T_STRUCT)
+        {
+            out_indent(e);
+            emit_match_as(e, n->a, 1);
+            PUT(e, "\n");
             return;
         }
         out_indent(e);
@@ -1169,8 +1349,7 @@ static void emit_signature(Emit *e, SymId fn)
     PUT(e, "(");
     if (SYM(fn)->owner)
     {
-        PUT(e, "m_");
-        out_sym_name(e, SYM(fn)->owner);
+        out_struct_name(e, SYM(fn)->owner);
         PUT(e, " *self");
         first = 0;
     }
@@ -1178,7 +1357,21 @@ static void emit_signature(Emit *e, SymId fn)
     for (NodeId p = sema_fn_params(u, fn); p; p = NEXT(u, p), index++)
     {
         put(e, first ? "" : ", ");
-        out_type(e, sema_param_type(u, fn, p), NODE(u, p)->tok);
+        TypeId pt = sema_param_type(u, fn, p);
+        if (type_kind(pt) == T_ARRAY) // by its address; a mutable one is copied in (emit_function)
+        {
+            PUT(e, "const ");
+            out_type(e, type_ref(pt), NODE(u, p)->tok);
+            PUT(e, " *");
+            out_param_name(e, p, index);
+            if (NODE(u, p)->flags & AST_F_MUT)
+            {
+                PUT(e, "__in");
+            }
+            first = 0;
+            continue;
+        }
+        out_type(e, pt, NODE(u, p)->tok);
         put_c(e, ' ');
         out_param_name(e, p, index);
         first = 0;
@@ -1192,7 +1385,13 @@ static void emit_clause_test(Emit *e, SymId fn, TypeId ret)
 {
     Unit *u = e->u;
     SymId next = sema_next_clause(u, fn);
-    if (!next)
+    int patterned = 0;
+    for (NodeId p = sema_fn_params(u, fn); p && !next; p = NEXT(u, p))
+    {
+        Pattern pat;
+        patterned |= sema_pattern_of(u, p, SYM(fn)->owner, &pat, 0);
+    }
+    if (!next && !patterned)
     {
         return;
     }
@@ -1210,6 +1409,11 @@ static void emit_clause_test(Emit *e, SymId fn, TypeId ret)
         emit_pattern_cond(e, &pat, sema_param_type(u, fn, p), (Subject){p, index, NULL});
     }
     PUT(e, "))\n    {\n        ");
+    if (!next) // no clause takes these values: the call does nothing (a nil clause set)
+    {
+        PUT(e, "return;\n    }\n");
+        return;
+    }
     int tail = scalar_type(ret) && !SYM(fn)->owner; // the same prototype: a tail call
     for (NodeId p = sema_fn_params(u, fn); p && tail; p = NEXT(u, p))
     {
@@ -1247,6 +1451,26 @@ static void emit_function(Emit *e, SymId fn)
     if (SYM(fn)->owner)
     {
         PUT(e, "    (void)self;\n");
+    }
+    int pindex = 0;
+    for (NodeId p = sema_fn_params(u, fn); p; p = NEXT(u, p), pindex++) // a mutable array: its own copy
+    {
+        TypeId pt = sema_param_type(u, fn, p);
+        if (type_kind(pt) != T_ARRAY || !(NODE(u, p)->flags & AST_F_MUT))
+        {
+            continue;
+        }
+        PUT(e, "    ");
+        out_type(e, type_ref(pt), NODE(u, p)->tok);
+        put_c(e, ' ');
+        out_param_name(e, p, pindex);
+        char len[96];
+        snprintf(len, sizeof(len), "[%u]; for (uint64_t m_k = 0; m_k < %uu; m_k++) ", type_len(pt), type_len(pt));
+        put(e, len);
+        out_param_name(e, p, pindex);
+        PUT(e, "[m_k] = ");
+        out_param_name(e, p, pindex);
+        PUT(e, "__in[m_k];\n");
     }
     emit_clause_test(e, fn, ret);
     if (n->flags & AST_F_ONELINE)
@@ -1307,16 +1531,41 @@ static void emit_struct(Emit *e, NodeId decl)
     int block = self && sema_is_register_block(self);
     uint32_t pos = 0;
 
-    PUT(e, "struct m_");
-    put_n(e, TSTART(name), name->len);
+    PUT(e, "struct ");
+    out_struct_name(e, self);
     PUT(e, "\n{\n");
+    // The fields in the order sema/layout.c put them (largest alignment first, or as written in
+    // a register block): C then lays them out at the same offsets.
+    NodeId by_offset[64];
+    uint32_t nf = 0, total = 0;
     for (NodeId m = n->a; m; m = NEXT(u, m))
     {
-        const AstNode *member = NODE(u, m);
-        if (member->kind == AST_STRUCT_DECL)
+        if (NODE(u, m)->kind == AST_STRUCT_DECL)
         {
-            unsupported(e, member->tok, "a struct declared inside another struct");
+            unsupported(e, NODE(u, m)->tok, "a struct declared inside another struct");
         }
+        if (NODE(u, m)->kind != AST_FIELD_DECL)
+        {
+            continue;
+        }
+        total++;
+        uint32_t at = self ? layout_member_offset(self, m) : 0, k = nf < 64 ? nf++ : 64;
+        while (k < 64 && k > 0 && layout_member_offset(self, by_offset[k - 1]) > at)
+        {
+            by_offset[k] = by_offset[k - 1];
+            k--;
+        }
+        if (k < 64)
+        {
+            by_offset[k] = m;
+        }
+    }
+    int as_written = !self || total > 64;
+    uint32_t next = 0;
+    for (NodeId m = as_written ? n->a : (nf ? by_offset[0] : 0); m;
+         m = as_written ? NEXT(u, m) : (++next < nf ? by_offset[next] : 0))
+    {
+        const AstNode *member = NODE(u, m);
         if (member->kind != AST_FIELD_DECL)
         {
             continue;
@@ -1371,12 +1620,12 @@ static void emit_struct(Emit *e, NodeId decl)
             continue;
         }
         char check[96];
-        PUT(e, "typedef char m_layout_");
-        put_n(e, TSTART(name), name->len);
-        put_c(e, '_');
+        PUT(e, "typedef char ");
+        out_struct_name(e, self);
+        PUT(e, "_layout_");
         put_n(e, TSTART(field), field->len);
-        PUT(e, "[offsetof(struct m_");
-        put_n(e, TSTART(name), name->len);
+        PUT(e, "[offsetof(struct ");
+        out_struct_name(e, self);
         PUT(e, ", ");
         put_n(e, TSTART(field), field->len);
         snprintf(check, sizeof(check), ") == %u ? 1 : -1];\n", field_offset_of(s));
@@ -1384,14 +1633,59 @@ static void emit_struct(Emit *e, NodeId decl)
     }
     if (self && !has_str)
     {
-        char check[96];
-        PUT(e, "typedef char m_layout_");
-        put_n(e, TSTART(name), name->len);
-        snprintf(check, sizeof(check), "_size[sizeof(struct m_%.*s) == %u ? 1 : -1];\n",
-                 (int)name->len, TSTART(name), type_layout(type_make(T_STRUCT, self)).size);
+        char check[64];
+        PUT(e, "typedef char ");
+        out_struct_name(e, self);
+        PUT(e, "_size[sizeof(struct ");
+        out_struct_name(e, self);
+        snprintf(check, sizeof(check), ") == %u ? 1 : -1];\n", type_layout(type_make(T_STRUCT, self)).size);
         put(e, check);
     }
     PUT(e, "\n");
+}
+
+// A struct the C program declares: a top-level struct of a file that is part of the program.
+static int c_struct(SymId st)
+{
+    const Symbol *s = SYM(st);
+    if (s->kind != SYM_STRUCT || s->owner || !s->decl)
+    {
+        return 0;
+    }
+    const Unit *home = &cx.units[s->unit];
+    return !home->is_manifest && !home->broken && !home->provided &&
+           NODE(home, s->decl)->kind == AST_STRUCT_DECL;
+}
+
+// Defines st, after the structs its fields hold by value (C needs those complete first).
+static void emit_struct_after_fields(Emit *e, SymId st, uint8_t *defined)
+{
+    if (defined[st] || !c_struct(st))
+    {
+        return;
+    }
+    defined[st] = 1;
+    Unit *home = &cx.units[SYM(st)->unit];
+    for (NodeId m = NODE(home, SYM(st)->decl)->a; m; m = NEXT(home, m))
+    {
+        if (NODE(home, m)->kind != AST_FIELD_DECL)
+        {
+            continue;
+        }
+        const Token *field = TOK(home, NODE(home, m)->tok);
+        SymId f = scope_find(scope_at(SYM(st)->scope_ref), TSTART(field), field->len);
+        while (f && SYM(f)->kind != SYM_FIELD)
+        {
+            f = SYM(f)->next;
+        }
+        TypeId t = f ? sema_value_type(home, f) : T_NONE;
+        if (f && type_kind(t) == T_STRUCT)
+        {
+            emit_struct_after_fields(e, type_ref(t), defined);
+        }
+    }
+    e->u = home;
+    emit_struct(e, SYM(st)->decl);
 }
 
 static const char *const prelude =
@@ -1451,6 +1745,8 @@ static const char *const prelude =
     "    if ((T)-1 < 0 && b == (T)-1) return (T)(0 - (uint64_t)a); return (T)(a / b); }\n"
     "M_DIV(uint8_t) M_DIV(uint16_t) M_DIV(uint32_t) M_DIV(uint64_t)\n"
     "M_DIV(int8_t) M_DIV(int16_t) M_DIV(int32_t) M_DIV(int64_t)\n"
+    // An index: past the length, the program stops with its place (as in the native code).
+    "M_RT uint64_t m_index(uint64_t i, uint64_t n, const char *m) { if (i >= n) m_trap(m); return i; }\n"
     "M_RT void m_write_uint(unsigned long long n) {\n"
     "    uint8_t b[24]; int i = 24;\n"
     "    do { b[--i] = (uint8_t)('0' + n % 10); n /= 10; } while (n);\n"
@@ -1565,10 +1861,9 @@ static void backend_c_begin(const BackendJob *job)
             const AstNode *n = NODE(m, d);
             int value = n->kind == AST_FIELD_DECL ||
                         (n->kind == AST_DEFINE && NODE(m, n->a)->kind != AST_FN_LIT && !ast_import_root(m, n->a));
-            if (n->kind == AST_STRUCT_DECL || value)
+            if (value)
             {
-                unsupported(e, n->tok, n->kind == AST_STRUCT_DECL ? "a type in an imported file"
-                                                                  : "a module-level value in an imported file");
+                unsupported(e, n->tok, "a module-level value in an imported file");
             }
         }
         e->u = u;
@@ -1576,28 +1871,28 @@ static void backend_c_begin(const BackendJob *job)
 
     put(e, prelude);
 
-    // 1. Types: every struct is declared before any is defined, so they can refer to each
-    //    other through pointers in any order.
-    for (NodeId d = NODE(u, u->root)->a; d; d = NEXT(u, d))
+    // 1. Types, of every file the program reaches: each struct is declared before any is
+    //    defined, so they can refer to each other through pointers in any order, and each is
+    //    defined after the structs it holds by value.
+    for (SymId st = 1; st < cx.syms.size; st++)
     {
-        if (NODE(u, d)->kind == AST_STRUCT_DECL)
+        if (c_struct(st))
         {
-            const Token *name = TOK(u, NODE(u, d)->tok);
-            PUT(e, "typedef struct m_");
-            put_n(e, TSTART(name), name->len);
-            PUT(e, " m_");
-            put_n(e, TSTART(name), name->len);
+            PUT(e, "typedef struct ");
+            out_struct_name(e, st);
+            put_c(e, ' ');
+            out_struct_name(e, st);
             PUT(e, ";\n");
         }
     }
     PUT(e, "\n");
-    for (NodeId d = NODE(u, u->root)->a; d; d = NEXT(u, d))
+    uint8_t *defined = calloc(cx.syms.size, 1);
+    for (SymId st = 1; st < cx.syms.size; st++)
     {
-        if (NODE(u, d)->kind == AST_STRUCT_DECL)
-        {
-            emit_struct(e, d);
-        }
+        emit_struct_after_fields(e, st, defined);
     }
+    free(defined);
+    e->u = u;
 
     // 2. Module-level values.
     for (NodeId d = NODE(u, u->root)->a; d; d = NEXT(u, d))

@@ -453,8 +453,8 @@ static NodeId decl_chain(const Unit *u, NodeId decl)
 // ---- location rules --------------------------------------------------------------------------
 
 // Like Go's internal/: a domain can be imported from its parent folder and from anything
-// below that parent. Further out, it is reached only through the parent's mod.modal. And a
-// file of another domain can be imported directly only if its domain's mod.modal binds it.
+// below that parent. Further out, it is reached only through the parent's mod.modal. Any file
+// of a domain in reach can be imported: what another domain uses is public (std.md §10).
 // A file sees its own domain and every domain above it, as a child sees its ancestors.
 static int sees_inside(const Unit *u, const Unit *target)
 {
@@ -491,16 +491,6 @@ static int may_import(Unit *u, uint32_t tok, const Unit *target)
                 (int)(parent_end - parent), parent);
         return 0;
     }
-    if (!target->is_manifest && !target->bound)
-    {
-        diag_at(u, tok, "error",
-                "module '%.*s' is not part of the face of domain '%s'. To share it, bind it in "
-                "%s/mod.modal: `%.*s := import(\"./%.*s\")`",
-                target->name_len, target->name, domain_name(target->domain),
-                domain_name(target->domain), target->name_len, target->name, target->name_len,
-                target->name);
-        return 0;
-    }
     return 1;
 }
 
@@ -521,42 +511,17 @@ static Target follow_import(SymId id, int depth)
     return chain_eval(owner, decl->a, CHAIN_SILENT, depth + 1);
 }
 
-// The inside / outside rule, applied to one name. Returns 0 after reporting a violation.
+// What one name may reach across files. Every member and module-level name of a domain can be
+// used; a use from another domain makes it public (std.md §10). What stays out of reach is the
+// compile-time side of a domain: its mod.modal configuration and functions. Returns 0 after
+// reporting a violation.
 static int may_see(Unit *u, uint32_t tok, SymId id)
 {
     const Token *name = TOK(u, tok);
-    const Symbol *s = SYM(id);
+    Symbol *s = SYM(id);
     Unit *owner = &cx.units[s->unit];
 
-    if (s->owner) // a struct member: only the struct's face can be named from elsewhere
-    {
-        int tlen;
-        const char *type = symbol_name(s->owner, &tlen);
-        if (s->kind == SYM_FIELD)
-        {
-            diag_at(u, tok, "error",
-                    "'%.*s' is a field of '%.*s', and fields are never visible outside their "
-                    "struct. Add an accessor below it: `T %.*s(self: %.*s): self.%.*s`",
-                    name->len, TSTART(name), tlen, type, name->len, TSTART(name), tlen, type,
-                    name->len, TSTART(name));
-            return 0;
-        }
-        if (!(s->flags & SYM_F_EXPOSED))
-        {
-            diag_at(u, tok, "error",
-                    "'%.*s' is inside '%.*s'. To use it here, move it below the closing brace "
-                    "of the struct",
-                    name->len, TSTART(name), tlen, type);
-            return 0;
-        }
-        return 1;
-    }
-
-    if (sees_inside(u, owner) || owner->provided)
-    {
-        return 1; // files of one domain share everything at module level; target is everyone's
-    }
-    if (owner->is_manifest)
+    if (owner->is_manifest && !sees_inside(u, owner))
     {
         if (s->kind == SYM_CONST)
         {
@@ -572,16 +537,12 @@ static int may_see(Unit *u, uint32_t tok, SymId id)
                     name->len, TSTART(name), domain_name(owner->domain), domain_name(owner->domain));
             return 0;
         }
-        return 1; // the modules mod.modal binds are the domain's face
+        return 1; // a module mod.modal binds: a name for it
     }
-    if (s->kind != SYM_STRUCT) // a type travels as an opaque type; nothing else leaves the file
+    if (owner->domain != u->domain && !owner->provided && !owner->is_manifest)
     {
-        diag_at(u, tok, "error",
-                "'%.*s' is inside module '%.*s', private to domain '%s'. To share it, define "
-                "it in %s/mod.modal",
-                name->len, TSTART(name), owner->name_len, owner->name, domain_name(owner->domain),
-                domain_name(owner->domain));
-        return 0;
+        s->flags |= SYM_F_PUBLIC;
+        audit_use(id, u->domain);
     }
     return 1;
 }
@@ -1049,28 +1010,41 @@ void contract_print(void)
         for (uint16_t j = 0; j < cx.nunits; j++)
         {
             Unit *u = &cx.units[j];
-            if (u->domain != m->domain || !u->bound)
+            if (u->domain != m->domain || u->is_manifest)
             {
                 continue;
             }
-            printf("module %.*s\n", u->name_len, u->name);
+            // What other domains use of this module (public by use, std.md §10).
+            int header = 0;
             for (SymId id = 1; id < cx.syms.size; id++)
             {
                 const Symbol *s = SYM(id);
                 int len;
                 const char *name = symbol_name(id, &len);
-                if (s->unit != u->id || (s->flags & SYM_F_LITERAL))
+                if (s->unit != u->id || (s->flags & SYM_F_LITERAL) || !(s->flags & SYM_F_PUBLIC))
                 {
                     continue;
                 }
-                if (s->kind == SYM_STRUCT && !s->owner)
+                if (!header)
                 {
-                    printf("  type %.*s\n", len, name); // opaque: no fields in the contract
+                    printf("module %.*s\n", u->name_len, u->name);
+                    header = 1;
                 }
-                else if (s->owner && (s->flags & SYM_F_EXPOSED))
+                if (s->kind == SYM_STRUCT)
+                {
+                    printf("  type %.*s\n", len, name);
+                }
+                else if (s->kind == SYM_FIELD)
+                {
+                    char t[64];
+                    printf("    %.*s: %s%s\n", len, name, type_str(sema_value_type(u, id), t, sizeof(t)),
+                           (s->flags & SYM_F_MUT) ? "  (writable)" : "");
+                }
+                else
                 {
                     char why[160];
-                    sig_line("  ", ast.sig_str(u, s->decl, sig, sizeof(sig)), sema_fn_kind(id, why, sizeof(why)));
+                    sig_line(s->owner ? "    " : "  ", ast.sig_str(u, s->decl, sig, sizeof(sig)),
+                             s->kind == SYM_METHOD ? sema_fn_kind(id, why, sizeof(why)) : "");
                 }
             }
         }
@@ -1150,9 +1124,9 @@ static void link_new_units(void)
     }
 }
 
-// The function a binding names (`assert := import("std").assert`), through re-exports; 0 if it
-// names no function.
-SymId module_binding_function(SymId binding)
+// What a binding names (`point := import("./geo").point`), through re-exports; 0 if it names
+// no declaration.
+SymId module_binding_target(SymId binding)
 {
     for (int depth = 0; binding && SYM(binding)->kind == SYM_IMPORT && depth < FOLLOW_MAX; depth++)
     {
@@ -1165,7 +1139,15 @@ SymId module_binding_function(SymId binding)
         const AstNode *sel = NODE(owner, decl->a);
         binding = module_member(owner, sel->a, sel->tok);
     }
-    return binding && SYM(binding)->kind == SYM_METHOD ? binding : 0;
+    return binding && SYM(binding)->kind != SYM_IMPORT ? binding : 0;
+}
+
+// The function a binding names (`assert := import("std").assert`), through re-exports; 0 if it
+// names no function.
+SymId module_binding_function(SymId binding)
+{
+    SymId t = module_binding_target(binding);
+    return t && SYM(t)->kind == SYM_METHOD ? t : 0;
 }
 
 // What `base.name` names when `base` leads to a module (an import binding, or a path through

@@ -6,8 +6,7 @@
 //   - `f(args)` must name a function; the number of arguments selects the definition (any of
 //     them, for an overload set) and each argument must fit its parameter
 //   - `value.name` and `value.name(args)` are resolved through the type of `value`, which is
-//     also where the inside / outside rule is enforced: fields and helpers written inside a
-//     struct's braces are only reachable from that struct's own methods
+//     also where use across domains is recorded: a member another domain uses is public
 //   - `T.name(args)` on a struct type calls the method on a fresh zero value (a constructor)
 //   - a local takes the type of its initializer; a return must fit the declared type
 //
@@ -31,8 +30,8 @@ typedef struct
     uint8_t context; // a context parameter (`arena: arena`)
     uint8_t param;   // a parameter, not a local declared in the body
     uint8_t bound;   // bound with `name := value`: immutable, like everywhere else
-    uint8_t nonzero; // an arm's binding whose values exclude 0 (`d 1..9`): a divisor needs no guard
-    uint8_t arm;     // bound by an arm's pattern
+    uint8_t nonzero; // inside an arm whose values exclude 0: as a divisor it needs no guard
+    uint64_t below;  // inside an arm whose values are 0 .. below - 1 (0: not known): an index in range
 } Local;
 
 typedef struct
@@ -51,6 +50,7 @@ typedef struct
     int fn_base;    // its first local: a local below it belongs to the function around it
     uint32_t literal_name; // `name := (...) {...}`: the name the next literal is bound to
     SymId fn;              // the function whose body is being checked (its kind's facts)
+    int returning_ref;     // checking `return &point{ ... }`: built in self's storage
     Local locals[MAX_LOCALS];
 } Check;
 
@@ -198,6 +198,8 @@ typedef enum
 } NameKind;
 
 static TypeId check_expr(Check *c, NodeId id);
+static SymId struct_of(TypeId t);
+static SymId field_named(SymId s, const Token *name);
 
 // ---- small helpers ---------------------------------------------------------------------------
 
@@ -512,7 +514,21 @@ static TypeId resolve_type(Unit *u, NodeId tn, SymId owner, int loud)
         {
             return T_NONE;
         }
-        if (!exact_value(u, n->b, &len) || len < 1 || len > (1 << 24))
+        int known = exact_value(u, n->b, &len);
+        if (!known && NODE(u, n->b)->kind == AST_IDENT && u->scope)
+        {
+            // `[N]u8`: a type is resolved before any body is checked, so the name is looked up
+            // here, among the module's immutable constants.
+            SymId s = scope_find_token(u->scope, TOK(u, NODE(u, n->b)->tok));
+            if (s && SYM(s)->kind == SYM_CONST && !SYM(s)->owner)
+            {
+                const Unit *h = &cx.units[SYM(s)->unit];
+                const AstNode *d = NODE(h, SYM(s)->decl);
+                NodeId init = d->kind == AST_DEFINE ? d->a : d->kind == AST_FIELD_DECL && !(d->flags & AST_F_MUT) ? d->b : 0;
+                known = init && exact_value(h, init, &len);
+            }
+        }
+        if (!known || len < 1 || len > (1 << 24))
         {
             if (loud)
             {
@@ -555,9 +571,10 @@ static TypeId resolve_type(Unit *u, NodeId tn, SymId owner, int loud)
         {
             return type_make(T_STRUCT, s);
         }
-        if (s && SYM(s)->kind == SYM_IMPORT)
+        if (s && SYM(s)->kind == SYM_IMPORT) // `gpoint := import("./geo").shapes.point`: a struct
         {
-            return T_EXTERN;
+            SymId target = module_binding_target(s);
+            return target && SYM(target)->kind == SYM_STRUCT ? type_make(T_STRUCT, target) : T_EXTERN;
         }
         if (text_is(t, "site"))
         {
@@ -781,7 +798,8 @@ static NameKind find_name(Check *c, const Token *t, SymId *sym, TypeId *type)
         return NAME_SYMBOL; // a function of the domain's mod.modal
     }
     // the language's primitives (docs/std.md §2), after every declaration: a program's own wins
-    if (text_is(t, "sizeof") || text_is(t, "trap") || type_is_int(prim_type(t)))
+    if (text_is(t, "sizeof") || text_is(t, "alignof") || text_is(t, "offsetof") || text_is(t, "fieldsof") ||
+        text_is(t, "typeid") || text_is(t, "trap") || type_is_int(prim_type(t)))
     {
         return NAME_BUILTIN;
     }
@@ -800,6 +818,11 @@ static TypeId symbol_type(Check *c, SymId s)
     case SYM_FIELD:
     case SYM_CONST:
         return value_type(c->u, s);
+    case SYM_IMPORT: // `point := import("./geo").shapes.point`: what it names, when that is known
+    {
+        SymId target = module_binding_target(s);
+        return target && SYM(target)->kind != SYM_IMPORT ? symbol_type(c, target) : T_EXTERN;
+    }
     default:
         return T_EXTERN;
     }
@@ -914,35 +937,84 @@ int sema_primitive(const Unit *u, NodeId call)
     return NODE(u, call)->kind == AST_CALL ? NODE(u, call)->aux : PRIM_NONE;
 }
 
+static int is_type_query(int prim)
+{
+    return prim == PRIM_SIZEOF || prim == PRIM_ALIGNOF || prim == PRIM_OFFSETOF || prim == PRIM_FIELDSOF ||
+           prim == PRIM_TYPEID;
+}
+
 int sema_sizeof(const Unit *u, NodeId call, uint64_t *out)
 {
-    if (sema_primitive(u, call) != PRIM_SIZEOF || !NODE(u, call)->b)
+    int prim = sema_primitive(u, call);
+    NodeId arg = NODE(u, call)->kind == AST_CALL ? NODE(u, call)->b : 0;
+    if (!is_type_query(prim) || !arg || !u->types)
     {
         return 0;
     }
-    TypeId t = u->types[NODE(u, call)->b]; // what it measures (check_sizeof put it there)
+    if (prim == PRIM_OFFSETOF)
+    {
+        SymId field = u->refs ? u->refs[arg] : 0; // check_type_query put the field there
+        if (!field || SYM(field)->kind != SYM_FIELD)
+        {
+            return 0;
+        }
+        *out = field_offset_of(field);
+        return 1;
+    }
+    TypeId t = u->types[arg]; // what it asks about (check_type_query put it there)
     if (type_kind(t) == T_TYPE)
     {
         t = type_make(T_STRUCT, type_ref(t));
+    }
+    if (t == T_NONE || t == T_EXTERN || t == T_INT_LIT)
+    {
+        return 0;
+    }
+    if (prim == PRIM_TYPEID) // the interned type: one number per type, the same in every backend
+    {
+        *out = t;
+        return 1;
+    }
+    if (prim == PRIM_FIELDSOF)
+    {
+        uint64_t n = 0;
+        if (type_kind(t) == T_STRUCT)
+        {
+            SymId s = type_ref(t);
+            const Unit *home = &cx.units[SYM(s)->unit];
+            for (NodeId m = NODE(home, SYM(s)->decl)->a; m; m = NEXT(home, m))
+            {
+                n += NODE(home, m)->kind == AST_FIELD_DECL;
+            }
+        }
+        *out = n;
+        return 1;
     }
     Layout l = type_layout(t);
     if (!l.size)
     {
         return 0;
     }
-    *out = l.size;
+    *out = prim == PRIM_ALIGNOF ? l.align : l.size;
     return 1;
 }
 
-// `sizeof(u32)`, `sizeof(header)`, `sizeof(value)`: the argument is a type or a value; its type
-// is what is measured, in the target's layout. The result is an unsized constant.
-static TypeId check_sizeof(Check *c, NodeId id, uint32_t at)
+// `sizeof(u32)`, `alignof(header)`, `fieldsof(p)`, `typeid(point)`, `offsetof(point.y)`: what is
+// asked about is a type or a value (its type), or for offsetof a field named through its
+// struct. The result is an unsized constant: nothing is left for run time, and no name is.
+static TypeId check_type_query(Check *c, NodeId id, uint32_t at, int prim)
 {
+    static const char *const names[] = {[PRIM_SIZEOF] = "sizeof", [PRIM_ALIGNOF] = "alignof",
+                                        [PRIM_OFFSETOF] = "offsetof", [PRIM_FIELDSOF] = "fieldsof",
+                                        [PRIM_TYPEID] = "typeid"};
     Unit *u = c->u;
     NodeId arg = NODE(u, id)->b;
+    const char *what = names[prim];
     if (!arg || NEXT(u, arg))
     {
-        diag_at(u, at, "error", "sizeof takes one type or value: `sizeof(T)`");
+        diag_at(u, at, "error", prim == PRIM_OFFSETOF ? "offsetof takes one field: `offsetof(T.field)`"
+                                                      : "%s takes one type or value: `%s(T)`",
+                what, what);
         for (NodeId a = arg; a; a = NEXT(u, a))
         {
             check_expr(c, a);
@@ -950,21 +1022,37 @@ static TypeId check_sizeof(Check *c, NodeId id, uint32_t at)
         return T_NONE;
     }
     const AstNode *a = NODE(u, arg);
+    if (prim == PRIM_OFFSETOF)
+    {
+        SymId s = a->kind == AST_SELECTOR ? struct_of(check_expr(c, a->a)) : 0;
+        SymId field = s ? field_named(s, TOK(u, a->tok)) : 0;
+        if (!field)
+        {
+            diag_at(u, a->tok, "error", "offsetof takes a field of a struct: `offsetof(T.field)`");
+            return T_NONE;
+        }
+        u->refs[arg] = field;
+        set_type(c, arg, value_type(u, field));
+        return T_INT_LIT;
+    }
     TypeId t = a->kind == AST_IDENT ? prim_type(TOK(u, a->tok)) : T_NONE;
     if (t == T_NONE)
     {
         t = check_expr(c, arg);
     }
     set_type(c, arg, t);
-    uint64_t size;
+    uint64_t v;
     if (t == T_NONE)
     {
         return T_NONE;
     }
-    if (!sema_sizeof(u, id, &size))
+    if (!sema_sizeof(u, id, &v))
     {
         char name[64];
-        diag_at(u, a->tok, "error", "sizeof: %s has no size in memory", type_str(t, name, sizeof(name)));
+        diag_at(u, a->tok, "error",
+                t == T_INT_LIT ? "%s: an unsized constant has no type yet: give it one (`u8 x = 3`)"
+                               : "%s: %s has no layout in memory",
+                what, type_str(t, name, sizeof(name)));
         return T_NONE;
     }
     return T_INT_LIT;
@@ -1447,15 +1535,29 @@ static TypeId call_function(Check *c, NodeId id, uint32_t at, SymId first)
     check_args(c, args, fn);
     c->u->refs[id] = fn;
     note_call(c, fn);
+    if (fn && c->fn && cx.sym_names[fn] == cx.sym_names[c->fn] && SYM(fn)->owner == SYM(c->fn)->owner)
+    {
+        SYM(c->fn)->flags |= SYM_F_LOOPS; // the lowering inlines larger bodies into it
+    }
     return fn ? fn_ret_type(c->u, fn) : T_NONE;
 }
 
-// Finds `name` among the members of struct `s`, applying the inside / outside rule: from
-// outside the struct's own methods only its face (methods written below its braces) exists.
+// Finds `name` among the members of struct `s`. Every member is reachable; a use from another
+// domain makes the member public (note_use).
 //
 // A field and its accessor may share a name (`u8 n1` and `u8 n1(self: T): self.n1`). Which
-// one is meant follows from the use: `x.n1(...)` is the method, `x.n1` is the field when the
-// field can be seen from here, and the accessor otherwise.
+// one is meant follows from the use: `x.n1(...)` is the method, `x.n1` is the field.
+// A member used from another domain is public: visibility follows use (std.md §10). The
+// record is what --sig prints and what the layout may rely on.
+static void note_use(const Check *c, SymId member)
+{
+    if (cx.units[SYM(member)->unit].domain != c->u->domain)
+    {
+        SYM(member)->flags |= SYM_F_PUBLIC;
+        audit_use(member, c->u->domain);
+    }
+}
+
 static SymId find_member(Check *c, SymId s, uint32_t name_tok, int is_call)
 {
     const Token *name = TOK(c->u, name_tok);
@@ -1463,7 +1565,7 @@ static SymId find_member(Check *c, SymId s, uint32_t name_tok, int is_call)
     const char *type = symbol_name(s, &tlen);
     SymId member = scope_find_token(struct_scope(s), name);
 
-    if (member && !is_call && SYM(member)->kind == SYM_METHOD && c->owner == s)
+    if (member && !is_call && SYM(member)->kind == SYM_METHOD) // `x.n1`: the field, not its accessor
     {
         for (SymId other = SYM(member)->next; other; other = SYM(other)->next)
         {
@@ -1477,34 +1579,13 @@ static SymId find_member(Check *c, SymId s, uint32_t name_tok, int is_call)
             }
         }
     }
-
     if (!member)
     {
         diag_at(c->u, name_tok, "error", "'%.*s' has no member '%.*s'", tlen, type, name->len,
                 TSTART(name));
         return 0;
     }
-    if (c->owner == s)
-    {
-        return member; // a struct's own methods see all of it
-    }
-    if (SYM(member)->kind == SYM_FIELD)
-    {
-        diag_at(c->u, name_tok, "error",
-                "'%.*s' is a field of '%.*s', and fields are never visible outside their "
-                "struct. Add an accessor below it: `T %.*s(self: %.*s): self.%.*s`",
-                name->len, TSTART(name), tlen, type, name->len, TSTART(name), tlen, type, name->len,
-                TSTART(name));
-        return 0;
-    }
-    if (!(SYM(member)->flags & SYM_F_EXPOSED))
-    {
-        diag_at(c->u, name_tok, "error",
-                "'%.*s' is inside '%.*s'. To use it here, move it below the closing brace of "
-                "the struct",
-                name->len, TSTART(name), tlen, type);
-        return 0;
-    }
+    note_use(c, member);
     return member;
 }
 
@@ -1589,10 +1670,16 @@ static TypeId check_call(Check *c, NodeId id)
         NODE(u, id)->aux = PRIM_NONE;
         if (kind == NAME_BUILTIN && t->kind != TOK_WRITE)
         {
-            if (text_is(t, "sizeof"))
+            int query = text_is(t, "sizeof")     ? PRIM_SIZEOF
+                        : text_is(t, "alignof")  ? PRIM_ALIGNOF
+                        : text_is(t, "offsetof") ? PRIM_OFFSETOF
+                        : text_is(t, "fieldsof") ? PRIM_FIELDSOF
+                        : text_is(t, "typeid")   ? PRIM_TYPEID
+                                                 : PRIM_NONE;
+            if (query != PRIM_NONE)
             {
-                NODE(u, id)->aux = PRIM_SIZEOF;
-                return check_sizeof(c, id, cn->tok);
+                NODE(u, id)->aux = (uint8_t)query;
+                return check_type_query(c, id, cn->tok, query);
             }
             if (text_is(t, "trap"))
             {
@@ -1777,6 +1864,13 @@ static TypeId check_selector(Check *c, NodeId id)
             return T_NONE;
         }
         u->refs[id] = member;
+        if (SYM(member)->kind == SYM_METHOD)
+        {
+            diag_at(u, n->tok, "error", "'%.*s' is a method of '%.*s': call it, `x.%.*s(...)`", name->len,
+                    TSTART(name), (int)TOK(&cx.units[SYM(s)->unit], SYM(s)->tok)->len,
+                    TSTART(TOK(&cx.units[SYM(s)->unit], SYM(s)->tok)), name->len, TSTART(name));
+            return T_NONE;
+        }
         note_field(c, member, n->tok);
         return symbol_type(c, member);
     }
@@ -1816,7 +1910,11 @@ static TypeId check_selector(Check *c, NodeId id)
 
 static void check_return(Check *c, NodeId id, NodeId value)
 {
+    const AstNode *v = value ? NODE(c->u, value) : NULL;
+    c->returning_ref = v && v->kind == AST_UNARY_OP && TOK(c->u, v->tok)->kind == TOK_AMP &&
+                       NODE(c->u, v->a)->kind == AST_STRUCT_LIT;
     TypeId got = value ? check_expr(c, value) : T_VOID;
+    c->returning_ref = 0;
     char a[64], b[64];
 
     if (!c->in_callable || c->ret == T_NONE)
@@ -1960,11 +2058,7 @@ static int cover_take(Unit *u, Cover *cv, NodeId pat, char *overlap, size_t cap)
     {
         return 0;
     }
-    if (NODE(u, pat)->kind == AST_IDENT && NODE(u, pat)->a) // a name with a test: the test's values
-    {
-        pat = NODE(u, pat)->a;
-    }
-    if (NODE(u, pat)->kind == AST_IDENT)
+    if (NODE(u, pat)->aux & PAT_ANY)
     {
         int full = cv->type != T_STR && cover_has(cv, cover_min(cv->type), cover_max(cv->type));
         cv->all = 1;
@@ -2071,11 +2165,16 @@ static int match_subjects(Check *c, NodeId id, TypeId *types, NodeId *params, in
 {
     Unit *u = c->u;
     const AstNode *n = NODE(u, id);
-    if (n->a)
+    if (n->a) // the values written after `if`, one column each
     {
-        types[0] = check_expr(c, n->a);
-        params[0] = 0;
-        return 1;
+        int k = 0;
+        for (NodeId v = n->a; v && k < cap; v = NEXT(u, v), k++)
+        {
+            types[k] = check_expr(c, v);
+            types[k] = types[k] == T_INT_LIT ? T_I64 : types[k]; // an unsized value: matched as an i64
+            params[k] = 0;
+        }
+        return k;
     }
     if (!c->fn || !c->in_callable)
     {
@@ -2102,7 +2201,130 @@ static int match_subjects(Check *c, NodeId id, TypeId *types, NodeId *params, in
 static int is_statement(const Unit *u, NodeId result)
 {
     int k = NODE(u, result)->kind;
-    return k == AST_BLOCK || k == AST_RETURN || k == AST_ASSIGN || k == AST_FIELD_DECL;
+    return k == AST_BLOCK || k == AST_RETURN || k == AST_ASSIGN || k == AST_FIELD_DECL || k == AST_IF;
+}
+
+// Does code `id` assign to the local `name` (`name = ...` anywhere in it)? Then an arm's range
+// fact about it does not hold for the whole arm.
+static int assigns_to(const Unit *u, NodeId id, NameId name)
+{
+    if (!id)
+    {
+        return 0;
+    }
+    const AstNode *n = NODE(u, id);
+    switch (n->kind)
+    {
+    case AST_ASSIGN:
+        if (NODE(u, n->a)->kind == AST_IDENT && token_name(TOK(u, NODE(u, n->a)->tok)) == name)
+        {
+            return 1;
+        }
+        return assigns_to(u, n->a, name) || assigns_to(u, n->b, name);
+    case AST_BLOCK:
+        for (NodeId s = n->a; s; s = NEXT(u, s))
+        {
+            if (assigns_to(u, s, name))
+            {
+                return 1;
+            }
+        }
+        return 0;
+    case AST_CALL:
+        for (NodeId s = n->b; s; s = NEXT(u, s))
+        {
+            if (assigns_to(u, s, name))
+            {
+                return 1;
+            }
+        }
+        return 0;
+    case AST_MATCH:
+        for (NodeId v = n->a; v; v = NEXT(u, v))
+        {
+            if (assigns_to(u, v, name))
+            {
+                return 1;
+            }
+        }
+        for (NodeId s = n->b; s; s = NEXT(u, s))
+        {
+            if (assigns_to(u, NODE(u, s)->b, name))
+            {
+                return 1;
+            }
+        }
+        return 0;
+    case AST_IF:
+        return assigns_to(u, n->a, name) || assigns_to(u, NODE(u, n->b)->a, name) ||
+               assigns_to(u, NODE(u, n->b)->b, name);
+    case AST_BIN_OP:
+    case AST_INDEX:
+        return assigns_to(u, n->a, name) || assigns_to(u, n->b, name);
+    case AST_UNARY_OP:
+    case AST_RETURN:
+    case AST_DEFINE:
+    case AST_SELECTOR:
+    case AST_PAREN_GROUP:
+        return assigns_to(u, n->a, name);
+    case AST_FIELD_DECL:
+        return assigns_to(u, n->b, name);
+    default:
+        return 0;
+    }
+}
+
+static int name_pattern_value(const Unit *u, const AstNode *pn, TypeId type, uint64_t *v);
+static int ends_pattern(Unit *u, const AstNode *pn, TypeId type, Pattern *out, int loud);
+
+// A name used as a pattern: it must exist, fit the value matched, and not be that value. 1 when
+// the compiler knows its value (a constant: it counts like a literal), 0 when the program does.
+static int name_pattern(Check *c, const AstNode *pn, TypeId type, NameId subject)
+{
+    Unit *u = c->u;
+    const Token *t = TOK(u, pn->tok);
+    TypeId nt = check_expr(c, pn->a);
+    char x[64], y[64];
+    if (subject && token_name(t) == subject)
+    {
+        diag_at(u, pn->tok, "error", "'%.*s' is the value being matched, so this pattern takes every value: "
+                                     "write `_`", t->len, TSTART(t));
+        return 0;
+    }
+    if (nt == T_NONE || nt == T_EXTERN)
+    {
+        return 0;
+    }
+    if (type == T_STR)
+    {
+        diag_at(u, pn->tok, "error", "a name as a pattern on a []u8 is not supported yet: write the string");
+        return 0;
+    }
+    if (!fits(nt, type))
+    {
+        diag_at(u, pn->tok, "error", "the pattern '%.*s' is %s, but the value matched is %s", t->len, TSTART(t),
+                type_str(nt, x, sizeof(x)), type_str(type, y, sizeof(y)));
+        return 0;
+    }
+    uint64_t v;
+    if (!name_pattern_value(u, pn, type, &v))
+    {
+        return 0;
+    }
+    if (nt == T_INT_LIT && type_is_int(type)) // an unsized constant: its value must fit
+    {
+        int negative;
+        sema_unsized_value(u, pn->a, &v, &negative);
+        Exact val = negative ? (Exact)(int64_t)v : (Exact)v;
+        int ok = val >= cover_min(type) && val <= cover_max(type);
+        if (!ok)
+        {
+            diag_at(u, pn->tok, "error", "the pattern '%.*s' does not fit %s", t->len, TSTART(t),
+                    type_str(type, y, sizeof(y)));
+            return 0;
+        }
+    }
+    return 1;
 }
 
 static TypeId check_match(Check *c, NodeId id)
@@ -2128,6 +2350,31 @@ static TypeId check_match(Check *c, NodeId id)
     {
         covers[s] = (Cover){.type = types[s]};
     }
+    // The local each subject is (a name matched, or a parameter): its range fact in an arm.
+    int subj_local[16];
+    NameId subj_name[16];
+    for (int k = 0; k < ns; k++)
+    {
+        subj_local[k] = -1;
+        subj_name[k] = 0;
+        NodeId value = m->a;
+        for (int j = 0; value && j < k; j++)
+        {
+            value = NEXT(u, value);
+        }
+        uint32_t name_tok = on_params ? (params[k] && SYM(c->fn)->unit == u->id ? NODE(u, params[k])->tok : 0)
+                          : value && NODE(u, value)->kind == AST_IDENT ? NODE(u, value)->tok : 0;
+        if (!name_tok)
+        {
+            continue;
+        }
+        NameId want = token_name(TOK(u, name_tok));
+        subj_name[k] = want;
+        for (int i = c->nlocals - 1; i >= 0 && subj_local[k] < 0; i--)
+        {
+            subj_local[k] = c->locals[i].name == want ? i : -1;
+        }
+    }
     TypeId result = T_NONE;
     int value_arms = 1, index = 0, all_names_last = 0;
     NodeId last_arm = 0;
@@ -2137,70 +2384,71 @@ static TypeId check_match(Check *c, NodeId id)
         const AstNode *a = NODE(u, arm);
         int saved = c->nlocals, saved_base = c->block_base;
         c->block_base = c->nlocals;
-        int np = 0, literal_col = -1, literals = 0;
+        int np = 0, literal_col = -1, literals = 0, runtime = 0;
+        int lone_any = !a->aux && NODE(u, a->a)->kind == AST_PATTERN && (NODE(u, a->a)->aux & PAT_ANY) &&
+                       !NEXT(u, a->a);
         for (NodeId pat = a->a; pat; pat = NEXT(u, pat), np++)
         {
-            if (np >= ns)
-            {
-                continue;
-            }
             const AstNode *pn = NODE(u, pat);
-            if (pn->kind == AST_IDENT)
+            if (np >= ns || (pn->aux & PAT_ANY))
             {
-                // a name: binds the value (immutable), or a mutable copy (`u64 n`: type first,
-                // the value's own type); with a test (`d 1..9`) it takes only the test's values,
-                // and inside the arm d is known to be one of them.
-                if (pn->b)
-                {
-                    TypeId want = resolve_type(u, pn->b, c->owner, 1);
-                    if (want != T_NONE && want != types[np])
-                    {
-                        char x[64], y[64];
-                        diag_at(u, pn->tok, "error", "this binding is %s, but the value is %s: a binding takes "
-                                                     "the value's own type (no conversion)",
-                                type_str(want, x, sizeof(x)), type_str(types[np], y, sizeof(y)));
-                    }
-                }
-                int nonzero = 0;
-                if (pn->a)
-                {
-                    Pattern pt;
-                    if (pattern_from(u, NODE(u, pn->a), types[np], &pt, 1) && pt.kind != PATTERN_TEXT &&
-                        types[np] != T_BOOL)
-                    {
-                        Exact lo = cover_value(types[np], pt.lo);
-                        Exact hi = pt.kind == PATTERN_RANGE ? cover_value(types[np], pt.hi) : lo;
-                        nonzero = (lo > 0 || hi < 0) && !pn->b; // a mutable copy may become 0
-                    }
-                    literals++;
-                    literal_col = np;
-                }
-                int same = !pn->a && !pn->b && params[np] && SYM(c->fn)->unit == u->id &&
-                           same_text(u, pn->tok, NODE(u, params[np])->tok);
-                if (!same)
-                {
-                    push_local(c, pn->tok, types[np], pn->b != 0);
-                    c->locals[c->nlocals - 1].bound = pn->b == 0;
-                    c->locals[c->nlocals - 1].nonzero = (uint8_t)nonzero;
-                    c->locals[c->nlocals - 1].arm = 1;
-                }
                 continue;
             }
-            Pattern pt;
-            pattern_from(u, pn, types[np], &pt, 1);
+            if (pn->aux & PAT_NAME)
+            {
+                if (!name_pattern(c, pn, types[np], subj_name[np]))
+                {
+                    runtime++; // compared when the program runs: it adds nothing the compiler can count
+                    continue;
+                }
+            }
+            else if (pn->aux & PAT_ENDS)
+            {
+                for (NodeId e = pn->a; e; e = e == pn->a ? pn->b : 0)
+                {
+                    check_expr(c, e);
+                }
+                Pattern pt;
+                if (!ends_pattern(u, pn, types[np], &pt, 1))
+                {
+                    literals = 2; // reported: no cover from this arm
+                }
+            }
+            else
+            {
+                Pattern pt;
+                pattern_from(u, pn, types[np], &pt, 1);
+            }
             literals++;
             literal_col = np;
+        }
+        if (lone_any)
+        {
+            np = ns; // `_` alone: every value of every parameter
+        }
+        else if (ns > 1 && !a->aux)
+        {
+            diag_at(u, a->tok, "error", "this match has %d values: write one pattern for each, in parentheses "
+                                        "(`(0, _): ...`), or `_` alone for all of them",
+                    ns);
+            np = ns;
+            literals = 2; // reported: no cover
         }
         if (np != ns)
         {
             diag_at(u, a->tok, "error", "this arm has %d pattern%s, but the match has %d value%s (%s)", np,
                     np == 1 ? "" : "s", ns, ns == 1 ? "" : "s",
-                    on_params ? "one per parameter" : "write them as `value { ... }`");
+                    on_params ? "one per parameter" : "one per value after `if`");
         }
         else if (all_names_last)
         {
-            diag_at(u, a->tok, "error", "this arm never runs: an arm above takes every value (a name "
-                                        "in each place). Move it above that arm, or remove it");
+            diag_at(u, a->tok, "error", "this arm never runs: an arm above takes every value (`_` in each "
+                                        "place). Move it above that arm, or remove it");
+        }
+        else if (runtime)
+        {
+            // A value known only at run time: the arm is tested in its place, first wins, and the
+            // compiler counts nothing from it (neither coverage nor overlap).
         }
         else if (literals <= 1)
         {
@@ -2237,8 +2485,37 @@ static TypeId check_match(Check *c, NodeId id)
                 }
             }
         }
-        // the result: a value, or (a block, `return`, an assignment) a statement
+        // Inside the arm, the value keeps its name and is known to be in the arm's values: when
+        // those exclude 0 and the arm does not assign to it, a division by it needs no guard.
         NodeId r = a->b;
+        int fact = -1, fact_below = -1;
+        if (literals == 1 && literal_col >= 0 && subj_local[literal_col] >= 0)
+        {
+            NodeId pat = a->a;
+            for (int k = 0; k < literal_col; k++)
+            {
+                pat = NEXT(u, pat);
+            }
+            Pattern pt;
+            if (sema_arm_pattern(u, pat, types[literal_col], &pt) && pt.kind != PATTERN_TEXT &&
+                types[literal_col] != T_BOOL)
+            {
+                Exact lo = cover_value(types[literal_col], pt.lo);
+                Exact hi = pt.kind == PATTERN_RANGE ? cover_value(types[literal_col], pt.hi) : lo;
+                const Local *lc = &c->locals[subj_local[literal_col]];
+                int unchanged = !assigns_to(u, r, lc->name);
+                if ((lo > 0 || hi < 0) && !lc->nonzero && unchanged)
+                {
+                    fact = subj_local[literal_col];
+                    c->locals[fact].nonzero = 1;
+                }
+                if (lo >= 0 && !lc->below && unchanged) // an index below hi + 1 needs no bounds check
+                {
+                    fact_below = subj_local[literal_col];
+                    c->locals[fact_below].below = (uint64_t)hi + 1;
+                }
+            }
+        }
         TypeId t;
         if (on_params && !is_statement(u, r) && c->ret != T_VOID)
         {
@@ -2272,15 +2549,26 @@ static TypeId check_match(Check *c, NodeId id)
                         type_str(t, x, sizeof(x)), type_str(result, y, sizeof(y)));
             }
         }
+        if (fact >= 0)
+        {
+            c->locals[fact].nonzero = 0;
+        }
+        if (fact_below >= 0)
+        {
+            c->locals[fact_below].below = 0;
+        }
         c->nlocals = saved;
         c->block_base = saved_base;
     }
-    // Every value must be taken: a name last, or literals that cover the whole type.
+    // Every value must be taken: `_` last, or literals that cover the whole type.
     int full = all_names_last;
     for (int s = 0; s < ns && !full; s++)
     {
         full = ns == 1 && cover_full(&covers[s]);
     }
+    // A statement may leave values untaken (it does nothing for them): a warning. A value, or a
+    // body that returns one, takes them all.
+    const char *level = (m->aux & MATCH_STATEMENT) || (on_params && c->ret == T_VOID) ? "warning" : "error";
     if (!full)
     {
         char gaps[160] = "";
@@ -2290,14 +2578,12 @@ static TypeId check_match(Check *c, NodeId id)
         }
         if (gaps[0])
         {
-            diag_at(u, m->tok, "error", "not every value is taken: no arm takes %s. Add arms for them, or end "
-                                        "with a name that takes the rest (`n: ...`)", gaps);
+            diag_at(u, m->tok, level, "not every value is taken: no arm takes %s. Add arms for them, or end "
+                                      "with `_: ...`, which takes the rest", gaps);
         }
         else
         {
-            diag_at(u, m->tok, "error", "not every value is taken: end with an arm that names the value, "
-                                        "which takes the rest (`%s: ...`)",
-                    types[0] == T_STR ? "s" : "n");
+            diag_at(u, m->tok, level, "not every value is taken: end with `_: ...`, which takes the rest");
         }
     }
     else if (!all_names_last && last_arm)
@@ -2349,6 +2635,11 @@ static int always_returns(const Unit *u, NodeId block)
     if (n->kind == AST_RETURN)
     {
         return 1;
+    }
+    if (n->kind == AST_IF) // both branches return
+    {
+        const AstNode *br = NODE(u, n->b);
+        return br->b && always_returns(u, br->a) && always_returns(u, br->b);
     }
     if (n->kind == AST_MATCH) // every arm returns: on parameters, a value is the return
     {
@@ -2513,6 +2804,104 @@ static void check_callable(Check *c, NodeId fn, SymId owner, SymId sym)
 }
 
 // Depth is bounded by the parser's nesting limit, so this recursion is too.
+// The field `name` of struct s (a field and its accessor may share a name), or 0.
+static SymId field_named(SymId s, const Token *name)
+{
+    for (SymId m = scope_find_token(struct_scope(s), name); m; m = SYM(m)->next)
+    {
+        int len;
+        const char *text = symbol_name(m, &len);
+        if (SYM(m)->kind == SYM_FIELD && SYM(m)->owner == s && (uint32_t)len == name->len &&
+            memcmp(text, TSTART(name), name->len) == 0)
+        {
+            return m;
+        }
+    }
+    return 0;
+}
+
+// `point{ x, y: e }`. Every field is given (no field starts at a value nobody wrote), each once.
+// It is built where point's fields are seen: in its methods, or anywhere when its face shows
+// every field.
+static TypeId check_struct_lit(Check *c, NodeId id)
+{
+    Unit *u = c->u;
+    const AstNode *n = NODE(u, id);
+    const Token *tname = TOK(u, n->tok);
+    SymId s;
+    TypeId found;
+    NameKind kind = find_name(c, tname, &s, &found);
+    if (kind == NAME_MISSING)
+    {
+        report_missing(c, n->tok, 0);
+        return T_NONE;
+    }
+    if (s && SYM(s)->kind == SYM_IMPORT) // `point := import("./geo").shapes.point`
+    {
+        s = module_binding_target(s);
+    }
+    if (!s || SYM(s)->kind != SYM_STRUCT)
+    {
+        diag_at(u, n->tok, "error", "'%.*s' is not a struct: a literal `name{ ... }` builds a struct", tname->len,
+                TSTART(tname));
+        return T_NONE;
+    }
+    const Unit *home = &cx.units[SYM(s)->unit];
+    for (NodeId f = n->a; f; f = NEXT(u, f))
+    {
+        const AstNode *fn = NODE(u, f);
+        const Token *fname = TOK(u, fn->tok);
+        SymId field = field_named(s, fname);
+        TypeId vt = check_expr(c, fn->a);
+        if (!field)
+        {
+            diag_at(u, fn->tok, "error", "'%.*s' has no field '%.*s'", tname->len, TSTART(tname), fname->len,
+                    TSTART(fname));
+            continue;
+        }
+        for (NodeId g = n->a; g != f; g = NEXT(u, g))
+        {
+            if (u->refs[g] == field)
+            {
+                diag_at(u, fn->tok, "error", "'%.*s' is given twice", fname->len, TSTART(fname));
+            }
+        }
+        u->refs[f] = field;
+        note_use(c, field);
+        TypeId ft = symbol_type(c, field);
+        char a[64], b[64];
+        if (vt != T_NONE && vt != T_EXTERN && !fits(vt, ft))
+        {
+            diag_at(u, fn->tok, "error", "'%.*s' is %s, but this value is %s", fname->len, TSTART(fname),
+                    type_str(ft, a, sizeof(a)), type_str(vt, b, sizeof(b)));
+        }
+        else if (vt == T_INT_LIT)
+        {
+            check_bounds(c, fn->a, ft); // `point{ x: 300 }` with a u8 x
+        }
+    }
+    for (NodeId m = NODE(home, SYM(s)->decl)->a; m; m = NEXT(home, m))
+    {
+        if (NODE(home, m)->kind != AST_FIELD_DECL)
+        {
+            continue;
+        }
+        SymId field = field_named(s, TOK(home, NODE(home, m)->tok));
+        int given = 0;
+        for (NodeId f = n->a; f && !given; f = NEXT(u, f))
+        {
+            given = u->refs[f] == field;
+        }
+        if (!given)
+        {
+            const Token *missing = TOK(home, NODE(home, m)->tok);
+            diag_at(u, n->tok, "error", "'%.*s' is not given: a literal gives every field (`%.*s{ ..., %.*s: 0 }`)",
+                    missing->len, TSTART(missing), tname->len, TSTART(tname), missing->len, TSTART(missing));
+        }
+    }
+    return type_make(T_STRUCT, s);
+}
+
 static TypeId check_expr(Check *c, NodeId id)
 {
     if (!id)
@@ -2608,6 +2997,15 @@ static TypeId check_expr(Check *c, NodeId id)
         else if (op == TOK_AMP)
         {
             type = type_make(T_PTR, operand);
+            if (NODE(u, n->a)->kind == AST_STRUCT_LIT &&
+                !(c->returning_ref && c->has_self && operand == type_make(T_STRUCT, c->owner)))
+            {
+                diag_at(u, n->tok, "error",
+                        "a reference to a literal is a constructor's result: `return &%.*s{ ... }` in a method "
+                        "with `self: %.*s`, which builds it in self's storage",
+                        TOK(u, NODE(u, n->a)->tok)->len, TSTART(TOK(u, NODE(u, n->a)->tok)),
+                        TOK(u, NODE(u, n->a)->tok)->len, TSTART(TOK(u, NODE(u, n->a)->tok)));
+            }
         }
         else if (op == TOK_STAR)
         {
@@ -2634,9 +3032,30 @@ static TypeId check_expr(Check *c, NodeId id)
     case AST_PAREN_GROUP:
         type = check_expr(c, n->a);
         break;
+    case AST_STRUCT_LIT:
+        type = check_struct_lit(c, id);
+        break;
     case AST_MATCH:
         type = check_match(c, id);
         break;
+    case AST_IF: // if cond then [else other]: a statement
+    {
+        TypeId cond = check_expr(c, n->a);
+        if (cond != T_BOOL && cond != T_NONE && cond != T_EXTERN)
+        {
+            char got[64];
+            diag_at(u, NODE(u, n->a)->tok, "error", "an if's condition is a bool, not %s",
+                    type_str(cond, got, sizeof(got)));
+        }
+        const AstNode *br = NODE(u, n->b);
+        check_expr(c, br->a);
+        if (br->b)
+        {
+            check_expr(c, br->b);
+        }
+        type = T_VOID;
+        break;
+    }
     case AST_INDEX: // a[i]: an array's element, or a []u8's byte (read only)
     {
         TypeId base = check_expr(c, n->a);
@@ -2659,6 +3078,10 @@ static TypeId check_expr(Check *c, NodeId id)
             type = T_U8;
             break;
         }
+        if (type_kind(base) == T_PTR && type_kind(type_ref(base)) == T_ARRAY)
+        {
+            base = type_ref(base); // `p: *[24]u8`: p[i] is the array's element, in place
+        }
         if (type_kind(base) != T_ARRAY)
         {
             char got[64];
@@ -2666,6 +3089,22 @@ static TypeId check_expr(Check *c, NodeId id)
                     type_str(base, got, sizeof(got)));
             type = T_NONE;
             break;
+        }
+        const AstNode *ix = NODE(u, n->b);
+        if (ix->kind == AST_IDENT && !u->refs[n->b])
+        {
+            NameId name = token_name(TOK(u, ix->tok));
+            for (int i = c->nlocals - 1; i >= 0; i--)
+            {
+                if (c->locals[i].name == name)
+                {
+                    if (c->locals[i].below && c->locals[i].below <= type_len(base))
+                    {
+                        NODE(u, id)->aux |= INDEX_SAFE; // an arm took it in range: no bounds check
+                    }
+                    break;
+                }
+            }
         }
         Exact k;
         if (exact_value(u, n->b, &k) && (k < 0 || k >= (Exact)type_len(base)))
@@ -2696,7 +3135,20 @@ static TypeId check_expr(Check *c, NodeId id)
                 local = c->locals[i].name == name ? &c->locals[i] : NULL;
             }
         }
-        if (t->kind == AST_INDEX && (named->kind != AST_IDENT || !local ||
+        TypeId through = t->kind == AST_INDEX ? u->types[t->a] : T_NONE;
+        int by_pointer = type_kind(through) == T_PTR && type_kind(type_ref(through)) == T_ARRAY;
+        if (by_pointer)
+        {
+            // `p[i] = v` with p: *[N]T: the array p points at is written, as the caller asked by
+            // passing `&a` (the pointer itself is not changed)
+            if (!fits(value, target))
+            {
+                char a[64], b[64];
+                diag_at(u, n->tok, "error", "cannot assign %s to %s", type_str(value, a, sizeof(a)),
+                        type_str(target, b, sizeof(b)));
+            }
+        }
+        else if (t->kind == AST_INDEX && (named->kind != AST_IDENT || !local ||
                                      type_kind(u->types[t->a]) != T_ARRAY))
         {
             diag_at(u, n->tok, "error",
@@ -2749,15 +3201,6 @@ static TypeId check_expr(Check *c, NodeId id)
                     "'%.*s' is a context parameter: it cannot be reassigned. To use another one "
                     "from here on, declare `%.*s := ...` in a block, or pass it to the call",
                     name->len, TSTART(name), name->len, TSTART(name));
-        }
-        else if (local && local->arm && !local->mut)
-        {
-            const Token *name = TOK(u, t->tok);
-            char ty[64];
-            diag_at(u, n->tok, "error",
-                    "'%.*s' is bound by the arm's pattern, so it is immutable. Write its type first, "
-                    "`%s %.*s`, for a copy the arm can change",
-                    name->len, TSTART(name), type_str(local->type, ty, sizeof(ty)), name->len, TSTART(name));
         }
         else if (local && local->bound)
         {
@@ -3186,6 +3629,7 @@ static void check_decl(Check *c, NodeId decl, Scope *scope, SymId enclosing, int
         break;
     }
     case AST_VAL_DECL:
+    case AST_STRUCT_LIT: // `point{ x, y }` alone: the struct's face (sema_declare took it)
         break;
     default:
         if (!functions)
@@ -3243,7 +3687,9 @@ static int pattern_number(Unit *u, uint32_t tok, int negative, TypeId type, uint
     }
     if (loud && type != T_NONE)
     {
-        diag_at(u, tok, "error", "a number pattern needs an integer parameter");
+        char name[32];
+        diag_at(u, tok, "error", "a number pattern needs an integer value to match, not %s",
+                type_str(type, name, sizeof(name)));
     }
     return 0;
 }
@@ -3272,10 +3718,181 @@ int sema_pattern_of(Unit *u, NodeId param, SymId owner, Pattern *out, int loud)
     return pattern_from(u, n, resolve_type(u, n->a, owner, 0), out, loud);
 }
 
-// An arm's literal pattern (AST_PATTERN), for a subject of `type`. 0 for a name (or an error).
+static int const_value(const Unit *u, NodeId e, TypeId type, uint64_t *v);
+static int ends_pattern(Unit *u, const AstNode *pn, TypeId type, Pattern *out, int loud);
+
+// A range with a name at an end: both ends must be known now and fit the type, low <= high.
+static int ends_pattern(Unit *u, const AstNode *pn, TypeId type, Pattern *out, int loud)
+{
+    *out = (Pattern){.kind = PATTERN_RANGE, .tok = pn->tok};
+    char y[32];
+    if (!type_is_int(type) || type == T_INT_LIT)
+    {
+        if (loud)
+        {
+            diag_at(u, pn->tok, "error", "a range pattern needs an integer value to match, not %s",
+                    type_str(type, y, sizeof(y)));
+        }
+        return 0;
+    }
+    NodeId ends[2] = {pn->a, pn->b};
+    for (int e = 0; e < 2; e++)
+    {
+        uint64_t v;
+        if (!ends[e])
+        {
+            out->hi = cover_max(type) < 0 ? 0 : (uint64_t)cover_max(type); // open: the type's last value
+            continue;
+        }
+        if (!const_value(u, ends[e], type, &v))
+        {
+            if (loud)
+            {
+                const Token *t = TOK(u, NODE(u, ends[e])->tok);
+                diag_at(u, NODE(u, ends[e])->tok, "error", "'%.*s' is not known while compiling: a range's ends are "
+                        "literals or constants", t->len, TSTART(t));
+            }
+            return 0;
+        }
+        Exact x = signed_type(type) ? (Exact)(int64_t)v : (Exact)v; // (a negative end on an unsigned value: too large)
+        if (x < cover_min(type) || x > cover_max(type))
+        {
+            if (loud)
+            {
+                diag_at(u, NODE(u, ends[e])->tok, "error", "this end of the range does not fit %s",
+                        type_str(type, y, sizeof(y)));
+            }
+            return 0;
+        }
+        if (e == 0)
+        {
+            out->lo = (uint64_t)x;
+        }
+        else
+        {
+            out->hi = (uint64_t)x;
+        }
+    }
+    int empty = signed_type(type) ? (int64_t)out->hi < (int64_t)out->lo : out->hi < out->lo;
+    if (empty)
+    {
+        if (loud)
+        {
+            diag_at(u, pn->tok, "error", "this range takes no value: its high end is below its low end");
+        }
+        return 0;
+    }
+    return 1;
+}
+
+// A name pattern's value when the compiler knows it (a constant, sized or not).
+static int name_pattern_value(const Unit *u, const AstNode *pn, TypeId type, uint64_t *v)
+{
+    return const_value(u, pn->a, type, v);
+}
+
+// The value of a pattern's expression the compiler knows: a literal, a negative one, or a
+// constant's name.
+static int const_value(const Unit *u, NodeId e, TypeId type, uint64_t *v)
+{
+    int negative;
+    Exact x;
+    if (type == T_STR)
+    {
+        return 0;
+    }
+    if (NODE(u, e)->kind == AST_UNARY_OP && NODE(u, NODE(u, e)->a)->kind == AST_IDENT) // `-limit`
+    {
+        if (!const_value(u, NODE(u, e)->a, type, v))
+        {
+            return 0;
+        }
+        *v = 0 - *v;
+        return 1;
+    }
+    if (NODE(u, e)->kind != AST_IDENT)
+    {
+        if (!exact_value(u, e, &x))
+        {
+            return 0;
+        }
+        *v = (uint64_t)x;
+        return 1;
+    }
+    if (sema_unsized_value(u, e, v, &negative))
+    {
+        return 1;
+    }
+    SymId s = u->refs ? u->refs[e] : 0;
+    if (!s || SYM(s)->owner || (NODE(&cx.units[SYM(s)->unit], SYM(s)->decl)->flags & AST_F_MUT) ||
+        SYM(s)->kind == SYM_METHOD)
+    {
+        return 0; // a local, a parameter, a field, a mutable module variable: known when it runs
+    }
+    if (SYM(s)->kind == SYM_CONST) // `limit: u8 = 50`: its value, exactly
+    {
+        const Unit *h = &cx.units[SYM(s)->unit];
+        const AstNode *d = NODE(h, SYM(s)->decl);
+        NodeId init = d->kind == AST_DEFINE ? d->a : d->kind == AST_FIELD_DECL ? d->b : 0;
+        Exact e;
+        if (init && exact_value(h, init, &e))
+        {
+            *v = (uint64_t)e;
+            return 1;
+        }
+    }
+    return s && sema_comptime_value(s, v); // one the compiler computed (`fact(5)`)
+}
+
+int sema_params_overlap(Unit *u, NodeId a, NodeId b, SymId owner)
+{
+    Pattern pa, pb;
+    if (!sema_pattern_of(u, a, owner, &pa, 0) || !sema_pattern_of(u, b, owner, &pb, 0))
+    {
+        return 1; // a parameter without a pattern takes every value
+    }
+    if (pa.kind == PATTERN_TEXT || pb.kind == PATTERN_TEXT)
+    {
+        if (pa.kind != pb.kind)
+        {
+            return 0;
+        }
+        static uint8_t x[4096], y[4096];
+        size_t nx = sema_pattern_text(u, pa.tok, x, sizeof(x)), ny = sema_pattern_text(u, pb.tok, y, sizeof(y));
+        return nx == ny && memcmp(x, y, nx < sizeof(x) ? nx : sizeof(x)) == 0;
+    }
+    TypeId t = resolve_type(u, NODE(u, a)->a, owner, 0);
+    Exact alo = cover_value(t, pa.lo), ahi = pa.kind == PATTERN_RANGE ? cover_value(t, pa.hi) : alo;
+    Exact blo = cover_value(t, pb.lo), bhi = pb.kind == PATTERN_RANGE ? cover_value(t, pb.hi) : blo;
+    return alo <= bhi && blo <= ahi;
+}
+
+// An arm's pattern known while compiling (a literal, or a name of a constant), for a subject of
+// `type`. 0 for `_`, a name known only when the program runs, or an error.
 int sema_arm_pattern(Unit *u, NodeId pat, TypeId type, Pattern *out)
 {
-    return NODE(u, pat)->kind == AST_PATTERN && pattern_from(u, NODE(u, pat), type, out, 0);
+    const AstNode *pn = NODE(u, pat);
+    if (pn->kind != AST_PATTERN || (pn->aux & PAT_ANY))
+    {
+        return 0;
+    }
+    if (pn->aux & PAT_NAME)
+    {
+        *out = (Pattern){.kind = PATTERN_VALUE, .tok = pn->tok};
+        return name_pattern_value(u, pn, type, &out->lo);
+    }
+    if (pn->aux & PAT_ENDS)
+    {
+        return ends_pattern(u, pn, type, out, 0);
+    }
+    return pattern_from(u, pn, type, out, 0);
+}
+
+NodeId sema_arm_name(Unit *u, NodeId pat, TypeId type)
+{
+    const AstNode *pn = NODE(u, pat);
+    uint64_t v;
+    return pn->kind == AST_PATTERN && (pn->aux & PAT_NAME) && !name_pattern_value(u, pn, type, &v) ? pn->a : 0;
 }
 
 // What a literal pattern takes (a parameter's or an arm's: the literal token and PAT_* in aux).
@@ -3289,7 +3906,7 @@ static int pattern_from(Unit *u, const AstNode *n, TypeId type, Pattern *out, in
         {
             if (loud)
             {
-                diag_at(u, n->tok, "error", "a string pattern needs a []u8 parameter");
+                diag_at(u, n->tok, "error", "a string pattern needs a []u8 value to match");
             }
             return 0;
         }
@@ -3302,7 +3919,7 @@ static int pattern_from(Unit *u, const AstNode *n, TypeId type, Pattern *out, in
         {
             if (loud)
             {
-                diag_at(u, n->tok, "error", "the pattern '%.*s' is a bool, but the parameter is not",
+                diag_at(u, n->tok, "error", "the pattern '%.*s' is a bool, but the value matched is not",
                         t->len, TSTART(t));
             }
             return 0;
@@ -3462,7 +4079,9 @@ void sema_syntax_only(Unit *u)
     size_t decls = u->nodes.size, toks = u->tokens.size;
     for (NodeId id = 1; id < decls; id++)
     {
-        if (NODE(u, id)->flags & AST_F_LAZY)
+        // (a function's signature node carries AST_F_LAZY too; its body is reached from the function)
+        int kind = NODE(u, id)->kind;
+        if ((NODE(u, id)->flags & AST_F_LAZY) && (kind == AST_METHOD_DECL || kind == AST_FN_LIT))
         {
             parse_function_body(u, fn_body(u, id));
             u->nodes.size = decls;

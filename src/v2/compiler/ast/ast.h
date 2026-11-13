@@ -54,6 +54,10 @@ typedef enum
     AST_ARM,     // first token  patterns     result (an expression, a statement or a block)
     AST_PATTERN, // literal      (aux: PAT_*, as a pattern parameter's; PAT_ANY: `_`)
     AST_IF,      // 'if'         condition    branches (an AST_ARM: a = then, b = else or 0)
+    // A struct literal `point{ x, y: e }`, and at module level alone on its line, the struct's
+    // face: the members visible outside it (`point{ x, y, len: length }`).
+    AST_STRUCT_LIT, // type name   inits
+    AST_FIELD_INIT, // member name value (`x` alone: an AST_IDENT of the same token; aux = 1 when written `x: v`)
     // An arm binds no name: inside it the subject keeps its own, known to be in the arm's values.
     // In an expression, an AST_IDENT's aux may hold IDENT_NONZERO: inside an arm, it names the
     // subject, whose values there exclude 0 (no divisor guard).
@@ -95,9 +99,13 @@ enum
     PAT_OPEN = 1u << 3,   // `lo..`: no high end
     PAT_TEXT = 1u << 4,   // a string literal (`[]u8 "help"`)
     PAT_ANY = 1u << 5,    // `_`: every value (in an arm)
+    PAT_NAME = 1u << 6,   // an existing name (a = its AST_IDENT): equal to its value (in an arm)
+    PAT_ENDS = 1u << 7,   // a range with a name at an end (with PAT_RANGE): a = low end, b = high (0: open)
 };
 
 #define IDENT_NONZERO 1
+// An AST_INDEX whose index the checker proved in range (an arm took it): no bounds check.
+#define INDEX_SAFE 1
 
 typedef struct AstNode
 {

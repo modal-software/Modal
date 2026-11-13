@@ -172,12 +172,12 @@ static void declare_value(Unit *u, Scope *scope, SymId owner, SymKind kind, uint
     scope_insert(scope, symbol_new(u, kind, flags, tok, owner, decl));
 }
 
-// `face` is SYM_F_EXPOSED for a method written outside its struct's braces, 0 otherwise.
+// `outside` is 1 for a method written outside its struct's braces, 0 otherwise.
 static void declare_callable(Unit *u, Scope *scope, SymId owner, uint32_t tok, NodeId decl,
-                             int overloadable, uint8_t face)
+                             int overloadable, int outside)
 {
     const Token *t = TOK(u, tok);
-    uint8_t flags = (uint8_t)((overloadable ? SYM_F_MUT : 0) | face);
+    uint8_t flags = (uint8_t)(overloadable ? SYM_F_MUT : 0);
 
     SymId first = scope_find_token(scope, t);
     if (!first)
@@ -186,10 +186,10 @@ static void declare_callable(Unit *u, Scope *scope, SymId owner, uint32_t tok, N
         return;
     }
 
-    if (SYM(first)->kind == SYM_FIELD && face)
+    if (SYM(first)->kind == SYM_FIELD && outside)
     {
         // An accessor may carry the name of the field it reads: `u8 n1(self: T): self.n1`.
-        // From outside only the method can be seen, so the name is never ambiguous there.
+        // `x.n1(...)` is the method and `x.n1` the field, so the name is never ambiguous.
         // It is inserted in front of the field, which is what a lookup then finds.
         scope_insert(scope, symbol_new(u, SYM_METHOD, flags, tok, owner, decl));
         return;
@@ -328,7 +328,7 @@ static void declare_define(Unit *u, Scope *scope, SymId owner, NodeId decl, int 
         {
             check_member_self(u, owner, params);
         }
-        declare_callable(u, scope, owner, tok, decl, 0, (top_level && owner) ? SYM_F_EXPOSED : 0);
+        declare_callable(u, scope, owner, tok, decl, 0, top_level && owner);
         return;
     }
 
@@ -433,8 +433,7 @@ void sema_declare(Unit *u)
             Scope *home = callable_home(u, n->a, &owner);
             if (home)
             {
-                declare_callable(u, home, owner, n->tok, d, n->flags & AST_F_MUT,
-                                 owner ? SYM_F_EXPOSED : 0); // outside the braces: the face
+                declare_callable(u, home, owner, n->tok, d, n->flags & AST_F_MUT, owner != 0);
             }
             break;
         }
@@ -446,6 +445,11 @@ void sema_declare(Unit *u)
             break;
         case AST_IMPORT_PICK:
             declare_import_items(u, n->b); // bare import(x).(a, b as c)
+            break;
+        case AST_STRUCT_LIT: // the face line of before: visibility follows use now
+            diag_at(u, n->tok, "error",
+                    "a struct needs no face line: its members are public as soon as another domain uses "
+                    "them (std.md §10). Remove this line");
             break;
         default:
             break;
@@ -466,11 +470,60 @@ void sema_declare(Unit *u)
             continue;
         }
         int n = arity(u, params), later = 0;
-        for (SymId t = sym->next_overload; t && !later; t = SYM(t)->next_overload)
+        for (SymId t = sym->next_overload; t; t = SYM(t)->next_overload)
         {
-            later = same_types(u, sema_callable_params(u, SYM(t)->decl), params);
+            NodeId theirs = sema_callable_params(u, SYM(t)->decl);
+            if (!same_types(u, theirs, params))
+            {
+                continue;
+            }
+            later = 1;
+            // Clauses take disjoint values, as arms do (std.md §8): the order decides nothing but
+            // where the catch-all goes, so a value two clauses with patterns both take is an error.
+            // As for arms, the check is on one column: both clauses have their only pattern in the
+            // same parameter. With patterns in several places the first that matches wins.
+            int every = has_patterns(u, theirs), col_x = -1, col_y = -1, nx = 0, ny = 0, k = 0;
+            for (NodeId x = params, y = theirs; x && y; x = NEXT(u, x), y = NEXT(u, y), k++)
+            {
+                if (NODE(u, x)->flags & AST_F_PATTERN)
+                {
+                    nx++;
+                    col_x = k;
+                }
+                if (NODE(u, y)->flags & AST_F_PATTERN)
+                {
+                    ny++;
+                    col_y = k;
+                }
+            }
+            every = every && nx == 1 && ny == 1 && col_x == col_y;
+            for (NodeId x = params, y = theirs; x && y && every; x = NEXT(u, x), y = NEXT(u, y))
+            {
+                every = sema_params_overlap(u, x, y, sym->owner);
+            }
+            if (every)
+            {
+                int line, col;
+                source_pos(u->src, TSTART(TOK(u, sym->tok)), &line, &col);
+                diag_at(u, SYM(t)->tok, "error",
+                        "this clause takes values the clause at line %d takes too: clauses take disjoint "
+                        "values, so what each takes is what it says", line);
+            }
         }
-        if (!later)
+        // A clause set with no result may leave values to nobody (the call does nothing for them):
+        // a warning, as for arms. One that gives a value takes them all.
+        NodeId ret = fn_ret_node(u, sym->decl);
+        const Token *rt = ret ? TOK(u, NODE(u, ret)->tok) : NULL;
+        int nil = !ret || (rt->len == 3 && memcmp(TSTART(rt), "nil", 3) == 0);
+        if (!later && nil)
+        {
+            const Token *name = TOK(u, sym->tok);
+            diag_at(u, sym->tok, "warning",
+                    "'%.*s' with %d argument%s: no clause takes the other values, so a call with one does "
+                    "nothing (`nil %.*s(T n) {}` last says so)",
+                    name->len, TSTART(name), n, n == 1 ? "" : "s", name->len, TSTART(name));
+        }
+        else if (!later)
         {
             const Token *name = TOK(u, sym->tok);
             diag_at(u, sym->tok, "error",

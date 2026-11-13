@@ -1,6 +1,7 @@
 // Modal v2 driver: scan -> parse -> declare -> link -> check -> generate.
 //
 //   modal-v2 [options] file.modal
+#include <stdint.h>
 #define _XOPEN_SOURCE 700
 #include "v2/compiler/backend/backend.h"
 #include "v2/compiler/cx.h"
@@ -29,6 +30,8 @@ static int usage(const char *argv0)
             "  --ast            print the syntax tree of every loaded file\n"
             "  --syms           print the symbol table with visibility\n"
             "  --sig            print the derived contract of every domain\n"
+            "  --audit          print what the program depends on, what main reaches, where it\n"
+            "                   can stop at run time, its recursion and its writes\n"
             "  --stats          print token, node, symbol and memory counts\n"
             "  --time           print the time spent in each phase\n"
             "  --eager          parse every body up front and keep the whole tree\n"
@@ -218,8 +221,8 @@ static void find_std(const char *argv0)
 int main(int argc, char **argv)
 {
     const char *entry = NULL;
-    int show_ast = 0, show_syms = 0, show_stats = 0, show_sig = 0;
-    int run = 0, show_time = 0, eager = 0, repeat = 1, use_cache = 0;
+    uint8_t show_ast = 0, show_syms = 0, show_stats = 0, show_sig = 0;
+    uint8_t run = 0, show_time = 0, eager = 0, repeat = 1, use_cache = 0;
     char gen_path[512] = "", exe_path[512] = "";
     FILE *gen = NULL;
     const char *out_path = NULL;
@@ -307,6 +310,14 @@ int main(int argc, char **argv)
             show_sig = 1;
             cx.kinds = 1;
         }
+        else if (strcmp(argv[i], "--warn") == 0)
+        {
+            cx.warn = 1;
+        }
+        else if (strcmp(argv[i], "--audit") == 0)
+        {
+            cx.audit = 1;
+        }
         else if (strcmp(argv[i], "--stats") == 0)
         {
             show_stats = 1;
@@ -344,9 +355,9 @@ int main(int argc, char **argv)
     }
     else if (backend->executable)
     {
-        target_set(target_find(strcmp(backend->name, "x86_64") == 0 ? "x86_64-macos"
+        target_set(target_find(strcmp(backend->name, "x86_64") == 0  ? "x86_64-macos"
                                : strcmp(backend->name, "arm64") == 0 ? "arm64-macos"
-                                                                      : target_get()->name));
+                                                                     : target_get()->name));
     }
     if (run && target_get()->os != TOS_MACOS)
     {
@@ -373,7 +384,18 @@ int main(int argc, char **argv)
     // process writes no file at all.
     const char *tmp = getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp";
     int in_memory = run && !out_path && backend->can_run && backend->can_run();
-    if (in_memory)
+    // A binary that leaves this machine carries no source: its guards say `trap N` (std.md §11).
+    cx.trap_codes = (uint8_t)(out_path && backend->function_mir);
+    if (cx.audit && !out_path && !run) // the code is made in memory, to be read, and not run
+    {
+        const Backend *native = backend_find("native");
+        if (native && native->can_run && native->can_run())
+        {
+            codegen_start(native, NULL, NULL);
+            in_memory = 2;
+        }
+    }
+    if (in_memory == 1)
     {
         codegen_start(backend, NULL, NULL);
     }
@@ -473,6 +495,15 @@ int main(int argc, char **argv)
         {
             remove(gen_path); // never leave a half-translated file behind
         }
+        else if (cx.trap_codes)
+        {
+            char map[PATH_MAX + 8];
+            snprintf(map, sizeof(map), "%s.traps", out_path);
+            if (trap_codes_write(map) < 0)
+            {
+                fprintf(stderr, "%s: cannot write '%s'\n", argv[0], map);
+            }
+        }
     }
     fflush(stderr); // the reports come before any listing or summary on stdout
 
@@ -497,6 +528,10 @@ int main(int argc, char **argv)
     {
         contract_print();
     }
+    if (cx.audit && !cx.errors)
+    {
+        audit_print();
+    }
 
     if (show_stats)
     {
@@ -516,7 +551,7 @@ int main(int argc, char **argv)
 
     int status = cx.errors > 0;
 
-    if (!status && in_memory)
+    if (!status && in_memory == 1)
     {
         fflush(stdout);
         fflush(stderr);

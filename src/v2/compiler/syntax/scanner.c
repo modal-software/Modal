@@ -35,7 +35,6 @@ static const Keyword keywords[] = {
     {"volatile", 8, TOK_VOLATILE},
 };
 
-
 void scan_register_keywords(void)
 {
     for (size_t i = 0; i < sizeof(keywords) / sizeof(keywords[0]); i++)
@@ -105,11 +104,17 @@ void source_pos(const char *src, const char *at, int *line, int *col)
     last_line = *line;
 }
 
+int scan_quiet; // a scan for facts only (sema/layout.c): its errors are reported by the real one
+
 // Errors are rare, so the scanner does not track lines: the position is computed here.
 static void scan_error(const char *filename, const char *src, const char *at, const char *fmt, ...)
 {
     int line, col;
     va_list ap;
+    if (scan_quiet)
+    {
+        return;
+    }
     source_pos(src, at, &line, &col);
     va_start(ap, fmt);
     fprintf(stderr, "\nerror [%s:%d:%d]: ", filename, line, col);
@@ -145,11 +150,12 @@ static inline const char *next_body_special(const char *c)
     for (;; c += 16)
     {
         uint8x16_t v = vld1q_u8((const uint8_t *)c);
-        uint8x16_t m = vorrq_u8(vorrq_u8(vceqq_u8(v, quote), vceqq_u8(v, dash)),
-                                vorrq_u8(vorrq_u8(vceqq_u8(v, open), vceqq_u8(v, close)),
-                                         vceqq_u8(v, nul)));
+        uint8x16_t m =
+            vorrq_u8(vorrq_u8(vceqq_u8(v, quote), vceqq_u8(v, dash)),
+                     vorrq_u8(vorrq_u8(vceqq_u8(v, open), vceqq_u8(v, close)), vceqq_u8(v, nul)));
         // narrow each byte of the mask to 4 bits: a 64-bit word with 4 bits per position
-        uint64_t bits = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(m), 4)), 0);
+        uint64_t bits =
+            vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(m), 4)), 0);
         if (bits)
         {
             return c + (__builtin_ctzll(bits) >> 2);
@@ -165,10 +171,10 @@ static inline const char *next_body_special(const char *c)
     for (;; c += 16)
     {
         __m128i v = _mm_loadu_si128((const __m128i *)c);
-        __m128i m = _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, quote), _mm_cmpeq_epi8(v, dash)),
-                                 _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, open),
-                                                           _mm_cmpeq_epi8(v, close)),
-                                              _mm_cmpeq_epi8(v, nul)));
+        __m128i m = _mm_or_si128(
+            _mm_or_si128(_mm_cmpeq_epi8(v, quote), _mm_cmpeq_epi8(v, dash)),
+            _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, open), _mm_cmpeq_epi8(v, close)),
+                         _mm_cmpeq_epi8(v, nul)));
         unsigned bits = (unsigned)_mm_movemask_epi8(m);
         if (bits)
         {
@@ -262,6 +268,26 @@ static const char *skip_body(const char *open)
 // The scanning loop, shared by whole files and single bodies. It appends to `v` starting at
 // v->size and stops at the end of the text, or at `end` when one is given. With `defer`,
 // function bodies become TOK_BODY tokens.
+// A module-level `{` right after a name (`point{`), when that name starts its line (a face:
+// `point{ x, y }`) or is a value (`origin := point{ ... }`): a struct literal, tokenized now.
+static int literal_brace(const Token *toks, size_t first, uint32_t count, const char *brace)
+{
+    if (count <= first)
+    {
+        return 0;
+    }
+    const Token *name = &toks[count - 1];
+    if (name->kind != TOK_IDENTIFIER || token_base + name->off + name->len != brace)
+    {
+        return 0;
+    }
+    if (name->nl)
+    {
+        return 1;
+    }
+    return count - 1 > first && (toks[count - 2].kind == TOK_DEFINE || toks[count - 2].kind == TOK_EQ);
+}
+
 static int scan_into(const char *filename, const char *src, const char *from, const char *end,
                      TokenVec *v, int defer, size_t *max_body)
 {
@@ -272,6 +298,9 @@ static int scan_into(const char *filename, const char *src, const char *from, co
     int sp = 0;
     int errors = 0;
     int too_deep = 0;
+    // A module-level `x := if v { arms }`: the `{` after an `if` there, and every brace inside it,
+    // is tokenized now (the compiler evaluates the match), not kept as a body.
+    int if_pending = 0, arms_depth = 0;
 
     const char *c = from;
     uint32_t nl = 1;
@@ -345,7 +374,8 @@ static int scan_into(const char *filename, const char *src, const char *from, co
 
         if (!*c || (end && c >= end))
         {
-            toks[count++] = (Token){.off = (uint32_t)(start - token_base), .kind = TOK_EOF, .nl = 1};
+            toks[count++] =
+                (Token){.off = (uint32_t)(start - token_base), .kind = TOK_EOF, .nl = 1};
             break;
         }
 
@@ -367,6 +397,10 @@ static int scan_into(const char *filename, const char *src, const char *from, co
                 kind = TOK_IDENTIFIER;
                 match = id;
             }
+            else if (kind == TOK_IF && defer && !arms_depth)
+            {
+                if_pending = 1;
+            }
         }
         else if (cls & C_DIGIT)
         {
@@ -380,8 +414,7 @@ static int scan_into(const char *filename, const char *src, const char *from, co
             do
             {
                 c++;
-            } while ((CLASS(*c) & C_DIGIT) ||
-                     (hex && (*c | 0x20) >= 'a' && (*c | 0x20) <= 'f') ||
+            } while ((CLASS(*c) & C_DIGIT) || (hex && (*c | 0x20) >= 'a' && (*c | 0x20) <= 'f') ||
                      (*c == '_' && ((CLASS(c[1]) & C_DIGIT) ||
                                     (hex && (c[1] | 0x20) >= 'a' && (c[1] | 0x20) <= 'f'))));
             if (c[0] == '.' && (CLASS(c[1]) & C_DIGIT))
@@ -430,7 +463,12 @@ static int scan_into(const char *filename, const char *src, const char *from, co
                 kind = TOK_LBRACE;
                 // Every '{' at declaration level opens a function body, except the one
                 // after `struct`. A body is not tokenized now: it is one token.
-                if (defer && !(count > v->size && toks[count - 1].kind == TOK_STRUCT))
+                if (defer && (arms_depth || if_pending || literal_brace(toks, v->size, count, start)))
+                {
+                    arms_depth++;
+                    if_pending = 0;
+                }
+                else if (defer && !(count > v->size && toks[count - 1].kind == TOK_STRUCT))
                 {
                     const char *close = skip_body(start);
                     size_t body_bytes = close ? (size_t)(close - start) + 1 : 0;
@@ -447,6 +485,7 @@ static int scan_into(const char *filename, const char *src, const char *from, co
                 break;
             case '}':
                 kind = TOK_RBRACE;
+                arms_depth -= arms_depth > 0;
                 break;
             case '[':
                 kind = TOK_LBRACKET;
