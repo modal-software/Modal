@@ -1,0 +1,9 @@
+-- each target reports its own facts
+print := import("std").io.print
+target := import("target")
+where := target.arch
+sys := target.os
+main(): u8 {
+    print(where, sys)
+    return 0
+}

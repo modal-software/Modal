@@ -1,0 +1,62 @@
+-- Unsigned division by a constant is a multiplication in the machine-code backends (the high
+-- half, shifted; powers of two are a shift). The values come from module variables, so nothing
+-- here is computed by the compiler: every quotient below is the generated code's, against C.
+print := import("std").io.print
+u64 seed = 0
+u32 seed32 = 0
+u16 seed16 = 0
+u8 seed8 = 0
+u64 d0(): seed / 1
+u64 d1(): seed / 2
+u64 d2(): seed / 3
+u64 d3(): seed / 5
+u64 d4(): seed / 7
+u64 d5(): seed / 10
+u64 d6(): seed / 16
+u64 d7(): seed / 25
+u64 d8(): seed / 100
+u64 d9(): seed / 641
+u64 d10(): seed / 1000
+u64 d11(): seed / 7919
+u64 d12(): seed / 65535
+u64 d13(): seed / 4294967295
+u64 d14(): seed / 1000000007
+u64 d15(): seed / 9223372036854775807
+u64 d16(): seed / 9223372036854775808
+u64 d17(): seed / 12345678901234567
+u32 e(): seed32 / 10
+u16 g(): seed16 / 7
+u8 h(): seed8 / 3
+u8 h2(): seed8 / 255
+bool row(n: u64) {
+    seed = n
+    print(d0(), d1(), d2(), d3(), d4(), d5(), d6(), d7(), d8(), d9(), d10(), d11(), d12(), d13(), d14(), d15(), d16(), d17())
+    return true
+}
+main(): u8 {
+    row(0)
+    row(1)
+    row(9)
+    row(10)
+    row(99)
+    row(255)
+    row(65535)
+    row(4294967295)
+    row(18446744073709551615)
+    row(18446744073709551614)
+    row(9223372036854775808)
+    row(12345678901234567890)
+    seed32 = 4294967295
+    seed16 = 65535
+    seed8 = 255
+    print(e(), g(), h(), h2())
+    seed32 = 4294967290
+    seed16 = 65534
+    seed8 = 253
+    print(e(), g(), h(), h2())
+    seed32 = 9
+    seed16 = 6
+    seed8 = 2
+    print(e(), g(), h(), h2())
+    return 0
+}
