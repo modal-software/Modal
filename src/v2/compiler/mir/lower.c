@@ -2162,6 +2162,8 @@ static MirSlot lower_expr(NodeId id)
     }
     switch (n->kind)
     {
+    case AST_MATCH:
+        return lower_match(id, type == T_INT_LIT ? T_INT : type);
     case AST_NUMBER_LIT:
         unsupported(n->tok, "a fractional number");
         return temp();
