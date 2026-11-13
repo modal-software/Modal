@@ -1,0 +1,10 @@
+-- domain `std`: Modal's standard library, in Modal (docs/std.md). The compiler reads it only
+-- when a program imports std; it needs none of it to build, and none of it uses C's libc.
+-- What this file binds is std's face: `assert := import("std").assert`.
+--
+-- Two names are still the compiler's, reached by their old paths until Modal can write them
+-- (docs/std.md §4): `import("std").io.print` (variadic over types) and `import("std").sys.put`
+-- (the target's byte sink).
+version := "0.1.0"
+
+assert := import("./debug").assert
