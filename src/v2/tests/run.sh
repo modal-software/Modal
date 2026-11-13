@@ -136,7 +136,7 @@ else
     echo "FAIL  unknown backend is rejected"
     fail=1
 fi
-for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms; do
+for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms bindings; do
     if $BIN --run $EX/run/$prog.modal 2>&1 | cmp -s - $EX/run/$prog.expected; then
         echo "ok    $prog.modal compiles to C and prints the expected output"
     else
@@ -209,7 +209,7 @@ expect_output "a closure is reported" "closure.modal:2:.*a closure" $EX/errors/c
 
 # the native backend (copy-and-patch): same output and exit status as the C backend
 if [ "$(uname -m)" = arm64 ] || [ "$(uname -m)" = aarch64 ]; then
-    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms; do
+    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms bindings; do
         if $BIN --backend native --run $EX/run/$prog.modal 2>&1 | cmp -s - $EX/run/$prog.expected; then
             echo "ok    $prog.modal compiles to arm64 by copy-and-patch and prints the expected output"
         else
@@ -239,7 +239,7 @@ if [ "$(uname -m)" = arm64 ] || [ "$(uname -m)" = aarch64 ]; then
 fi
 # x86-64: on an x86-64 host, or on Apple Silicon through Rosetta
 if [ "$(uname -m)" = x86_64 ] || arch -x86_64 /usr/bin/true 2>/dev/null; then
-    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms; do
+    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms bindings; do
         if $BIN --backend x86_64 --run $EX/run/$prog.modal 2>&1 | cmp -s - $EX/run/$prog.expected; then
             echo "ok    $prog.modal compiles to x86-64 by copy-and-patch and prints the expected output"
         else
@@ -261,7 +261,7 @@ for cpu in arm64 x86_64; do
     else
         continue
     fi
-    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms; do
+    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms bindings; do
         if $BIN --target $cpu-linux -o "$ELF" $EX/run/$prog.modal >/dev/null 2>&1 &&
             $runner "$ELF" 2>&1 | cmp -s - $EX/run/$prog.expected; then
             echo "ok    $prog.modal as a Linux $cpu ELF prints the expected output"
@@ -331,6 +331,9 @@ expect_output "arms: strings end with a name" "arms.modal:11:.*end with an arm t
 expect_output "arms: a catch-all after full coverage never runs" "arms.modal:16:.*this arm never runs: the arms above already take every value" $EX/errors/arms.modal
 expect_output "arms: a value match gives one type" "arms.modal:22:.*this arm gives .*u8, but the arms above give a number" $EX/errors/arms.modal
 expect_output "arms: signed coverage names the gap" "arms.modal:25:.*no arm takes 0" $EX/errors/arms.modal
+expect_output "arms take disjoint values" "bindings.modal:4:.*this arm overlaps an arm above on 5..9" $EX/errors/bindings.modal
+expect_output "a binding takes the value's own type" "bindings.modal:9:.*this binding is u64, but the value is u8" $EX/errors/bindings.modal
+expect_output "an arm's binding is immutable" "bindings.modal:14:.*bound by the arm's pattern, so it is immutable" $EX/errors/bindings.modal
 expect_output "comptime_depth is configuration of the domain" "budget_ct/main.modal:3:.*nest deeper than comptime_depth = 5" $EX/errors/budget_ct/main.modal
 expect_output "configuration is a compile-time value" "ctvalues/main.modal:3:.*'max_ram' is configuration of the domain, a compile-time value" $EX/errors/ctvalues/main.modal
 expect_output "a target fact is a compile-time value" "ctvalues/main.modal:6:.*'ptr_size' is a fact of the target" $EX/errors/ctvalues/main.modal

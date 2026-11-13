@@ -1686,6 +1686,26 @@ per literal, and every case made explicit to the developer.
   `examples/errors/patterns.modal`; it was restored from git and the checks moved to
   `errors/literals.modal`.
 
+## 30. More control in arms: disjoint values, bindings with a test, mutable copies
+
+The owner asked that arms show the developer more control. Three rules, each enforced:
+- **Disjoint arms:** `Cover` finds a partial overlap (`cover_overlap`) and reports the shared
+  values: `this arm overlaps an arm above on 5..9`. A full overlap stays "never runs". Arm order
+  then decides only where the catch-all is.
+- **`d 1..9: ...`** (an AST_IDENT with its test in `a`): takes the test's values and binds them.
+  The checker marks the binding `nonzero` when its values exclude 0; an identifier that finds it
+  gets IDENT_NONZERO, and the native lowering skips the divisor guard (`share` in
+  `run/bindings.modal`: `100 / d` has no trap). The C backend keeps its `m_div` helper (it also
+  wraps INT_MIN / -1).
+- **`u64 m: ...`** (the type in `b`, AST_F_MUT): a copy the arm may change, in a slot of its own
+  (MIR) or a temporary (C); its type must be the value's (`this binding is u64, but the value is
+  u8`). Assigning to an untyped binding says how to get a copy.
+- Arm blocks may now start with `c 48..57:` or `u64 n:` (`arm_at`); a bare `n:` stays a local
+  declaration.
+- **Verified:** suite 263 passing (new: `run/bindings.modal` on five backends, three errors in
+  `errors/bindings.modal`). Fuzz: 0 differ (scalar 111, mix 100 programs).
+- **Not yet:** the disjoint rule for parameter clauses written as separate definitions.
+
 ---
 
 ## Appendix A. The owner's original specification inputs

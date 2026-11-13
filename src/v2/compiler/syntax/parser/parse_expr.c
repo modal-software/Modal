@@ -70,17 +70,18 @@ static NodeId parse_precedence(Parser *p, int prec)
 NodeId parse_expression(Parser *p)
 {
     NodeId e = parse_precedence(p, PREC_NONE);
-    // `value { arms }`: a block on the same line after a whole expression matches its value.
-    if (e && p->current->kind == TOK_LBRACE && !p->current->nl)
+    // `value: { arms }`: `:` takes the value, the arms match it.
+    if (e && p->current->kind == TOK_COLON && p->current[1].kind == TOK_LBRACE && !p->current[1].nl)
     {
+        parser_advance(p);
         return parse_arm_block(p, e);
     }
-    if (e && p->current->kind == TOK_BODY && !p->current->nl)
+    if (e && p->current->kind == TOK_COLON && p->current[1].kind == TOK_BODY && !p->current[1].nl)
     {
         // At module level the scanner keeps every `{` as a function body, not yet tokenized.
-        parser_error_at(p, p->current,
+        parser_error_at(p, p->current + 1,
                         "a match at module level is not supported yet: write it in a function "
-                        "(`R pick(T n) { 0: ... n: ... }`) and bind the call (`x := pick(v)`)");
+                        "(`R pick(T n) { 0: ...  _: ... }`) and bind the call (`x := pick(v)`)");
         return 0;
     }
     return e;

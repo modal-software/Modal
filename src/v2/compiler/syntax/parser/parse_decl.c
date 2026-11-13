@@ -539,7 +539,7 @@ int local_decl_at(const Token *t)
 {
     if (t->kind == TOK_IDENTIFIER && !t[1].nl && (t[1].kind == TOK_COLON || t[1].kind == TOK_COMMA))
     {
-        return 1;
+        return !(t[1].kind == TOK_COLON && t[2].kind == TOK_LBRACE); // `c: {` is a match
     }
     const Token *k = t;
     for (;;)

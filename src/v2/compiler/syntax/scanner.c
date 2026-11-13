@@ -10,6 +10,7 @@
 // The reserved words. They are interned before any source is read (see scan_register_keywords).
 static const Keyword keywords[] = {
     {"as", 2, TOK_AS},
+    {"if", 2, TOK_IF},
     {"or", 2, TOK_OR},
     {"fun", 3, TOK_FUNCTION},
     {"use", 3, TOK_USE},
@@ -17,6 +18,7 @@ static const Keyword keywords[] = {
     {"and", 3, TOK_AND},
     {"val", 3, TOK_VAL},
     {"test", 4, TOK_TEST},
+    {"else", 4, TOK_ELSE},
     {"defer", 5, TOK_DEFER},
     {"alias", 5, TOK_ALIAS},
     {"union", 5, TOK_UNION},

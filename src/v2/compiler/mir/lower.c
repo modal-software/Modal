@@ -2086,7 +2086,9 @@ static MirSlot lower_binop(NodeId id)
     else
     {
         MirSlot b = lower_expr(right);
-        if (op == MB_DIV && !(const_value(right, &k) && mir_normalize(k, p.var) != 0))
+        // no guard for a known divisor that is not 0, or an arm's binding whose test excludes 0
+        int nonzero = NODE(u, right)->kind == AST_IDENT && (NODE(u, right)->aux & IDENT_NONZERO);
+        if (op == MB_DIV && !nonzero && !(const_value(right, &k) && mir_normalize(k, p.var) != 0))
         {
             guard_divisor(b, n->tok);
         }
@@ -2746,7 +2748,18 @@ static MirSlot lower_match(NodeId id, TypeId want)
             const AstNode *pn = NODE(u, pat);
             if (pn->kind == AST_IDENT)
             {
-                push_local(token_name(TOK(u, pn->tok)), subj[k]);
+                Pattern pt;
+                if (pn->a && !(last && (m->aux & MATCH_LAST_FREE)) && sema_arm_pattern(u, pn->a, types[k], &pt))
+                {
+                    pattern_test(&pt, types[k], subj[k], next); // `d 1..9`: the test, then the name
+                }
+                MirSlot at = subj[k];
+                if (pn->b) // `u64 n`: a copy of its own, which the arm may change
+                {
+                    at = temp();
+                    into(subj[k], at);
+                }
+                push_local(token_name(TOK(u, pn->tok)), at);
                 continue;
             }
             Pattern pt;

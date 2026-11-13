@@ -648,7 +648,8 @@ static void emit_match(Emit *e, NodeId id)
         for (NodeId pat = a->a; pat && k < ns; pat = NEXT(u, pat), k++)
         {
             Pattern pt;
-            if (!(last && (m->aux & MATCH_LAST_FREE)) && sema_arm_pattern(u, pat, types[k], &pt))
+            NodeId test = NODE(u, pat)->kind == AST_IDENT ? NODE(u, pat)->a : pat; // `d 1..9`: its test
+            if (test && !(last && (m->aux & MATCH_LAST_FREE)) && sema_arm_pattern(u, test, types[k], &pt))
             {
                 put(e, tests ? " && " : "if (");
                 emit_pattern_cond(e, &pt, types[k], subj[k]);
@@ -660,15 +661,38 @@ static void emit_match(Emit *e, NodeId id)
         for (NodeId pat = a->a; pat && k < ns; pat = NEXT(u, pat), k++) // the names it binds
         {
             const AstNode *pn = NODE(u, pat);
-            if (pn->kind != AST_IDENT || (!m->a && same_name(u, pn->tok, NODE(u, subj[k].param)->tok)))
+            if (pn->kind != AST_IDENT)
             {
                 continue;
+            }
+            int same = !m->a && same_name(u, pn->tok, NODE(u, subj[k].param)->tok);
+            if (same && !pn->b)
+            {
+                continue; // the parameter itself
+            }
+            char via[32] = "";
+            if (same) // a copy of a parameter under its own name: through a temporary
+            {
+                snprintf(via, sizeof(via), "m_b%u", pat);
+                out_type(e, types[k], pn->tok);
+                put(e, " ");
+                put(e, via);
+                PUT(e, " = ");
+                out_subject(e, subj[k]);
+                PUT(e, ";\n");
             }
             out_type(e, types[k], pn->tok);
             PUT(e, " v_");
             out_tok(e, pn->tok);
             PUT(e, " = ");
-            out_subject(e, subj[k]);
+            if (same)
+            {
+                put(e, via);
+            }
+            else
+            {
+                out_subject(e, subj[k]);
+            }
             PUT(e, "; (void)v_");
             out_tok(e, pn->tok);
             PUT(e, ";\n");
@@ -709,7 +733,7 @@ static void emit_match(Emit *e, NodeId id)
             {
                 emit_stmt(e, r, ret);
             }
-            if (!m->a)
+            if (!m->a && ret == T_VOID) // (a block of a function with a result returns by itself)
             {
                 PUT(e, "        return;\n");
             }

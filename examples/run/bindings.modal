@@ -1,0 +1,35 @@
+-- Bindings in arms: a name with a test (`d 1..9`) takes only the test's values and, inside
+-- the arm, is known to be one of them (`100 / d` has no zero guard); a name with its type first
+-- (`u64 m`) is a copy the arm may change. Arms take disjoint values.
+print := import("std").io.print
+
+u64 share(u64 n) {
+    0: 0
+    d 1..9: 100 / d
+    n: n / 10
+}
+
+u64 bump(u64 n) {
+    0: 0
+    u64 m: {
+        m = m * 2
+        return m + n
+    }
+}
+
+-- a digit's value
+u8 digit(u8 c) {
+    d 48..57: d - 48
+    c: 255
+}
+
+main(): u8 {
+    u64 x = 0
+    print(share(x), share(x + 4), share(x + 70), bump(x + 5), digit(55), digit(65))
+    u8 c = 0
+    c {
+        d 48..57: print("digit", d - 48)
+        c: print("not a digit")
+    }
+    return 0
+}

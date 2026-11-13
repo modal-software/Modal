@@ -1,0 +1,21 @@
+-- binding mistakes: overlapping arms, a binding of another type, assigning an arm's binding
+[]u8 band(u8 n) {
+    1..9: "low"
+    5..20: "mid"
+    n: "other"
+}
+u8 widen(u8 n) {
+    0: 0
+    u8 m: 1
+}
+u8 keep(u8 n) {
+    0: 0
+    d 1..9: {
+        d = 3
+        return d
+    }
+    n: 2
+}
+main(): u8 {
+    return 0
+}

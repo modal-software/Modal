@@ -47,6 +47,8 @@ typedef enum
     TOK_AND,
     TOK_OR,
     TOK_WRITE,
+    TOK_IF,   // if cond branch [else branch] (the owner's choice: a statement, apart from arms)
+    TOK_ELSE,
     // Multi-char operators
     TOK_Q_DOT,
     TOK_EQ,

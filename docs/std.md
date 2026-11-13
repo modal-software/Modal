@@ -221,7 +221,9 @@ then it is a test.
 | `lo..hi`, `lo..` | every value from lo to hi, both included; from lo up | `1..9`, `100..` |
 | a string | those bytes | `u8 command([]u8 "help"): 1` |
 | `true`, `false` | that bool | |
-| a name | any value, bound to that name | `n: ...` |
+| a name | any value, bound to that name (immutable) | `n: ...` |
+| a type, then a name | any value, a copy the arm may change (type first: mutable); the value's own type | `u64 m: ...` |
+| a name, then a literal | the literal's values, bound: inside the arm the name is known to be one of them | `d 1..9: 100 / d` |
 
 **Arms** are clauses without their head: `pattern: result`, tried in order.
 
@@ -245,8 +247,19 @@ u64 sum(u64 n, u64 acc) { -- several parameters: one pattern each
 }
 ```
 
-**Explicit for the developer:** every decision the arms make is visible, and the compiler says
-what is wrong in terms of values:
+**Explicit for the developer, and under the developer's control:** every decision the arms make is
+written on them, and the compiler says what is wrong in terms of values:
+- **Arms take disjoint values.** An arm that shares values with one above is an error that names
+  them: `this arm overlaps an arm above on 5..9`. So what an arm takes is exactly what it says, the
+  order of the arms decides nothing but where the catch-all goes, and the compiler may test them in
+  any order (a jump table, a search) without changing what the program means.
+- **What you state, the compiler uses.** `d 1..9` binds d and proves it is 1..9 inside the arm:
+  `100 / d` has no zero guard there (native backends; the guard of a mutable copy stays, since it
+  may change). Array bounds checks will use the same fact.
+- **Mutability by position, as everywhere:** `n` is the value, immutable; `u64 n` a copy of it
+  that the arm may change. Assigning to `n` says so: `'d' is bound by the arm's pattern, so it is
+  immutable. Write its type first, u8 d, for a copy the arm can change`. The type written must be
+  the value's own (`this binding is u64, but the value is u8`).
 - **Every value is taken, or the program does not compile.** For numbers and bools the compiler
   joins the arms' ranges and names what is missing: `not every value is taken: no arm takes
   10..255`. For strings, the last arm is a name.
@@ -262,7 +275,9 @@ what is wrong in terms of values:
 is its length, then eight bytes at a time), and no call. Arms on the parameters are one function,
 so a loop written with them is a loop in registers.
 
-**Limits now:** a match at module level (the scanner keeps a module-level `{` as a function body;
+**Limits now:** parameter clauses (`u8 f(u8 1..9)` as separate definitions) still allow overlap,
+first one wins; the disjoint rule reaches them when clauses are checked as one group. A match at
+module level (the scanner keeps a module-level `{` as a function body;
 put the match in a function and bind the call); guards (`n if n > 3`), which would need a keyword
 or a sigil and are left out while ranges cover the cases; tuple subjects (`(a, b) { ... }`)
 outside a function's parameters. Next for speed: string arms dispatched by length first, and dense

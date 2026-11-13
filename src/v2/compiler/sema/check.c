@@ -31,6 +31,8 @@ typedef struct
     uint8_t context; // a context parameter (`arena: arena`)
     uint8_t param;   // a parameter, not a local declared in the body
     uint8_t bound;   // bound with `name := value`: immutable, like everywhere else
+    uint8_t nonzero; // an arm's binding whose values exclude 0 (`d 1..9`): a divisor needs no guard
+    uint8_t arm;     // bound by an arm's pattern
 } Local;
 
 typedef struct
@@ -41,6 +43,7 @@ typedef struct
     int implicit_self; // domain config: a bare member name stands for self.name
     int in_callable;
     int pretyped; // check_args: the arguments were typed already (an overload chosen by them)
+    int found_nonzero; // find_name: the local found is an arm binding that excludes 0
     TypeId ret; // declared return type of the callable being checked
     int nlocals;
     int block_base; // first local of the innermost block
@@ -714,7 +717,7 @@ static void push_local(Check *c, uint32_t tok, TypeId type, int mut)
         diag_at(c->u, tok, "error", "too many locals in one function (limit is %d)", MAX_LOCALS);
         return;
     }
-    c->locals[c->nlocals++] = (Local){tok, type, name, (uint8_t)mut, 0, 0, 0};
+    c->locals[c->nlocals++] = (Local){tok, type, name, (uint8_t)mut, 0, 0, 0, 0, 0};
 }
 
 static Scope *self_scope(const Check *c)
@@ -746,6 +749,7 @@ static NameKind find_name(Check *c, const Token *t, SymId *sym, TypeId *type)
                 SYM(c->literal)->flags |= SYM_F_CAPTURES; // a closure
             }
             *type = c->locals[i].type;
+            c->found_nonzero = c->locals[i].nonzero;
             return NAME_LOCAL;
         }
     }
@@ -1928,12 +1932,37 @@ static int same_text(const Unit *u, uint32_t a, uint32_t b)
     return x->len == y->len && memcmp(TSTART(x), TSTART(y), x->len) == 0;
 }
 
+// The first part of [lo, hi] an arm above takes, when only part of it is taken.
+static int cover_overlap(const Cover *cv, Exact lo, Exact hi, Exact *olo, Exact *ohi)
+{
+    for (int i = 0; i < cv->n; i++)
+    {
+        if (cv->lo[i] <= hi && lo <= cv->hi[i])
+        {
+            *olo = cv->lo[i] > lo ? cv->lo[i] : lo;
+            *ohi = cv->hi[i] < hi ? cv->hi[i] : hi;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void exact_text(Exact v, char *out, size_t cap)
+{
+    snprintf(out, cap, v < 0 ? "%lld" : "%llu", v < 0 ? (long long)v : (unsigned long long)v);
+}
+
 // Takes one arm's pattern into the cover. 0: it adds nothing (the arms above took all of it).
-static int cover_take(Unit *u, Cover *cv, NodeId pat)
+// 2: part of it is taken already (arms take disjoint values: written to `overlap`).
+static int cover_take(Unit *u, Cover *cv, NodeId pat, char *overlap, size_t cap)
 {
     if (cv->all)
     {
         return 0;
+    }
+    if (NODE(u, pat)->kind == AST_IDENT && NODE(u, pat)->a) // a name with a test: the test's values
+    {
+        pat = NODE(u, pat)->a;
     }
     if (NODE(u, pat)->kind == AST_IDENT)
     {
@@ -1965,6 +1994,23 @@ static int cover_take(Unit *u, Cover *cv, NodeId pat)
     if (cover_has(cv, lo, hi))
     {
         return 0;
+    }
+    Exact olo, ohi;
+    if (cover_overlap(cv, lo, hi, &olo, &ohi))
+    {
+        char a[48], b[48];
+        exact_text(olo, a, sizeof(a));
+        exact_text(ohi, b, sizeof(b));
+        if (olo == ohi)
+        {
+            snprintf(overlap, cap, "%s", cv->type == T_BOOL ? (olo ? "true" : "false") : a);
+        }
+        else
+        {
+            snprintf(overlap, cap, "%s..%s", a, b);
+        }
+        cover_add(cv, lo, hi);
+        return 2;
     }
     cover_add(cv, lo, hi);
     return 1;
@@ -2101,16 +2147,43 @@ static TypeId check_match(Check *c, NodeId id)
             const AstNode *pn = NODE(u, pat);
             if (pn->kind == AST_IDENT)
             {
-                // a name: takes any value, and binds it (a parameter's own name is the parameter)
-                const Token *name = TOK(u, pn->tok);
-                int same = params[np] && same_text(u, pn->tok, NODE(&cx.units[SYM(c->fn)->unit], params[np])->tok) &&
-                           SYM(c->fn)->unit == u->id;
+                // a name: binds the value (immutable), or a mutable copy (`u64 n`: type first,
+                // the value's own type); with a test (`d 1..9`) it takes only the test's values,
+                // and inside the arm d is known to be one of them.
+                if (pn->b)
+                {
+                    TypeId want = resolve_type(u, pn->b, c->owner, 1);
+                    if (want != T_NONE && want != types[np])
+                    {
+                        char x[64], y[64];
+                        diag_at(u, pn->tok, "error", "this binding is %s, but the value is %s: a binding takes "
+                                                     "the value's own type (no conversion)",
+                                type_str(want, x, sizeof(x)), type_str(types[np], y, sizeof(y)));
+                    }
+                }
+                int nonzero = 0;
+                if (pn->a)
+                {
+                    Pattern pt;
+                    if (pattern_from(u, NODE(u, pn->a), types[np], &pt, 1) && pt.kind != PATTERN_TEXT &&
+                        types[np] != T_BOOL)
+                    {
+                        Exact lo = cover_value(types[np], pt.lo);
+                        Exact hi = pt.kind == PATTERN_RANGE ? cover_value(types[np], pt.hi) : lo;
+                        nonzero = (lo > 0 || hi < 0) && !pn->b; // a mutable copy may become 0
+                    }
+                    literals++;
+                    literal_col = np;
+                }
+                int same = !pn->a && !pn->b && params[np] && SYM(c->fn)->unit == u->id &&
+                           same_text(u, pn->tok, NODE(u, params[np])->tok);
                 if (!same)
                 {
-                    push_local(c, pn->tok, types[np], 0);
-                    c->locals[c->nlocals - 1].bound = 1;
+                    push_local(c, pn->tok, types[np], pn->b != 0);
+                    c->locals[c->nlocals - 1].bound = pn->b == 0;
+                    c->locals[c->nlocals - 1].nonzero = (uint8_t)nonzero;
+                    c->locals[c->nlocals - 1].arm = 1;
                 }
-                (void)name;
                 continue;
             }
             Pattern pt;
@@ -2147,10 +2220,21 @@ static TypeId check_match(Check *c, NodeId id)
                                                 "value. Remove it");
                 }
             }
-            else if (!cover_take(u, &covers[col], pat))
+            else
             {
-                diag_at(u, a->tok, "error", "this arm never runs: the arms above already take every value "
-                                            "it takes. Move it above them, or remove it");
+                char overlap[100];
+                int took = cover_take(u, &covers[col], pat, overlap, sizeof(overlap));
+                if (!took)
+                {
+                    diag_at(u, a->tok, "error", "this arm never runs: the arms above already take every "
+                                                "value it takes. Move it above them, or remove it");
+                }
+                else if (took == 2)
+                {
+                    diag_at(u, a->tok, "error", "this arm overlaps an arm above on %s: arms take disjoint "
+                                                "values, so what each takes is what it says. Leave %s out of "
+                                                "this one", overlap, overlap);
+                }
             }
         }
         // the result: a value, or (a block, `return`, an assignment) a statement
@@ -2470,8 +2554,13 @@ static TypeId check_expr(Check *c, NodeId id)
     case AST_IDENT:
     {
         SymId sym;
+        c->found_nonzero = 0;
         NameKind kind = find_name(c, TOK(u, n->tok), &sym, &type);
         cx.names_resolved++;
+        if (kind == NAME_LOCAL && c->found_nonzero)
+        {
+            NODE(u, id)->aux |= IDENT_NONZERO; // the arm's test proved it: no divisor guard
+        }
         if (kind == NAME_MISSING)
         {
             report_missing(c, n->tok, 0);
@@ -2660,6 +2749,15 @@ static TypeId check_expr(Check *c, NodeId id)
                     "'%.*s' is a context parameter: it cannot be reassigned. To use another one "
                     "from here on, declare `%.*s := ...` in a block, or pass it to the call",
                     name->len, TSTART(name), name->len, TSTART(name));
+        }
+        else if (local && local->arm && !local->mut)
+        {
+            const Token *name = TOK(u, t->tok);
+            char ty[64];
+            diag_at(u, n->tok, "error",
+                    "'%.*s' is bound by the arm's pattern, so it is immutable. Write its type first, "
+                    "`%s %.*s`, for a copy the arm can change",
+                    name->len, TSTART(name), type_str(local->type, ty, sizeof(ty)), name->len, TSTART(name));
         }
         else if (local && local->bound)
         {
