@@ -69,7 +69,13 @@ static NodeId parse_precedence(Parser *p, int prec)
 
 NodeId parse_expression(Parser *p)
 {
-    return parse_precedence(p, PREC_NONE);
+    NodeId e = parse_precedence(p, PREC_NONE);
+    // `value { arms }`: a block on the same line after a whole expression matches its value.
+    if (e && p->current->kind == TOK_LBRACE && !p->current->nl)
+    {
+        return parse_arm_block(p, e);
+    }
+    return e;
 }
 
 // ---- prefix handlers -------------------------------------------------------------------------

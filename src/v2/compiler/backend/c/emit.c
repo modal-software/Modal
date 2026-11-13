@@ -520,6 +520,215 @@ static void emit_call(Emit *e, NodeId id)
     PUT(e, ")");
 }
 
+// What a pattern test compares: a parameter (by its C name), or a temporary of a match.
+typedef struct
+{
+    NodeId param;
+    int index;
+    const char *temp; // "m_s12": a match's value
+} Subject;
+
+static void out_subject(Emit *e, Subject s)
+{
+    if (s.temp)
+    {
+        put(e, s.temp);
+    }
+    else
+    {
+        out_param_name(e, s.param, s.index);
+    }
+}
+
+// `subject` is a value the pattern takes, as a C condition. A string: its length, then each
+// byte (no libc: no memcmp). A value: ==. A range: both ends, in the subject's own C type.
+static void emit_pattern_cond(Emit *e, const Pattern *pat, TypeId type, Subject s)
+{
+    char num[64];
+    if (pat->kind == PATTERN_TEXT)
+    {
+        static uint8_t text[4096];
+        size_t len = sema_pattern_text(e->u, pat->tok, text, sizeof(text));
+        out_subject(e, s);
+        snprintf(num, sizeof(num), ".len == %zu", len);
+        put(e, num);
+        for (size_t k = 0; k < len && k < sizeof(text); k++)
+        {
+            PUT(e, " && ");
+            out_subject(e, s);
+            snprintf(num, sizeof(num), ".ptr[%zu] == %u", k, (unsigned)text[k]);
+            put(e, num);
+        }
+        return;
+    }
+    // (only == <= >= joined by &&: no parentheses needed inside any && chain)
+    for (int end = 0; end < (pat->kind == PATTERN_RANGE ? 2 : 1); end++)
+    {
+        put(e, end ? " && " : "");
+        out_subject(e, s);
+        put(e, pat->kind == PATTERN_VALUE ? " == (" : end ? " <= (" : " >= (");
+        out_type(e, type, 0);
+        snprintf(num, sizeof(num), ")%lluull", (unsigned long long)(end ? pat->hi : pat->lo));
+        put(e, num);
+    }
+}
+
+// ---- arms (docs/std.md §8) ------------------------------------------------------------------------
+//
+// A match on a value is a GNU statement expression (clang and GCC): its value in m_s<id>, the arms
+// an if / else chain, the result in m_r<id>. A body of arms on the parameters is that chain of
+// returns. A name arm declares its name, bound to the value.
+static void emit_stmt(Emit *e, NodeId id, TypeId ret);
+static int tail_call(Emit *e, NodeId id);
+static void emit_tail(Emit *e, NodeId call);
+
+static int c_statement(const Unit *u, NodeId r)
+{
+    int k = NODE(u, r)->kind;
+    return k == AST_BLOCK || k == AST_RETURN || k == AST_ASSIGN || k == AST_FIELD_DECL;
+}
+
+static void emit_match(Emit *e, NodeId id)
+{
+    Unit *u = e->u;
+    const AstNode *m = NODE(u, id);
+    TypeId type = u->types[id], types[16];
+    Subject subj[16];
+    char temps[16][24];
+    int ns = 0;
+    TypeId ret = e->fn ? sema_fn_ret(&cx.units[SYM(e->fn)->unit], e->fn) : T_VOID;
+    if (m->a)
+    {
+        types[0] = u->types[m->a];
+        snprintf(temps[0], sizeof(temps[0]), "m_s%u", id);
+        subj[ns++] = (Subject){0, 0, temps[0]};
+        PUT(e, "({ ");
+        out_type(e, types[0], m->tok);
+        put(e, " ");
+        put(e, temps[0]);
+        PUT(e, " = ");
+        emit_as(e, m->a, types[0]);
+        PUT(e, "; ");
+        if (type != T_VOID && type != T_NONE)
+        {
+            out_type(e, type, m->tok);
+            char r[24];
+            snprintf(r, sizeof(r), " m_r%u", id);
+            put(e, r);
+            PUT(e, "; ");
+        }
+    }
+    else
+    {
+        int index = 0;
+        for (NodeId p = sema_fn_params(u, e->fn); p && ns < 16; p = NEXT(u, p), index++)
+        {
+            const AstNode *pn = NODE(u, p);
+            const Token *name = TOK(u, pn->tok);
+            if (!(pn->flags & AST_F_CONTEXT) && !is_self_token(TSTART(name), (int)name->len))
+            {
+                types[ns] = sema_param_type(u, e->fn, p);
+                subj[ns++] = (Subject){p, index, NULL};
+            }
+        }
+        PUT(e, "{\n");
+    }
+    for (NodeId arm = m->b; arm; arm = NEXT(u, arm))
+    {
+        const AstNode *a = NODE(u, arm);
+        int last = !NEXT(u, arm);
+        int tests = 0, k = 0;
+        for (NodeId pat = a->a; pat && k < ns; pat = NEXT(u, pat), k++)
+        {
+            Pattern pt;
+            if (!(last && (m->aux & MATCH_LAST_FREE)) && sema_arm_pattern(u, pat, types[k], &pt))
+            {
+                put(e, tests ? " && " : "if (");
+                emit_pattern_cond(e, &pt, types[k], subj[k]);
+                tests++;
+            }
+        }
+        put(e, tests ? ") {\n" : "{\n");
+        k = 0;
+        for (NodeId pat = a->a; pat && k < ns; pat = NEXT(u, pat), k++) // the names it binds
+        {
+            const AstNode *pn = NODE(u, pat);
+            if (pn->kind != AST_IDENT || (!m->a && same_name(u, pn->tok, NODE(u, subj[k].param)->tok)))
+            {
+                continue;
+            }
+            out_type(e, types[k], pn->tok);
+            PUT(e, " v_");
+            out_tok(e, pn->tok);
+            PUT(e, " = ");
+            out_subject(e, subj[k]);
+            PUT(e, "; (void)v_");
+            out_tok(e, pn->tok);
+            PUT(e, ";\n");
+        }
+        NodeId r = a->b;
+        int saved = e->indent;
+        e->indent = 2;
+        if (!m->a && !c_statement(u, r) && ret != T_VOID) // on the parameters: the return
+        {
+            if (tail_call(e, r))
+            {
+                emit_tail(e, r);
+            }
+            else
+            {
+                out_indent(e);
+                PUT(e, "return ");
+                emit_as(e, r, ret);
+                PUT(e, ";\n");
+            }
+        }
+        else if (m->a && type != T_VOID && type != T_NONE)
+        {
+            char line[32];
+            snprintf(line, sizeof(line), "m_r%u = ", id);
+            out_indent(e);
+            put(e, line);
+            emit_as(e, r, type);
+            PUT(e, ";\n");
+        }
+        else
+        {
+            if (!m->a && ret == T_VOID && !c_statement(u, r) && tail_call(e, r))
+            {
+                emit_tail(e, r);
+            }
+            else
+            {
+                emit_stmt(e, r, ret);
+            }
+            if (!m->a)
+            {
+                PUT(e, "        return;\n");
+            }
+        }
+        e->indent = saved;
+        put(e, last ? "}\n" : "} else ");
+    }
+    if (m->a)
+    {
+        if (type != T_VOID && type != T_NONE)
+        {
+            char r[24];
+            snprintf(r, sizeof(r), "m_r%u; })", id);
+            put(e, r);
+        }
+        else
+        {
+            PUT(e, "})");
+        }
+    }
+    else
+    {
+        PUT(e, "}");
+    }
+}
+
 static void emit_expr(Emit *e, NodeId id)
 {
     Unit *u = e->u;

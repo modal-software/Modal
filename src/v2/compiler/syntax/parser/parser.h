@@ -89,6 +89,8 @@ NodeId parse_import_items(Parser *p, const Token *open);
 // parse_stmt.c
 NodeId parse_statement(Parser *p);
 NodeId parse_block(Parser *p);
+int arm_at(const Token *t);                   // a literal pattern then `:` / `,` / `..` starts an arm
+NodeId parse_arm_block(Parser *p, NodeId subject); // `{ arms }`, matching subject (0: the parameters)
 
 // parse_expr.c
 NodeId parse_expression(Parser *p);
