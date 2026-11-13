@@ -48,6 +48,11 @@ typedef enum
     AST_IMPORT_ITEM, // name                                   alias TOKEN index (0 = none)
     AST_SIG, // return type, body (a node, or the TOK_BODY token of a body not parsed yet)
     AST_SITE, // the callee's name: a `site` the compiler filled, `file:line:col: <the call>`
+    // Arms (docs/std.md §8): `value { pattern: result ... }`, or a function body made of arms,
+    // which match its parameters (a = 0). Tried in order; the first that matches gives the result.
+    AST_MATCH,   // '{'          subject (0: the parameters)   arms
+    AST_ARM,     // first token  patterns     result (an expression, a statement or a block)
+    AST_PATTERN, // literal      (aux: PAT_*, as a pattern parameter's)  -- a name is an AST_IDENT
     AST__COUNT,
 } AstNodeKind;
 
