@@ -40,6 +40,7 @@ typedef struct
     int has_self;      // the callable declares `self`
     int implicit_self; // domain config: a bare member name stands for self.name
     int in_callable;
+    int pretyped; // check_args: the arguments were typed already (an overload chosen by them)
     TypeId ret; // declared return type of the callable being checked
     int nlocals;
     int block_base; // first local of the innermost block
@@ -361,6 +362,23 @@ static int exact_value(const Unit *u, NodeId id, Exact *out)
 }
 
 // Reports a constant that does not fit `type`. Returns 1 if it fits (or is no constant).
+// Does argument `id`, if its value is known now, fit `type`'s range? (No report: choosing among
+// overloads, where `u8 f` and `u64 f` both take an unsized literal and its value decides.)
+static int in_bounds(const Unit *u, NodeId id, TypeId type)
+{
+    Exact v;
+    int bits = type == T_U8 || type == T_I8 ? 8 : type == T_U16 || type == T_I16 ? 16
+             : type == T_U32 || type == T_I32 || type == T_INT ? 32 : 64;
+    int is_signed = type == T_I8 || type == T_I16 || type == T_I32 || type == T_INT || type == T_I64;
+    if (!type_is_int(type) || type == T_INT_LIT || !exact_value((Unit *)u, id, &v))
+    {
+        return 1;
+    }
+    Exact lo = is_signed ? -((Exact)1 << (bits - 1)) : 0;
+    Exact hi = is_signed ? ((Exact)1 << (bits - 1)) - 1 : ((Exact)1 << bits) - 1;
+    return v >= lo && v <= hi;
+}
+
 static int check_bounds(Check *c, NodeId id, TypeId type)
 {
     static const struct
@@ -433,6 +451,10 @@ static TypeId prim_type(const Token *t)
         {
             return T_INT;
         }
+        if (s[0] == 'n' && s[1] == 'i' && s[2] == 'l')
+        {
+            return T_VOID; // `nil f(...)`: no result (a type to write first, so it can be overloaded)
+        }
         if (s[0] == 'u' || s[0] == 'i')
         {
             int is_unsigned = s[0] == 'u';
@@ -479,6 +501,36 @@ static TypeId resolve_type(Unit *u, NodeId tn, SymId owner, int loud)
         TypeId elem = resolve_type(u, n->a, owner, loud);
         return elem == T_NONE ? T_NONE : type_make(T_PTR, elem);
     }
+    case AST_TYPE_ARRAY: // [N]T: N a literal or a constant, T a number or bool (for now)
+    {
+        TypeId elem = resolve_type(u, n->a, owner, loud);
+        Exact len;
+        if (elem == T_NONE)
+        {
+            return T_NONE;
+        }
+        if (!exact_value(u, n->b, &len) || len < 1 || len > (1 << 24))
+        {
+            if (loud)
+            {
+                diag_at(u, NODE(u, n->b)->tok, "error",
+                        "an array's length is a number known now, from 1 to 16777216 (a literal or a "
+                        "module-level constant)");
+            }
+            return T_NONE;
+        }
+        if (!(type_is_int(elem) && elem != T_INT_LIT) && elem != T_BOOL)
+        {
+            if (loud)
+            {
+                char got[64];
+                diag_at(u, n->tok, "error", "an array of %s is not supported yet (numbers and bools are)",
+                        type_str(elem, got, sizeof(got)));
+            }
+            return T_NONE;
+        }
+        return type_array(elem, (uint32_t)len);
+    }
     case AST_TYPE_NAME:
     {
         const Token *t = TOK(u, n->tok);
@@ -503,6 +555,10 @@ static TypeId resolve_type(Unit *u, NodeId tn, SymId owner, int loud)
         if (s && SYM(s)->kind == SYM_IMPORT)
         {
             return T_EXTERN;
+        }
+        if (text_is(t, "site"))
+        {
+            return T_STR; // a call's place, filled by the compiler (docs/std.md §2)
         }
         if (loud)
         {
@@ -558,6 +614,10 @@ static TypeId param_type(Unit *u, NodeId param, SymId owner, int loud)
     if (!(NODE(u, param)->flags & AST_F_CONTEXT))
     {
         return t;
+    }
+    if (t == T_STR && text_is(TOK(u, NODE(u, param)->tok), "site"))
+    {
+        return T_STR; // `site: site`: the one context that is not a struct, a string by value
     }
     if (type_kind(t) != T_STRUCT)
     {
@@ -716,6 +776,11 @@ static NameKind find_name(Check *c, const Token *t, SymId *sym, TypeId *type)
     {
         return NAME_SYMBOL; // a function of the domain's mod.modal
     }
+    // the language's primitives (docs/std.md §2), after every declaration: a program's own wins
+    if (text_is(t, "sizeof") || text_is(t, "trap") || type_is_int(prim_type(t)))
+    {
+        return NAME_BUILTIN;
+    }
     return module_wildcard_provides(c->u, TSTART(t), t->len) ? NAME_WILDCARD : NAME_MISSING;
 }
 
@@ -809,17 +874,9 @@ int sema_std_member(const Unit *u, SymId s)
 {
     return is_std_path(u, s, "print", "io")       ? STD_PRINT
            : is_std_path(u, s, "put", "sys")      ? STD_SYS_PUT
-           : is_std_path(u, s, "assert", "debug") ? STD_ASSERT
-           : is_std_path(u, s, "sizeof", "mem")   ? STD_SIZEOF
                                                   : STD_NONE;
 }
 
-static int std_call(const Unit *u, NodeId call, int member)
-{
-    const AstNode *n = NODE(u, call);
-    return n->kind == AST_CALL && NODE(u, n->a)->kind == AST_IDENT && u->refs &&
-           sema_std_member(u, u->refs[n->a]) == member;
-}
 
 int sema_unsized_value(const Unit *u, NodeId id, uint64_t *bits, int *negative)
 {
@@ -836,14 +893,26 @@ int sema_unsized_value(const Unit *u, NodeId id, uint64_t *bits, int *negative)
     return 1;
 }
 
-int sema_is_assert(const Unit *u, NodeId call)
+
+int sema_site_text(const Unit *u, NodeId site, char *text, size_t cap)
 {
-    return std_call(u, call, STD_ASSERT);
+    const Token *callee = TOK(u, NODE(u, site)->tok), *open = callee + 1;
+    int line, col;
+    source_pos(u->src, TSTART(callee), &line, &col);
+    const char *from = TSTART(callee);
+    const char *to = open->kind == TOK_LPAREN && open->match ? TSTART(TOK(u, open->match)) + 1 : from + callee->len;
+    int k = snprintf(text, cap, "%s:%d:%d: %.*s", u->path, line, col, (int)(to - from), from);
+    return k < 0 ? 0 : k >= (int)cap ? (int)cap - 1 : k;
+}
+
+int sema_primitive(const Unit *u, NodeId call)
+{
+    return NODE(u, call)->kind == AST_CALL ? NODE(u, call)->aux : PRIM_NONE;
 }
 
 int sema_sizeof(const Unit *u, NodeId call, uint64_t *out)
 {
-    if (!std_call(u, call, STD_SIZEOF) || !NODE(u, call)->b)
+    if (sema_primitive(u, call) != PRIM_SIZEOF || !NODE(u, call)->b)
     {
         return 0;
     }
@@ -897,25 +966,49 @@ static TypeId check_sizeof(Check *c, NodeId id, uint32_t at)
     return T_INT_LIT;
 }
 
-static TypeId check_assert(Check *c, NodeId id, uint32_t at)
+
+// `u8(x)`: an integer (or bool) converted to the type named, wrapping as a C cast does.
+static TypeId check_convert(Check *c, NodeId id, uint32_t at, TypeId to)
 {
     Unit *u = c->u;
     NodeId arg = NODE(u, id)->b;
+    char name[64];
     if (!arg || NEXT(u, arg))
     {
-        diag_at(u, at, "error", "assert takes one condition: `assert(a == b)`");
+        diag_at(u, at, "error", "a conversion takes one value: `%s(x)`", type_str(to, name, sizeof(name)));
         for (NodeId a = arg; a; a = NEXT(u, a))
         {
             check_expr(c, a);
         }
-        return T_VOID;
+        return to;
     }
     TypeId t = check_expr(c, arg);
-    if (t != T_BOOL && t != T_NONE && t != T_EXTERN)
+    if (!type_is_int(t) && t != T_BOOL && t != T_NONE && t != T_EXTERN)
     {
-        char name[64];
-        diag_at(u, NODE(u, arg)->tok, "error", "assert needs a bool, but this is %s",
-                type_str(t, name, sizeof(name)));
+        char got[64];
+        diag_at(u, NODE(u, arg)->tok, "error", "%s(x) converts an integer, but this is %s",
+                type_str(to, name, sizeof(name)), type_str(t, got, sizeof(got)));
+    }
+    return to;
+}
+
+// `trap(a, b, ...)`: strings to the error output, after the program's own output, then stop.
+static TypeId check_trap(Check *c, NodeId id, uint32_t at)
+{
+    Unit *u = c->u;
+    if (!NODE(u, id)->b)
+    {
+        diag_at(u, at, "error", "trap takes the message to stop with: `trap(\"why\")`");
+    }
+    for (NodeId a = NODE(u, id)->b; a; a = NEXT(u, a))
+    {
+        TypeId t = check_expr(c, a);
+        if (t != T_STR && t != T_NONE && t != T_EXTERN)
+        {
+            char got[64];
+            diag_at(u, NODE(u, a)->tok, "error", "trap writes strings ([]u8), but this is %s",
+                    type_str(t, got, sizeof(got)));
+        }
     }
     return T_VOID;
 }
@@ -981,9 +1074,11 @@ static void check_args(Check *c, NodeId args, SymId fn)
     NodeId param = fn ? fn_params(u, fn) : 0;
     int index = 1;
 
+    int pretyped = c->pretyped;
+    c->pretyped = 0;
     for (NodeId a = args; a; a = NEXT(u, a), index++)
     {
-        TypeId at = check_expr(c, a);
+        TypeId at = pretyped ? u->types[a] : check_expr(c, a);
         if (at == T_VOID)
         {
             diag_at(u, NODE(u, a)->tok, "error", "argument %d has no value", index);
@@ -1004,6 +1099,13 @@ static void check_args(Check *c, NodeId args, SymId fn)
             int nlen;
             const char *name = symbol_name(fn, &nlen);
             const Token *pn = TOK(home, NODE(home, param)->tok);
+            if (NODE(home, param)->flags & AST_F_PATTERN) // a pattern has no name: say the type
+            {
+                diag_at(u, NODE(u, a)->tok, "error", "argument %d of '%.*s' is %s, but it takes %s", index, nlen,
+                        name, type_str(at, got, sizeof(got)), type_str(pt, want, sizeof(want)));
+                param = NEXT(home, param);
+                continue;
+            }
             diag_at(u, NODE(u, a)->tok, "error",
                     "argument %d of '%.*s' is %s, but parameter '%.*s' is %s", index, nlen, name,
                     type_str(at, got, sizeof(got)), pn->len, TSTART(pn),
@@ -1045,6 +1147,11 @@ static void fill_contexts(Check *c, NodeId id, SymId fn, uint32_t at)
         for (int i = c->nlocals - 1; i >= 0 && !found; i--)
         {
             found = c->locals[i].name == want ? &c->locals[i] : NULL;
+        }
+        if (!found && text_is(name, "site") && resolve_type((Unit *)home, NODE(home, p)->a, 0, 0) == T_STR)
+        {
+            args[n++] = (AstNode){.kind = AST_SITE, .tok = at}; // the compiler knows where this call is
+            continue;
         }
         if (!found)
         {
@@ -1197,11 +1304,128 @@ static void check_sys_put(Check *c, NodeId id, uint32_t at)
     check_bounds(c, args, T_U8);
 }
 
+static int same_group(SymId a, SymId b);
+
+// Do two definitions of the set take this many arguments, of other types? Then the argument
+// types choose (docs/std.md §7): the first definition, in the order written, that every argument
+// fits, an unsized literal by its value too (`write(300)` skips `u8 write` for `u64 write`).
+static int typed_overloads(SymId first, int argc)
+{
+    SymId seen = 0;
+    for (SymId s = first; s; s = SYM(s)->kind == SYM_METHOD ? SYM(s)->next_overload : 0)
+    {
+        if (SYM(s)->kind != SYM_METHOD || arity_of(s) != argc)
+        {
+            continue;
+        }
+        if (!seen)
+        {
+            seen = s;
+        }
+        else if (!same_group(seen, s))
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int group_head(SymId first, SymId s) // the first clause of its group: calls go to it
+{
+    for (SymId t = first; t && t != s; t = SYM(t)->next_overload)
+    {
+        if (SYM(t)->kind == SYM_METHOD && same_group(t, s))
+        {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void param_list_str(SymId fn, char *out, size_t cap) // "(u64, []u8)"
+{
+    const Unit *home = &cx.units[SYM(fn)->unit];
+    size_t len = (size_t)snprintf(out, cap, "(");
+    for (NodeId p = fn_params(home, fn); p && len < cap; p = NEXT(home, p))
+    {
+        char t[64];
+        type_str(param_type((Unit *)home, p, SYM(fn)->owner, 0), t, sizeof(t));
+        len += (size_t)snprintf(out + len, cap - len, "%s%s", p == fn_params(home, fn) ? "" : ", ", t);
+    }
+    if (len < cap)
+    {
+        snprintf(out + len, cap - len, ")");
+    }
+}
+
+static SymId select_by_types(Check *c, uint32_t at, NodeId args, SymId first, int argc)
+{
+    Unit *u = c->u;
+    for (NodeId a = args; a; a = NEXT(u, a))
+    {
+        check_expr(c, a);
+    }
+    c->pretyped = 1;
+    for (SymId s = first; s; s = SYM(s)->next_overload)
+    {
+        if (SYM(s)->kind != SYM_METHOD || arity_of(s) != argc || !group_head(first, s))
+        {
+            continue;
+        }
+        const Unit *home = &cx.units[SYM(s)->unit];
+        int ok = 1;
+        NodeId p = fn_params(home, s);
+        for (NodeId a = args; a && p && ok; a = NEXT(u, a), p = NEXT(home, p))
+        {
+            TypeId pt = param_type((Unit *)home, p, SYM(s)->owner, 0);
+            ok = fits(u->types[a], pt) && in_bounds(u, a, pt);
+        }
+        if (ok)
+        {
+            return s;
+        }
+    }
+    char got[160], takes[400];
+    size_t len = (size_t)snprintf(got, sizeof(got), "(");
+    for (NodeId a = args; a && len < sizeof(got); a = NEXT(u, a))
+    {
+        char t[64];
+        len += (size_t)snprintf(got + len, sizeof(got) - len, "%s%s", a == args ? "" : ", ",
+                                type_str(u->types[a], t, sizeof(t)));
+    }
+    if (len < sizeof(got))
+    {
+        snprintf(got + len, sizeof(got) - len, ")");
+    }
+    len = 0;
+    takes[0] = 0;
+    for (SymId s = first; s && len < sizeof(takes); s = SYM(s)->next_overload)
+    {
+        if (SYM(s)->kind == SYM_METHOD && arity_of(s) == argc && group_head(first, s))
+        {
+            char one[160];
+            param_list_str(s, one, sizeof(one));
+            len += (size_t)snprintf(takes + len, sizeof(takes) - len, "%s%s", len ? ", " : "", one);
+        }
+    }
+    int nlen;
+    const char *name = symbol_name(first, &nlen);
+    diag_at(u, at, "error", "no definition of '%.*s' takes %s: it takes %s", nlen, name, got, takes);
+    c->pretyped = 0;
+    return 0;
+}
+
 static TypeId call_function(Check *c, NodeId id, uint32_t at, SymId first)
 {
     NodeId args = NODE(c->u, id)->b;
     int argc = count_list(c->u, args);
-    SymId fn = select_overload(c, at, first, argc);
+    SymId fn = typed_overloads(first, argc) ? select_by_types(c, at, args, first, argc)
+                                            : select_overload(c, at, first, argc);
+    if (!fn && c->pretyped == 0 && typed_overloads(first, argc))
+    {
+        c->u->refs[id] = 0;
+        return T_NONE; // reported, and its arguments are typed
+    }
     if (fn && c->fn && cx.units[SYM(fn)->unit].is_manifest && !cx.units[SYM(c->fn)->unit].is_manifest)
     {
         // compile time only (docs/comptime.md §2.2): a body runs in the program
@@ -1338,6 +1562,15 @@ static TypeId check_call(Check *c, NodeId id)
                 check_args(c, args, 0);
                 return T_NONE;
             }
+            // `assert := import("std").assert`: a binding that names a function is that function
+            SymId bound = SYM(sym)->kind == SYM_IMPORT && sema_std_member(u, sym) == STD_NONE
+                              ? module_binding_function(sym)
+                              : 0;
+            if (bound)
+            {
+                set_type(c, callee, type_make(T_FUNC, bound));
+                return call_function(c, id, cn->tok, bound);
+            }
         }
         else if (kind == NAME_LOCAL && type_kind(type) == T_FUNC)
         {
@@ -1349,13 +1582,25 @@ static TypeId check_call(Check *c, NodeId id)
         }
         set_type(c, callee, T_EXTERN);
         int member = kind == NAME_BUILTIN ? STD_NONE : sema_std_member(u, sym);
-        if (member == STD_SIZEOF)
+        NODE(u, id)->aux = PRIM_NONE;
+        if (kind == NAME_BUILTIN && t->kind != TOK_WRITE)
         {
-            return check_sizeof(c, id, cn->tok);
-        }
-        if (member == STD_ASSERT)
-        {
-            return check_assert(c, id, cn->tok);
+            if (text_is(t, "sizeof"))
+            {
+                NODE(u, id)->aux = PRIM_SIZEOF;
+                return check_sizeof(c, id, cn->tok);
+            }
+            if (text_is(t, "trap"))
+            {
+                NODE(u, id)->aux = PRIM_TRAP;
+                return check_trap(c, id, cn->tok);
+            }
+            TypeId to = prim_type(t);
+            if (type_is_int(to))
+            {
+                NODE(u, id)->aux = PRIM_CONVERT;
+                return check_convert(c, id, cn->tok, to);
+            }
         }
         if (member == STD_SYS_PUT)
         {
@@ -1492,6 +1737,25 @@ static TypeId check_binary(Check *c, const AstNode *n)
     return l == T_INT_LIT ? r : l;
 }
 
+// The domain's configuration (`max_ram`) and the target's facts (`target.os`) are compile-time
+// values (docs/comptime.md §2.2): a module-level position reads them; a body cannot, since a
+// function that did would be compile time only. The error says how to use one there.
+static void compile_time_value(Check *c, SymId s, uint32_t tok)
+{
+    const Unit *home = &cx.units[SYM(s)->unit];
+    if (!c->fn || SYM(s)->kind != SYM_CONST || (!home->provided && !home->is_manifest) ||
+        cx.units[SYM(c->fn)->unit].is_manifest)
+    {
+        return;
+    }
+    const Token *t = TOK(c->u, tok);
+    diag_at(c->u, tok, "error",
+            "'%.*s' is %s, a compile-time value: a function body cannot read it. Give its value a "
+            "name at module level (`n := ... %.*s ...`) and use that name here",
+            t->len, TSTART(t), home->provided ? "a fact of the target" : "configuration of the domain",
+            t->len, TSTART(t));
+}
+
 static TypeId check_selector(Check *c, NodeId id)
 {
     Unit *u = c->u;
@@ -1532,6 +1796,7 @@ static TypeId check_selector(Check *c, NodeId id)
         if (member && SYM(member)->kind == SYM_CONST)
         {
             u->refs[id] = member;
+            compile_time_value(c, member, n->tok);
             return symbol_type(c, member);
         }
     }
@@ -1776,6 +2041,9 @@ static TypeId check_expr(Check *c, NodeId id)
     case AST_NUMBER_LIT:
         type = T_INT_LIT;
         break;
+    case AST_SITE:
+        type = T_STR;
+        break;
     case AST_STRING_LIT:
     {
         const Token *t = TOK(u, n->tok);
@@ -1810,6 +2078,7 @@ static TypeId check_expr(Check *c, NodeId id)
         {
             u->refs[id] = sym;
             type = symbol_type(c, sym);
+            compile_time_value(c, sym, n->tok);
             note_global(c, sym, n->tok);
             note_field(c, sym, n->tok); // a bare member name (implicit_self)
         }
@@ -1873,11 +2142,46 @@ static TypeId check_expr(Check *c, NodeId id)
     case AST_PAREN_GROUP:
         type = check_expr(c, n->a);
         break;
-    case AST_INDEX:
-        check_expr(c, n->a);
-        check_expr(c, n->b);
-        type = T_EXTERN;
+    case AST_INDEX: // a[i]: an array's element, or a []u8's byte (read only)
+    {
+        TypeId base = check_expr(c, n->a);
+        TypeId index = check_expr(c, n->b);
+        if (base == T_NONE || base == T_EXTERN)
+        {
+            type = base;
+            break;
+        }
+        if (!type_is_int(index))
+        {
+            char got[64];
+            diag_at(u, NODE(u, n->b)->tok, "error", "an index is an integer, not %s",
+                    type_str(index, got, sizeof(got)));
+            type = T_NONE;
+            break;
+        }
+        if (base == T_STR)
+        {
+            type = T_U8;
+            break;
+        }
+        if (type_kind(base) != T_ARRAY)
+        {
+            char got[64];
+            diag_at(u, n->tok, "error", "only an array or a []u8 can be indexed, not %s",
+                    type_str(base, got, sizeof(got)));
+            type = T_NONE;
+            break;
+        }
+        Exact k;
+        if (exact_value(u, n->b, &k) && (k < 0 || k >= (Exact)type_len(base)))
+        {
+            char got[64];
+            diag_at(u, NODE(u, n->b)->tok, "error", "index %lld is out of range for %s (0 to %u)",
+                    (long long)k, type_str(base, got, sizeof(got)), type_len(base) - 1);
+        }
+        type = type_ref(base);
         break;
+    }
     case AST_ASSIGN:
     {
         TypeId target = check_expr(c, n->a);
@@ -1886,15 +2190,51 @@ static TypeId check_expr(Check *c, NodeId id)
         SymId field = t->kind == AST_SELECTOR ? u->refs[n->a] : 0;
 
         const Local *local = NULL;
-        if (t->kind == AST_IDENT)
+        // a[i] = v: the element of an array named by a local or a parameter, which must be
+        // mutable (type-first). A []u8 is read only.
+        const AstNode *named = t->kind == AST_INDEX ? NODE(u, t->a) : t;
+        if (named->kind == AST_IDENT)
         {
-            NameId name = token_name(TOK(u, t->tok));
+            NameId name = token_name(TOK(u, named->tok));
             for (int i = c->nlocals - 1; i >= 0 && !local; i--)
             {
                 local = c->locals[i].name == name ? &c->locals[i] : NULL;
             }
         }
-        if (t->kind != AST_IDENT && t->kind != AST_SELECTOR)
+        if (t->kind == AST_INDEX && (named->kind != AST_IDENT || !local ||
+                                     type_kind(u->types[t->a]) != T_ARRAY))
+        {
+            diag_at(u, n->tok, "error",
+                    u->types[t->a] == T_STR ? "a []u8 is read only: its bytes cannot be assigned"
+                                            : "only the elements of an array local or parameter can be assigned");
+        }
+        else if (t->kind == AST_INDEX)
+        {
+            if (!local->mut)
+            {
+                const Token *name = TOK(u, named->tok);
+                diag_at(u, n->tok, "error",
+                        "%s '%.*s' is immutable (declared `%.*s: T`). Declare it type-first, `T %.*s`, "
+                        "to assign to its elements",
+                        local->param ? "parameter" : "local", name->len, TSTART(name), name->len,
+                        TSTART(name), name->len, TSTART(name));
+            }
+            else if (!fits(value, target))
+            {
+                char a[64], b[64];
+                diag_at(u, n->tok, "error", "cannot assign %s to %s", type_str(value, a, sizeof(a)),
+                        type_str(target, b, sizeof(b)));
+            }
+            else
+            {
+                check_bounds(c, n->b, target);
+            }
+        }
+        else if (type_kind(target) == T_ARRAY)
+        {
+            diag_at(u, n->tok, "error", "an array is not assigned whole: assign its elements (`a[i] = v`)");
+        }
+        else if (t->kind != AST_IDENT && t->kind != AST_SELECTOR)
         {
             diag_at(u, n->tok, "error", "only a local or a field can be assigned to");
         }
@@ -2356,32 +2696,14 @@ static void check_decl(Check *c, NodeId decl, Scope *scope, SymId enclosing, int
 
 // The value a pattern parameter matches, as its type holds it. `loud`: report a literal that
 // does not fit the type. Returns 0 if `param` is not a pattern (or does not fit).
-int sema_pattern(Unit *u, NodeId param, SymId owner, uint64_t *value, int loud)
+// One number of a pattern, at token `tok` (negative: a `-` before it), checked against the
+// parameter's type. 0 after reporting (loud) when it does not fit.
+static int pattern_number(Unit *u, uint32_t tok, int negative, TypeId type, uint64_t *value, int loud)
 {
-    const AstNode *n = NODE(u, param);
-    if (!(n->flags & AST_F_PATTERN))
-    {
-        return 0;
-    }
-    const Token *t = TOK(u, n->tok);
-    TypeId type = resolve_type(u, n->a, owner, 0);
-    if (t->kind == TOK_IDENTIFIER) // true / false
-    {
-        if (type != T_BOOL)
-        {
-            if (loud)
-            {
-                diag_at(u, n->tok, "error", "the pattern '%.*s' is a bool, but the parameter is not",
-                        t->len, TSTART(t));
-            }
-            return 0;
-        }
-        *value = t->len == 4;
-        return 1;
-    }
+    const Token *t = TOK(u, tok);
     uint64_t v = 0;
     int overflow = 0;
-    if (!number_value(TSTART(t), t->len, &v, &overflow))
+    if (t->kind != TOK_NUMBER || !number_value(TSTART(t), t->len, &v, &overflow))
     {
         overflow = 1;
     }
@@ -2402,30 +2724,156 @@ int sema_pattern(Unit *u, NodeId param, SymId owner, uint64_t *value, int loud)
         {
             continue;
         }
-        if (overflow || (n->aux ? v > ranges[i].min : v > ranges[i].max))
+        if (overflow || (negative ? v > ranges[i].min : v > ranges[i].max))
         {
             if (loud)
             {
                 char name[32];
-                diag_at(u, n->tok, "error", "the pattern %s%.*s does not fit %s", n->aux ? "-" : "",
+                diag_at(u, tok, "error", "the pattern %s%.*s does not fit %s", negative ? "-" : "",
                         t->len, TSTART(t), type_str(type, name, sizeof(name)));
             }
             return 0;
         }
-        *value = n->aux ? 0 - v : v;
+        *value = negative ? 0 - v : v;
         return 1;
     }
     if (loud && type != T_NONE)
     {
-        diag_at(u, n->tok, "error", "a number pattern needs an integer parameter");
+        diag_at(u, tok, "error", "a number pattern needs an integer parameter");
     }
     return 0;
+}
+
+static int signed_type(TypeId t)
+{
+    return t == T_I8 || t == T_I16 || t == T_I32 || t == T_INT || t == T_I64;
+}
+
+static uint64_t type_max(TypeId t)
+{
+    return t == T_U8 ? 0xff : t == T_U16 ? 0xffff : t == T_U32 ? 0xffffffffu : t == T_U64 ? UINT64_MAX
+         : t == T_I8 ? 0x7f : t == T_I16 ? 0x7fff : t == T_I32 || t == T_INT ? 0x7fffffff
+                                                   : 0x7fffffffffffffffull;
+}
+
+int sema_pattern_of(Unit *u, NodeId param, SymId owner, Pattern *out, int loud)
+{
+    const AstNode *n = NODE(u, param);
+    if (!(n->flags & AST_F_PATTERN))
+    {
+        return 0;
+    }
+    const Token *t = TOK(u, n->tok);
+    TypeId type = resolve_type(u, n->a, owner, 0);
+    *out = (Pattern){.kind = PATTERN_VALUE, .tok = n->tok};
+    if (n->aux & PAT_TEXT)
+    {
+        if (type != T_STR)
+        {
+            if (loud)
+            {
+                diag_at(u, n->tok, "error", "a string pattern needs a []u8 parameter");
+            }
+            return 0;
+        }
+        out->kind = PATTERN_TEXT;
+        return 1;
+    }
+    if (t->kind == TOK_IDENTIFIER) // true / false
+    {
+        if (type != T_BOOL)
+        {
+            if (loud)
+            {
+                diag_at(u, n->tok, "error", "the pattern '%.*s' is a bool, but the parameter is not",
+                        t->len, TSTART(t));
+            }
+            return 0;
+        }
+        out->lo = t->len == 4;
+        return 1;
+    }
+    if (!pattern_number(u, n->tok, (n->aux & PAT_NEG) != 0, type, &out->lo, loud))
+    {
+        return 0;
+    }
+    if (!(n->aux & PAT_RANGE))
+    {
+        return 1;
+    }
+    out->kind = PATTERN_RANGE;
+    out->hi = signed_type(type) ? type_max(type) : type_max(type);
+    if (!(n->aux & PAT_OPEN))
+    {
+        uint32_t hi_tok = n->tok + 2 + ((n->aux & PAT_NEG_HI) ? 1 : 0);
+        if (!pattern_number(u, hi_tok, (n->aux & PAT_NEG_HI) != 0, type, &out->hi, loud))
+        {
+            return 0;
+        }
+    }
+    int empty = signed_type(type) ? (int64_t)out->hi < (int64_t)out->lo : out->hi < out->lo;
+    if (empty)
+    {
+        if (loud)
+        {
+            diag_at(u, n->tok, "error", "this range takes no value: its high end is below its low end");
+        }
+        return 0;
+    }
+    return 1;
+}
+
+// The value of a single-value pattern (a range: its low end; a string: 0).
+int sema_pattern(Unit *u, NodeId param, SymId owner, uint64_t *value, int loud)
+{
+    Pattern pat;
+    if (!sema_pattern_of(u, param, owner, &pat, loud))
+    {
+        return 0;
+    }
+    *value = pat.lo;
+    return 1;
+}
+
+size_t sema_pattern_text(const Unit *u, uint32_t tok, uint8_t *out, size_t cap)
+{
+    const Token *t = TOK(u, tok);
+    size_t n = 0;
+    for (uint32_t i = 1; i + 1 < t->len; i++, n++)
+    {
+        char ch = TSTART(t)[i];
+        if (ch == '\\' && i + 2 < t->len)
+        {
+            char e = TSTART(t)[++i];
+            ch = e == 'n' ? '\n' : e == 't' ? '\t' : e == 'r' ? '\r' : e == '0' ? '\0' : e;
+        }
+        if (n < cap)
+        {
+            out[n] = (uint8_t)ch;
+        }
+    }
+    return n;
 }
 
 static int clause_arity(const Unit *u, SymId fn)
 {
     (void)u;
     return arity_of(fn);
+}
+
+// One clause group: as many parameters, of the same types (patterns aside).
+static int same_group(SymId a, SymId b)
+{
+    const Unit *ua = &cx.units[SYM(a)->unit], *ub = &cx.units[SYM(b)->unit];
+    NodeId pa = fn_params(ua, a), pb = fn_params(ub, b);
+    for (; pa && pb; pa = NEXT(ua, pa), pb = NEXT(ub, pb))
+    {
+        if (param_type((Unit *)ua, pa, SYM(a)->owner, 0) != param_type((Unit *)ub, pb, SYM(b)->owner, 0))
+        {
+            return 0;
+        }
+    }
+    return pa == pb;
 }
 
 // The clause tried after `fn` when its patterns do not match: the next definition with as many
@@ -2441,10 +2889,9 @@ SymId sema_next_clause(Unit *u, SymId fn)
     {
         return 0;
     }
-    int n = clause_arity(u, fn);
     for (SymId s = SYM(fn)->next_overload; s; s = SYM(s)->next_overload)
     {
-        if (clause_arity(u, s) == n)
+        if (SYM(s)->kind == SYM_METHOD && same_group(fn, s))
         {
             return s;
         }

@@ -50,6 +50,15 @@ def body(t, e):
     return ["    %s r" % t, "    r = %s" % e, "    return r"]
 
 
+def call_args(n, rec, t):
+    if rec == "tail":  # deep: thousands of turns, in the stack of one call
+        top = {"u8": 255, "i8": 127}.get(t, 3000)
+        return [str(random.randint(0, top)), str(random.randint(0, 120))]
+    if rec:
+        return [str(random.randint(0, 30))]
+    return [str(random.randint(0, 120)) for _ in range(n)]
+
+
 def program():
     out = ['print := import("std").io.print', ""]
     fns = []
@@ -59,7 +68,12 @@ def program():
         t, name = random.choice(TYPES), "f%d" % i
         types_of[name] = t
         types_of[name + "_copy"] = t
-        if random.random() < 0.3:
+        roll = random.random()
+        if roll < 0.15:  # a loop: the recursion is a tail call (a jump), with an accumulator
+            out.append("%s %s(%s 0, %s acc): acc" % (t, name, t, t))
+            out.append("%s %s(%s n, %s acc): %s(n - 1, %s)" % (t, name, t, t, name, expr(["n", "acc"], 2, False)))
+            fns.append((name, 2, "tail"))
+        elif roll < 0.4:
             out.append("%s %s(%s 0): %s" % (t, name, t, random.randint(0, 9)))
             out.append("%s %s(%s n): %s + %s(n - 1)" % (t, name, t, expr(["n"], 2, False), name))
             fns.append((name, 1, True))
@@ -80,7 +94,7 @@ def program():
     for k in range(random.randint(0, 3)):
         name, n, rec = random.choice(fns)
         t = types_of[name]
-        args = [str(random.randint(0, 30))] if rec else [str(random.randint(0, 120)) for _ in range(n)]
+        args = call_args(n, rec, t)
         call = "%s(%s)" % (name, ", ".join(args))
         out.append("ct%d: %s = %s" % (k, t, call))
         cts.append(("ct%d" % k, call))
@@ -91,7 +105,7 @@ def program():
         parts = ['"v"']
         for _ in range(random.randint(1, 4)):
             name, k, rec = random.choice(fns)
-            args = [str(random.randint(0, 30))] if rec else [str(random.randint(0, 120)) for _ in range(k)]
+            args = call_args(k, rec, types_of[name])
             parts.append("%s(%s)" % (name, ", ".join(args)))
         out.append("    print(%s)" % ", ".join(parts))
     out += ["    return r(%d)" % random.randint(0, 255), "}"]

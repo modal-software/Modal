@@ -37,12 +37,14 @@ typedef enum
     T_SLICE,                  // ref = element type
     T_FUNC,                   // ref = function symbol (first of its overload set)
     T_TYPE,                   // ref = struct symbol: the type itself used as a value, `T.new()`
+    T_ARRAY,                  // ref = element type, len = its count: `[24]u8`
 } TypeKind;
 
 typedef struct
 {
     uint8_t kind;
     uint32_t ref;
+    uint32_t len; // T_ARRAY: the number of elements
 } Type;
 
 typedef struct
@@ -54,6 +56,8 @@ typedef struct
 
 void types_init(void);
 TypeId type_make(TypeKind kind, uint32_t ref);
+TypeId type_array(TypeId elem, uint32_t len); // [len]elem
+uint32_t type_len(TypeId t);                    // a T_ARRAY's count
 TypeKind type_kind(TypeId t);
 uint32_t type_ref(TypeId t);
 int type_is_int(TypeId t); // a sized integer or an integer literal

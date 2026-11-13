@@ -165,6 +165,282 @@ static void keep_if_small(const MirFunc *f)
 }
 
 static MirInst *inst(uint8_t op);
+static void self_loops(MirFunc *f);
+
+// ---- tail calls -------------------------------------------------------------------------------
+//
+// `return g(...)` as the last thing a function does, `call g; copy s0.. = window; ret`, becomes
+// one MIR_CALL_TAIL: g runs in this function's frame and returns to this function's caller, so
+// a recursion through tail calls (every loop of Modal: a clause that calls its function again,
+// a clause falling through to the next) runs in constant stack, in every backend.
+// Not when the function takes the address of one of its slots (a struct it built, a local
+// passed by reference): g's frame takes this one's place, and the address would point into it.
+static void mark_tail_calls(MirFunc *f)
+{
+    for (size_t i = 0; i < f->n; i++)
+    {
+        if (f->code[i].op == MIR_ADDR)
+        {
+            return;
+        }
+    }
+    size_t to = 0;
+    for (size_t i = 0; i < f->n; i++)
+    {
+        MirInst in = f->code[i];
+        f->code[to++] = in;
+        if (in.op != MIR_CALL || in.sub || !SYM(in.imm)->decl || i + 1 + f->ret_slots >= f->n)
+        {
+            continue;
+        }
+        uint32_t r = 0;
+        while (r < f->ret_slots && f->code[i + 1 + r].op == MIR_COPY && f->code[i + 1 + r].d == r &&
+               f->code[i + 1 + r].a == f->frame_size + r)
+        {
+            r++;
+        }
+        if (r < f->ret_slots || f->code[i + 1 + r].op != MIR_RET)
+        {
+            continue;
+        }
+        uint32_t params = mir_param_slots((SymId)in.imm);
+        MirInst *t = &f->code[to - 1];
+        t->sub = MIR_CALL_TAIL;
+        t->b = params; // the slots to move from the window to the frame's start
+        i += 1 + r;    // the copies of the result and the return are the callee's now
+    }
+    f->n = to;
+    self_loops(f);
+}
+
+// A tail call of the function to itself is a loop: the arguments move from the window to the
+// parameters, and the code goes on at a label before the first instruction. No frame is made
+// again and nothing is saved again: in registers, a loop like any other (the native backends'
+// allocator sees the branch back). The new code is in the region of the function being lowered.
+static void self_loops(MirFunc *f)
+{
+    size_t extra = 0;
+    for (size_t i = 0; i < f->n; i++)
+    {
+        if (MIR_IS_TAIL(&f->code[i]) && f->code[i].imm == f->sym)
+        {
+            extra += 1 + f->code[i].b;
+        }
+    }
+    if (!extra)
+    {
+        return;
+    }
+    MirInst *code = (MirInst *)region_push(REGION_MIR, (f->n + extra) * sizeof(MirInst));
+    uint32_t top = f->nlabels++;
+    size_t n = 0;
+    code[n++] = (MirInst){.op = MIR_LABEL, .imm = top};
+    for (size_t i = 0; i < f->n; i++)
+    {
+        const MirInst *in = &f->code[i];
+        if (!(MIR_IS_TAIL(in) && in->imm == f->sym))
+        {
+            code[n++] = *in;
+            continue;
+        }
+        for (uint32_t j = 0; j < in->b; j++) // ascending: the window is above the parameters
+        {
+            code[n++] = (MirInst){.op = MIR_COPY, .d = j, .a = f->frame_size + j};
+        }
+        code[n++] = (MirInst){.op = MIR_JUMP, .imm = top};
+    }
+    f->code = code;
+    f->n = f->cap = n;
+}
+
+// ---- pattern clauses as one function (the native backends) --------------------------------------
+//
+// Each clause is lowered as its own function, and one whose patterns do not match ends with a
+// tail call to the next clause, with the same arguments. A loop in Modal is a clause calling its
+// function again, the first clause: through two functions on every turn. So a clause with a next
+// one is held (copied out of the region) until the next is lowered, then the two become one
+// function: the first's code up to its miss label, then the next's. In that function the
+// recursion is a call to itself, which self_loops makes a loop. The next clause is still
+// generated on its own as well (nothing calls it any more; machine code drops it).
+typedef struct
+{
+    MirFunc f;     // its code and strings are in the arena
+    SymId next;    // the clause it waits for
+    size_t miss;   // where its miss path starts: the copies to the window, then the tail call
+} HeldClause;
+
+#define MAX_HELD 64
+static HeldClause held[MAX_HELD];
+static int nheld;
+
+// Is f's last act `copy window <- parameters; tail next` (the miss path mir_lower writes)?
+// Returns the index of the first copy, or 0.
+static size_t miss_path(const MirFunc *f, SymId next)
+{
+    uint32_t k = f->param_slots;
+    if (f->n < (size_t)k + 2 || !MIR_IS_TAIL(&f->code[f->n - 1]) || f->code[f->n - 1].imm != next ||
+        f->code[f->n - 1].b != k)
+    {
+        return 0;
+    }
+    size_t at = f->n - 1 - k;
+    for (uint32_t j = 0; j < k; j++)
+    {
+        const MirInst *c = &f->code[at + j];
+        if (c->op != MIR_COPY || c->d != f->frame_size + j || c->a != j)
+        {
+            return 0;
+        }
+    }
+    return f->code[at - 1].op == MIR_LABEL ? at : 0;
+}
+
+int mir_clause_hold(const MirFunc *f)
+{
+    SymId next = f->label ? 0 : sema_next_clause(f->u, f->sym);
+    size_t at = next ? miss_path(f, next) : 0;
+    if (!at || nheld == MAX_HELD)
+    {
+        return 0;
+    }
+    HeldClause *h = &held[nheld++];
+    h->f = *f;
+    h->f.code = (MirInst *)arena_alloc(f->n * sizeof(MirInst));
+    memcpy(h->f.code, f->code, f->n * sizeof(MirInst));
+    h->f.cap = f->n;
+    h->f.strings = NULL;
+    h->f.strings_cap = f->nstrings;
+    if (f->nstrings)
+    {
+        h->f.strings = (MirString *)arena_alloc(f->nstrings * sizeof(MirString));
+        for (size_t i = 0; i < f->nstrings; i++)
+        {
+            uint8_t *bytes = (uint8_t *)arena_alloc(f->strings[i].len + 1);
+            memcpy(bytes, f->strings[i].bytes, f->strings[i].len);
+            h->f.strings[i] = (MirString){bytes, f->strings[i].len};
+        }
+    }
+    h->next = next;
+    h->miss = at;
+    return 1;
+}
+
+// The slots of one function placed in a frame of `frame` slots: its window moves up with it.
+static MirSlot reframe(MirSlot s, uint32_t from, uint32_t to)
+{
+    return s >= from ? s - from + to : s;
+}
+
+static void reframe_inst(MirInst *in, uint32_t from, uint32_t to)
+{
+    switch (in->op)
+    {
+    case MIR_CONST:
+    case MIR_STR:
+    case MIR_GLOAD:
+        in->d = reframe(in->d, from, to);
+        break;
+    case MIR_BIN:
+        in->d = reframe(in->d, from, to);
+        in->a = reframe(in->a, from, to);
+        in->b = reframe(in->b, from, to);
+        break;
+    case MIR_STORE:
+        in->a = reframe(in->a, from, to);
+        in->b = reframe(in->b, from, to);
+        break;
+    case MIR_COPY:
+    case MIR_ADDR:
+    case MIR_LOAD:
+    case MIR_BINI:
+    case MIR_NEG:
+    case MIR_NOT:
+    case MIR_NORM:
+        in->d = reframe(in->d, from, to);
+        in->a = reframe(in->a, from, to);
+        break;
+    case MIR_ZERO:
+    case MIR_JZ:
+    case MIR_JNZ:
+    case MIR_GSTORE:
+    case MIR_TRAP:
+        in->a = reframe(in->a, from, to);
+        break;
+    case MIR_WRITE:
+        if (in->sub != MW_SPACE && in->sub != MW_NL)
+        {
+            in->a = reframe(in->a, from, to);
+        }
+        break;
+    default: // LABEL, CALL, RET, JUMP: no slot
+        break;
+    }
+}
+
+int mir_clause_merge(const MirFunc *g, MirFunc *out)
+{
+    int i = 0;
+    while (i < nheld && held[i].next != g->sym)
+    {
+        i++;
+    }
+    if (i == nheld || g->param_slots != held[i].f.param_slots || g->ret_slots != held[i].f.ret_slots)
+    {
+        return 0;
+    }
+    HeldClause h = held[i];
+    held[i] = held[--nheld];
+    const MirFunc *f = &h.f;
+    uint32_t frame = f->frame_size > g->frame_size ? f->frame_size : g->frame_size;
+    size_t n = h.miss + g->n;
+    MirInst *code = (MirInst *)region_push(REGION_MIR, n * sizeof(MirInst));
+    for (size_t k = 0; k < h.miss; k++)
+    {
+        code[k] = f->code[k];
+        reframe_inst(&code[k], f->frame_size, frame);
+    }
+    for (size_t k = 0; k < g->n; k++)
+    {
+        MirInst in = g->code[k];
+        reframe_inst(&in, g->frame_size, frame);
+        if (in.op == MIR_LABEL || MIR_BRANCHES(&in))
+        {
+            in.imm += f->nlabels;
+        }
+        else if (in.op == MIR_STR)
+        {
+            in.imm += f->nstrings;
+        }
+        code[h.miss + k] = in;
+    }
+    MirString *strings = NULL;
+    size_t nstrings = f->nstrings + g->nstrings;
+    if (nstrings)
+    {
+        strings = (MirString *)region_push(REGION_MIR, nstrings * sizeof(MirString));
+        memcpy(strings, f->strings, f->nstrings * sizeof(MirString));
+        memcpy(strings + f->nstrings, g->strings, g->nstrings * sizeof(MirString));
+    }
+    *out = *f;
+    out->code = code;
+    out->n = out->cap = n;
+    out->strings = strings;
+    out->nstrings = out->strings_cap = nstrings;
+    out->nlabels = f->nlabels + g->nlabels;
+    out->frame_size = frame;
+    self_loops(out);
+    return 1;
+}
+
+int mir_clause_release(MirFunc *out)
+{
+    if (!nheld)
+    {
+        return 0;
+    }
+    *out = held[--nheld].f;
+    return 1;
+}
 
 // What cannot be lowered is not reported here: the function is left out, and the reason is
 // kept. It becomes an error only if the program reaches the function (see MirFunc.fail_*), so
@@ -728,6 +1004,11 @@ static int const_value(NodeId id, uint64_t *out)
     case AST_CALL:
     {
         int v = u->types[id] == T_INT_LIT ? -1 : int_variant(u->types[id]);
+        if (sema_primitive(u, id) == PRIM_CONVERT && v >= 0 && n->b && const_value(n->b, out))
+        {
+            *out = mir_normalize(*out, v); // u8(300) is 44, as the program computes it
+            return 1;
+        }
         if (!sema_sizeof(u, id, out))
         {
             return 0;
@@ -761,6 +1042,16 @@ static int const_value(NodeId id, uint64_t *out)
         {
             *out = mir_normalize(computed, v);
             return 1;
+        }
+        if (init && NODE(home, init)->kind == AST_IDENT && v >= 0 &&
+            !(decl->kind == AST_FIELD_DECL && (decl->flags & AST_F_MUT)))
+        {
+            const Token *b = TOK(home, NODE(home, init)->tok); // `has_output := true`
+            if ((b->len == 4 && memcmp(TSTART(b), "true", 4) == 0) || (b->len == 5 && memcmp(TSTART(b), "false", 5) == 0))
+            {
+                *out = b->len == 4;
+                return 1;
+            }
         }
         if (!init || NODE(home, init)->kind != AST_NUMBER_LIT || v < 0 ||
             (decl->kind == AST_FIELD_DECL && (decl->flags & AST_F_MUT)))
@@ -872,6 +1163,23 @@ static MirSlot lower_as(NodeId id, TypeId want)
         return i->d;
     }
     return slot;
+}
+
+// A string literal's bytes, its escapes decoded (as lower_string does), into out; at most cap.
+static size_t decode_string(const Token *t, uint8_t *out, size_t cap)
+{
+    size_t n = 0;
+    for (uint32_t i = 1; i + 1 < t->len && n < cap; i++)
+    {
+        char ch = TSTART(t)[i];
+        if (ch == '\\' && i + 2 < t->len)
+        {
+            char e = TSTART(t)[++i];
+            ch = e == 'n' ? '\n' : e == 't' ? '\t' : e == 'r' ? '\r' : e == '0' ? '\0' : e;
+        }
+        out[n++] = (uint8_t)ch;
+    }
+    return n;
 }
 
 static MirSlot lower_string(const Token *t)
@@ -1511,18 +1819,6 @@ static MirSlot lower_struct_addr(NodeId id)
     return a->d;
 }
 
-// `file:line:col: assertion failed: <the condition as written>`, the message of a failed assert.
-int mir_assert_message(Unit *u, NodeId call, char *text, size_t cap)
-{
-    const AstNode *n = NODE(u, call);
-    const Token *open = TOK(u, NODE(u, n->a)->tok) + 1;
-    int line, col;
-    source_pos(u->src, TSTART(TOK(u, NODE(u, n->a)->tok)), &line, &col);
-    const char *from = TSTART(open) + 1, *to = open->match ? TSTART(TOK(u, open->match)) : from;
-    int k = snprintf(text, cap, "%s:%d:%d: assertion failed: %.*s\n", u->path, line, col, (int)(to - from), from);
-    return k < 0 ? 0 : k >= (int)cap ? (int)cap - 1 : k;
-}
-#define assert_message mir_assert_message
 
 static MirSlot lower_call(NodeId id)
 {
@@ -1541,19 +1837,39 @@ static MirSlot lower_call(NodeId id)
     {
         return emit_const(size); // a constant of the target's layout
     }
-    if (sema_is_assert(u, id))
+    if (sema_primitive(u, id) == PRIM_CONVERT && n->b)
     {
-        // a run-time guard (docs/guards.md §2.2): the condition, then a trap with what failed
+        return lower_as(n->b, u->types[id]); // the width changes: wraps, as a C cast
+    }
+    if (sema_primitive(u, id) == PRIM_TRAP)
+    {
+        // Literal text is joined into one message; anything else (a parameter, a `site`) is
+        // written as a part, then the trap ends with what is left.
         char text[600];
-        assert_message(u, id, text, sizeof(text));
-        MirSlot cond = lower_as(n->b, T_BOOL);
-        uint32_t ok = new_label();
-        MirInst *j = inst(MIR_JNZ);
-        j->a = cond;
-        j->imm = ok;
-        MirSlot m = string_slot((const uint8_t *)text, strlen(text));
-        inst(MIR_TRAP)->a = m;
-        place_label(ok);
+        size_t len = 0;
+        for (NodeId a = n->b; a; a = NEXT(u, a))
+        {
+            const AstNode *an = NODE(u, a);
+            if (an->kind == AST_STRING_LIT)
+            {
+                len += decode_string(TOK(u, an->tok), (uint8_t *)text + len, sizeof(text) - len);
+                continue;
+            }
+            if (len)
+            {
+                MirSlot joined = string_slot((const uint8_t *)text, len); // before the trap reads it
+                MirInst *p = inst(MIR_TRAP);
+                p->sub = MIR_TRAP_PART;
+                p->a = joined;
+                len = 0;
+            }
+            MirSlot part = lower_expr(a);
+            MirInst *p = inst(MIR_TRAP);
+            p->sub = MIR_TRAP_PART;
+            p->a = part;
+        }
+        MirSlot last = string_slot((const uint8_t *)text, len);
+        inst(MIR_TRAP)->a = last;
         return temp();
     }
     if (callee->kind == AST_IDENT && sema_is_std_print(u, u->refs[n->a]))
@@ -1845,6 +2161,12 @@ static MirSlot lower_expr(NodeId id)
         return temp();
     case AST_STRING_LIT:
         return lower_string(t);
+    case AST_SITE:
+    {
+        char text[600];
+        int k = sema_site_text(u, id, text, sizeof(text));
+        return string_slot((const uint8_t *)text, (size_t)k);
+    }
     case AST_IDENT:
     {
         SymId s = u->refs[id];
@@ -2267,6 +2589,68 @@ static void init_globals(void)
     }
 }
 
+// A clause's test: go to `miss` when `slot <op> k` (in variant v).
+static void miss_if(uint8_t op, int v, MirSlot slot, uint64_t k, uint32_t miss)
+{
+    MirSlot t = temp();
+    if (k < 0x10000)
+    {
+        bini(op, v, t, slot, k);
+    }
+    else
+    {
+        MirSlot c = emit_const(k);
+        MirInst *i = inst(MIR_BIN);
+        i->sub = op;
+        i->var = (uint8_t)v;
+        i->d = t;
+        i->a = slot;
+        i->b = c;
+    }
+    MirInst *j = inst(MIR_JNZ);
+    j->a = t;
+    j->imm = miss;
+    L.top = t; // the test's temporary is free again
+}
+
+// A string pattern: the length, then the bytes, eight at a time while eight are left (a string
+// is its length, then its bytes; every target is little-endian), then one at a time.
+static void miss_unless_text(MirSlot s, uint32_t tok, uint32_t miss)
+{
+    uint8_t text[4096];
+    size_t len = sema_pattern_text(L.u, tok, text, sizeof(text));
+    if (len > sizeof(text))
+    {
+        unsupported(tok, "a string pattern longer than 4096 bytes");
+        return;
+    }
+    uint32_t top = L.top;
+    MirSlot w = temp();
+    MirInst *ld = inst(MIR_LOAD);
+    ld->var = MV_U64;
+    ld->d = w;
+    ld->a = s;
+    ld->imm = 0;
+    miss_if(MB_NE, MV_U64, w, len, miss);
+    for (size_t at = 0; at < len;)
+    {
+        int wide = len - at >= 8;
+        uint64_t k = 0;
+        for (int b = 0; b < (wide ? 8 : 1); b++)
+        {
+            k |= (uint64_t)text[at + (size_t)b] << (8 * b);
+        }
+        ld = inst(MIR_LOAD);
+        ld->var = wide ? MV_U64 : MV_U8;
+        ld->d = w;
+        ld->a = s;
+        ld->imm = 8 + at;
+        miss_if(MB_NE, wide ? MV_U64 : MV_U8, w, k, miss);
+        at += wide ? 8 : 1;
+    }
+    L.top = top;
+}
+
 static void region_start(void);
 
 int mir_lower(Unit *u, SymId fn, MirFunc *out)
@@ -2329,38 +2713,37 @@ int mir_lower(Unit *u, SymId fn, MirFunc *out)
     {
         MirSlot slot = next_slot;
         next_slot += slots_of(sema_param_type(u, fn, p));
-        uint64_t value;
-        if (!sema_pattern(u, p, SYM(fn)->owner, &value, 0))
+        Pattern pat;
+        if (!sema_pattern_of(u, p, SYM(fn)->owner, &pat, 0))
         {
             continue;
         }
-        // The clause's test: an argument that differs from its pattern sends the call on.
-        int v = int_variant(sema_param_type(u, fn, p));
-        uint64_t k = mir_normalize(value, v);
-        MirSlot t = temp();
-        if (k < 0x10000)
+        // The clause's test: an argument its pattern does not take sends the call on.
+        TypeId pt = sema_param_type(u, fn, p);
+        if (pat.kind == PATTERN_TEXT)
         {
-            MirInst *i = inst(MIR_BINI);
-            i->sub = MB_NE;
-            i->var = (uint8_t)v;
-            i->d = t;
-            i->a = slot;
-            i->imm = k;
+            miss_unless_text(slot, pat.tok, miss);
+            continue;
         }
-        else
+        int v = int_variant(pt);
+        if (pat.kind == PATTERN_VALUE)
         {
-            MirSlot c = emit_const(k);
-            MirInst *i = inst(MIR_BIN);
-            i->sub = MB_NE;
-            i->var = (uint8_t)v;
-            i->d = t;
-            i->a = slot;
-            i->b = c;
+            miss_if(MB_NE, v, slot, mir_normalize(pat.lo, v), miss);
+            continue;
         }
-        MirInst *j = inst(MIR_JNZ);
-        j->a = t;
-        j->imm = miss;
-        L.top = t; // the test's temporary is free again
+        int is_signed = v >= MV_I8;
+        uint64_t lo = mir_normalize(pat.lo, v), hi = mir_normalize(pat.hi, v);
+        uint64_t min = is_signed ? mir_normalize(1ull << ((8u << (v - MV_I8)) - 1), v) : 0;
+        uint64_t max = mir_normalize(is_signed ? (1ull << ((8u << (v - MV_I8)) - 1)) - 1
+                                               : ~0ull >> (64 - (8u << (v - MV_U8))), v);
+        if (lo != min)
+        {
+            miss_if(MB_LT, v, slot, lo, miss);
+        }
+        if (hi != max)
+        {
+            miss_if(MB_GT, v, slot, hi, miss);
+        }
     }
 
     if (u->id == 0 && SYM(fn)->owner == 0 && scope_find(u->scope, "main", 4) == fn)
@@ -2403,6 +2786,10 @@ int mir_lower(Unit *u, SymId fn, MirFunc *out)
         mir_optimize(out);
     }
     keep_if_small(out); // a small body, kept to be spliced into later callers
+    if (L.errors == 0)
+    {
+        mark_tail_calls(out); // after keeping: a spliced body must return to its caller
+    }
     return L.errors == 0;
 }
 
@@ -2504,6 +2891,7 @@ void mir_reset(void)
     nglobals = 0;
     nsink_helpers = 0;
     nest_base = NULL;
+    nheld = 0;
 }
 
 // A module-level initializer as a function of no parameters that returns it (in slot 0), for the
@@ -2550,7 +2938,7 @@ void mir_print(const MirFunc *f, FILE *out)
     static const char *const ops[MIR__COUNT] = {
         "const", "copy", "addr", "zero", "load", "store", "bin", "bini", "neg",
         "not",   "norm", "label", "jz",  "jnz",  "call",  "ret", "str",  "write", "gload", "gstore",
-        "trap",
+        "trap",  "jump",
     };
     static const char *const bins[MB__COUNT] = {"add", "sub", "mul", "div", "eq",
                                                 "ne",  "lt",  "le",  "gt",  "ge"};
@@ -2586,6 +2974,11 @@ void mir_print(const MirFunc *f, FILE *out)
         {
             int l;
             const char *callee = symbol_name((SymId)in->imm, &l);
+            if (in->sub == MIR_CALL_TAIL)
+            {
+                fprintf(out, "    tail %.*s (%u slots)\n", l, callee, in->b);
+                break;
+            }
             fprintf(out, "    call %.*s\n", l, callee);
             break;
         }

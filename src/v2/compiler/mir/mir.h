@@ -43,19 +43,37 @@ typedef enum
     MIR_LABEL,  // imm = label number
     MIR_JZ,     // if a == 0: go to label imm
     MIR_JNZ,    // if a != 0: go to label imm
-    MIR_CALL,   // call function `imm` (a SymId); its frame starts at frame_size
+    MIR_CALL,   // call function `imm` (a SymId); its frame starts at frame_size (sub: MIR_CALL_TAIL)
     MIR_RET,    // return (the result, if any, is already in slot 0)
     MIR_STR,    // d = address of string `imm` (an index in MirFunc.strings)
     MIR_WRITE,  // write a, as `sub` (MirWrite)
     MIR_GLOAD,  // d = module-level variable imm
     MIR_GSTORE, // module-level variable imm = a
-    MIR_TRAP,   // end the program: a holds the address of its message (a division by zero)
+    MIR_TRAP,   // end the program: a holds the address of its message (a division by zero);
+                // sub MIR_TRAP_PART: write that message part to the error output, and go on
+    MIR_JUMP,   // go to label imm. Made after the optimizer only (a tail call to the function
+                // itself becomes a loop: mir/lower.c, self_loops), so the optimizer never sees one
     MIR__COUNT,
 } MirOp;
 
 // LOAD / STORE `sub`: a device register (a field placed with `@`). It is done exactly as written,
 // in its order: never forwarded, merged or removed, and nothing is moved across it.
 #define MIR_MEM_DEVICE 1
+
+// MIR_TRAP `sub`: one part of a message (`trap(a, b)` writes a, then b, then ends). It ends no
+// block; only the final trap (sub 0) does.
+#define MIR_TRAP_PART 1
+// MIR_CALL `sub`: a tail call (`return g(...)` as the function's last act). The arguments are in
+// the window as for any call; the backend moves them to slots 0 .. b - 1 (b: the callee's
+// parameter slots) and goes to the callee in this function's place, which returns to this
+// function's caller with the result in slot 0. Its frame is this one's: the depth does not grow,
+// so recursion through tail calls runs in constant stack (Modal's loops are recursion).
+#define MIR_CALL_TAIL 1
+#define MIR_IS_TAIL(in) ((in)->op == MIR_CALL && (in)->sub == MIR_CALL_TAIL)
+#define MIR_ENDS(in) ((in)->op == MIR_RET || ((in)->op == MIR_TRAP && (in)->sub != MIR_TRAP_PART) || MIR_IS_TAIL(in))
+// Has a label as a target (imm); and does the code after it not follow from it?
+#define MIR_BRANCHES(in) ((in)->op == MIR_JZ || (in)->op == MIR_JNZ || (in)->op == MIR_JUMP)
+#define MIR_NO_FALLTHROUGH(in) (MIR_ENDS(in) || (in)->op == MIR_JUMP)
 
 typedef enum
 {
@@ -166,6 +184,14 @@ void mir_print(const MirFunc *f, FILE *out); // --mir
 // The output routines the program's calls need (one per `put` method and kind of value, made
 // when a call first needs it): lowers the next one into *out. Returns 0 when none is left.
 int mir_next_helper(MirFunc *out);
+
+// Pattern clauses as one function (native backends; registry.c codegen_function): hold keeps a
+// clause that ends by going on to its next one (1: held, do not generate it yet); merge gives the
+// held clause waiting for g joined with g (call again with the result, for a chain); release
+// gives what is still held at the end, as it was.
+int mir_clause_hold(const MirFunc *f);
+int mir_clause_merge(const MirFunc *g, MirFunc *out);
+int mir_clause_release(MirFunc *out);
 
 // Module-level variables live at the bottom of the value stack: how many there are (for the
 // entry, which puts main's frame after them).

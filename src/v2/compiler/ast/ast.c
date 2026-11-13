@@ -31,6 +31,7 @@ static const char *ast_kind_name(AstNodeKind kind)
     static const char *const names[AST__COUNT] = {
         [AST_NONE] = "none",
         [AST_SIG] = "signature",
+        [AST_SITE] = "site",
         [AST_MODULE] = "module",
         [AST_STRUCT_DECL] = "struct",
         [AST_FIELD_DECL] = "field",
@@ -125,6 +126,15 @@ static void str_type(Str *s, const Unit *u, NodeId type)
             str_puts(s, "[]");
             type = n->a;
             continue;
+        case AST_TYPE_ARRAY:
+        {
+            const Token *len = TOK(u, NODE(u, n->b)->tok);
+            str_puts(s, "[");
+            str_put(s, TSTART(len), len->len);
+            str_puts(s, "]");
+            type = n->a;
+            continue;
+        }
         case AST_TYPE_PTR:
             str_puts(s, "*");
             type = n->a;
@@ -263,6 +273,7 @@ static int print_visit(Unit *u, NodeId id, uint32_t depth, void *ctx)
         break;
     case AST_TYPE_NAME:
     case AST_TYPE_SLICE:
+    case AST_TYPE_ARRAY:
     case AST_TYPE_PTR:
         str_type(&s, u, id);
         printf(" %s", text);

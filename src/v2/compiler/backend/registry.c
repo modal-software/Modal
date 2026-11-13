@@ -106,11 +106,20 @@ void codegen_failure_clear(SymId fn) // reported once
     }
 }
 
-// A machine-code backend gets the functions of every file (the program is linked as a whole and
-// its unreachable functions dropped); the C backend, those of the entry file.
+static void emit_mir(MirFunc *f)
+{
+    if (cx.show_mir)
+    {
+        mir_print(f, stdout);
+    }
+    codegen.backend->function_mir(&codegen.job, f);
+}
+
+// Every backend gets the functions of every file: the program is linked as a whole (machine
+// code drops what is unreachable; the C compiler, unused static functions).
 void codegen_function(Unit *u, SymId fn)
 {
-    if (!codegen.begun || (u->id != 0 && !codegen.backend->function_mir))
+    if (!codegen.begun)
     {
         return;
     }
@@ -121,11 +130,15 @@ void codegen_function(Unit *u, SymId fn)
         MirFunc f;
         if (!cx.errors && mir_lower(u, fn, &f))
         {
-            if (cx.show_mir)
+            if (!mir_clause_hold(&f)) // a clause that goes on to the next: joined with it below
             {
-                mir_print(&f, stdout);
+                emit_mir(&f);
             }
-            codegen.backend->function_mir(&codegen.job, &f);
+            MirFunc joined;
+            for (const MirFunc *g = &f; mir_clause_merge(g, &joined); g = &joined)
+            {
+                emit_mir(&joined);
+            }
         }
         else if (!cx.errors && f.fail_what)
         {
@@ -166,6 +179,10 @@ int codegen_finish(void)
     if (codegen.backend->function_mir && !cx.errors) // the routines the compiler made
     {
         MirFunc f;
+        while (mir_clause_release(&f)) // clauses whose next one never came: as they are
+        {
+            emit_mir(&f);
+        }
         while (mir_next_helper(&f))
         {
             if (cx.show_mir)

@@ -28,6 +28,7 @@ typedef struct
     FILE *out;
     int errors;
     int indent;
+    SymId fn;   // the function being written
     size_t len; // bytes waiting in buf
     char buf[1 << 16];
 } Emit;
@@ -124,7 +125,14 @@ static void out_fn_name(Emit *e, SymId fn)
         put(e, name);
         return;
     }
+    const Unit *home = &cx.units[SYM(fn)->unit];
     PUT(e, "m_");
+    if (home->id != 0) // a function of another file: its file's number keeps the names apart
+    {
+        char prefix[16];
+        snprintf(prefix, sizeof(prefix), "u%u_", (unsigned)home->id);
+        put(e, prefix);
+    }
     if (SYM(fn)->owner)
     {
         out_sym_name(e, SYM(fn)->owner);
@@ -134,7 +142,7 @@ static void out_fn_name(Emit *e, SymId fn)
     if (SYM(fn)->flags & SYM_F_MUT)
     {
         int arity = 0;
-        for (NodeId p = sema_fn_params(e->u, fn); p; p = NEXT(e->u, p))
+        for (NodeId p = sema_fn_params(home, fn); p; p = NEXT(home, p))
         {
             arity++;
         }
@@ -151,7 +159,7 @@ static void out_fn_name(Emit *e, SymId fn)
             put_c(e, digits[--n]);
         }
         // a later clause of the same arity: _2, _3, ... (calls go to the first)
-        int clause = sema_clause_index(e->u, fn);
+        int clause = sema_clause_index((Unit *)home, fn);
         if (clause > 0)
         {
             put_c(e, '_');
@@ -419,23 +427,33 @@ static void emit_call(Emit *e, NodeId id)
     const AstNode *n = NODE(u, id);
     const AstNode *callee = NODE(u, n->a);
     SymId fn = u->refs[id];
+    if (sema_primitive(u, id) == PRIM_CONVERT && n->b)
+    {
+        PUT(e, "((");
+        out_type(e, u->types[id], n->tok);
+        PUT(e, ")(");
+        emit_expr(e, n->b);
+        PUT(e, "))");
+        return;
+    }
+    if (sema_primitive(u, id) == PRIM_TRAP)
+    {
+        PUT(e, "(");
+        for (NodeId a = n->b; a; a = NEXT(u, a))
+        {
+            PUT(e, "m_trap_part(");
+            emit_expr(e, a);
+            PUT(e, "), ");
+        }
+        PUT(e, "m_trap(\"\"))");
+        return;
+    }
     uint64_t size;
     if (sema_sizeof(u, id, &size))
     {
         char num[32];
         snprintf(num, sizeof(num), "%llu", (unsigned long long)size);
         put(e, num);
-        return;
-    }
-    if (sema_is_assert(u, id))
-    {
-        char text[600];
-        int k = mir_assert_message(u, id, text, sizeof(text));
-        PUT(e, "((");
-        emit_expr(e, n->b);
-        PUT(e, ") ? (void)0 : m_trap(");
-        put_c_bytes(e, (const uint8_t *)text, (size_t)k);
-        PUT(e, "))");
         return;
     }
 
@@ -459,7 +477,7 @@ static void emit_call(Emit *e, NodeId id)
     }
     if (!fn)
     {
-        unsupported(e, callee->tok, "calling something that is not a function of this file");
+        unsupported(e, callee->tok, "calling something that is not a Modal function");
         PUT(e, "0");
         return;
     }
@@ -491,11 +509,12 @@ static void emit_call(Emit *e, NodeId id)
         first = 0;
     }
 
-    NodeId param = sema_fn_params(u, fn);
-    for (NodeId a = n->b; a && param; a = NEXT(u, a), param = NEXT(u, param))
+    Unit *home = &cx.units[SYM(fn)->unit];
+    NodeId param = sema_fn_params(home, fn);
+    for (NodeId a = n->b; a && param; a = NEXT(u, a), param = NEXT(home, param))
     {
         put(e, first ? "" : ", ");
-        emit_as(e, a, sema_param_type(u, fn, param));
+        emit_as(e, a, sema_param_type(home, fn, param));
         first = 0;
     }
     PUT(e, ")");
@@ -534,6 +553,17 @@ static void emit_expr(Emit *e, NodeId id)
             PUT(e, "u"); // C's own type for it, said out loud (no warning)
         }
         break;
+    case AST_SITE:
+    {
+        char text[600];
+        int k = sema_site_text(u, id, text, sizeof(text));
+        char len[24];
+        PUT(e, "((m_str){(const uint8_t *)");
+        put_c_bytes(e, (const uint8_t *)text, (size_t)k);
+        snprintf(len, sizeof(len), ", %d})", k);
+        put(e, len);
+        break;
+    }
     case AST_STRING_LIT:
         PUT(e, "M_STR(");
         for (uint32_t i = 0; i < t->len; i++) // a Modal string may span lines; a C one may not
@@ -748,6 +778,62 @@ static void emit_expr(Emit *e, NodeId id)
 
 // ---- statements ------------------------------------------------------------------------------
 
+// Is the call `id`, as the last act of function e->fn, one C can make a tail call (M_TAIL:
+// clang's and GCC's musttail)? Modal's loops are recursion, and without it a long one runs out
+// of stack: at -O0 always (`--run` builds without flags), and even optimized when the C
+// compiler chooses not to. musttail needs the same prototype on both sides; with only numbers
+// and bools passed, no argument can point into the frame that the callee takes over.
+static int scalar_type(TypeId t)
+{
+    return t == T_VOID || t == T_BOOL || (type_is_int(t) && t != T_INT_LIT);
+}
+
+static int tail_call(Emit *e, NodeId id)
+{
+    Unit *u = e->u;
+    const AstNode *n = NODE(u, id);
+    SymId caller = e->fn;
+    if (n->kind != AST_CALL || !caller || (n->flags & AST_F_SINK) || sema_primitive(u, id))
+    {
+        return 0;
+    }
+    const AstNode *callee_node = NODE(u, n->a);
+    SymId fn = u->refs[id];
+    uint64_t size;
+    if (callee_node->kind != AST_IDENT || TOK(u, callee_node->tok)->kind == TOK_WRITE || !fn ||
+        SYM(fn)->kind != SYM_METHOD || !SYM(fn)->decl || SYM(fn)->owner || SYM(caller)->owner ||
+        sema_is_std_print(u, u->refs[n->a]) || sema_std_member(u, u->refs[n->a]) == STD_SYS_PUT ||
+        sema_sizeof(u, id, &size))
+    {
+        return 0;
+    }
+    Unit *home = &cx.units[SYM(fn)->unit], *mine = &cx.units[SYM(caller)->unit];
+    TypeId ret = sema_fn_ret(home, fn);
+    if (ret != sema_fn_ret(mine, caller) || !scalar_type(ret))
+    {
+        return 0;
+    }
+    NodeId p = sema_fn_params(home, fn), q = sema_fn_params(mine, caller);
+    for (; p && q; p = NEXT(home, p), q = NEXT(mine, q))
+    {
+        TypeId t = sema_param_type(home, fn, p);
+        if (t != sema_param_type(mine, caller, q) || !scalar_type(t) || t == T_VOID)
+        {
+            return 0;
+        }
+    }
+    return !p && !q;
+}
+
+// `return call` as a tail call when it can be one (the value needs no conversion: the same type).
+static void emit_tail(Emit *e, NodeId call)
+{
+    out_indent(e);
+    PUT(e, "M_TAIL ");
+    emit_call(e, call);
+    PUT(e, ";\n");
+}
+
 static void emit_stmt(Emit *e, NodeId id, TypeId ret)
 {
     Unit *u = e->u;
@@ -797,6 +883,11 @@ static void emit_stmt(Emit *e, NodeId id, TypeId ret)
         PUT(e, ";\n");
         return;
     case AST_RETURN:
+        if (n->a && tail_call(e, n->a))
+        {
+            emit_tail(e, n->a);
+            return;
+        }
         out_indent(e);
         PUT(e, "return");
         if (n->a)
@@ -866,23 +957,50 @@ static void emit_clause_test(Emit *e, SymId fn, TypeId ret)
     int index = 0, first = 1;
     for (NodeId p = sema_fn_params(u, fn); p; p = NEXT(u, p), index++)
     {
-        uint64_t value;
-        if (!sema_pattern(u, p, SYM(fn)->owner, &value, 0))
+        Pattern pat;
+        if (!sema_pattern_of(u, p, SYM(fn)->owner, &pat, 0))
         {
             continue;
         }
         put(e, first ? "" : " && ");
-        out_param_name(e, p, index);
-        char num[32];
-        snprintf(num, sizeof(num), " == (");
-        put(e, num);
-        out_type(e, sema_param_type(u, fn, p), NODE(u, p)->tok);
-        snprintf(num, sizeof(num), ")%lluull", (unsigned long long)value);
-        put(e, num);
         first = 0;
+        char num[64];
+        if (pat.kind == PATTERN_TEXT) // its length, then each byte (no libc: no memcmp)
+        {
+            static uint8_t text[4096];
+            size_t len = sema_pattern_text(u, pat.tok, text, sizeof(text));
+            PUT(e, "(");
+            out_param_name(e, p, index);
+            snprintf(num, sizeof(num), ".len == %zu", len);
+            put(e, num);
+            for (size_t k = 0; k < len && k < sizeof(text); k++)
+            {
+                PUT(e, " && ");
+                out_param_name(e, p, index);
+                snprintf(num, sizeof(num), ".ptr[%zu] == %u", k, (unsigned)text[k]);
+                put(e, num);
+            }
+            PUT(e, ")");
+            continue;
+        }
+        // A value: ==. A range: both ends, compared in the parameter's own C type.
+        for (int end = 0; end < (pat.kind == PATTERN_RANGE ? 2 : 1); end++)
+        {
+            put(e, end ? " && " : "");
+            out_param_name(e, p, index);
+            put(e, pat.kind == PATTERN_VALUE ? " == (" : end ? " <= (" : " >= (");
+            out_type(e, sema_param_type(u, fn, p), NODE(u, p)->tok);
+            snprintf(num, sizeof(num), ")%lluull", (unsigned long long)(end ? pat.hi : pat.lo));
+            put(e, num);
+        }
     }
     PUT(e, "))\n    {\n        ");
-    put(e, ret == T_VOID ? "" : "return ");
+    int tail = scalar_type(ret) && !SYM(fn)->owner; // the same prototype: a tail call
+    for (NodeId p = sema_fn_params(u, fn); p && tail; p = NEXT(u, p))
+    {
+        tail = scalar_type(sema_param_type(u, fn, p));
+    }
+    put(e, tail ? "M_TAIL " : ret == T_VOID ? "" : "return ");
     out_fn_name(e, next);
     PUT(e, "(");
     first = 1;
@@ -898,7 +1016,7 @@ static void emit_clause_test(Emit *e, SymId fn, TypeId ret)
         out_param_name(e, p, index);
         first = 0;
     }
-    put(e, ret == T_VOID ? ");\n        return;\n    }\n" : ");\n    }\n");
+    put(e, ret == T_VOID && !tail ? ");\n        return;\n    }\n" : ");\n    }\n");
 }
 
 static void emit_function(Emit *e, SymId fn)
@@ -910,6 +1028,7 @@ static void emit_function(Emit *e, SymId fn)
     emit_signature(e, fn);
     PUT(e, "\n{\n");
     e->indent = 1;
+    e->fn = fn;
     if (SYM(fn)->owner)
     {
         PUT(e, "    (void)self;\n");
@@ -917,19 +1036,34 @@ static void emit_function(Emit *e, SymId fn)
     emit_clause_test(e, fn, ret);
     if (n->flags & AST_F_ONELINE)
     {
-        out_indent(e);
-        PUT(e, "return ");
-        emit_as(e, fn_body(u, (NodeId)(n - u->nodes.data)), ret);
-        PUT(e, ";\n");
+        NodeId body = fn_body(u, (NodeId)(n - u->nodes.data));
+        if (tail_call(e, body))
+        {
+            emit_tail(e, body);
+        }
+        else
+        {
+            out_indent(e);
+            PUT(e, "return ");
+            emit_as(e, body, ret);
+            PUT(e, ";\n");
+        }
     }
     else
     {
         for (NodeId s = NODE(u, fn_body(u, (NodeId)(n - u->nodes.data)))->a; s; s = NEXT(u, s))
         {
+            // A void function's last statement, a call of the same prototype: a tail call too.
+            if (!NEXT(u, s) && ret == T_VOID && tail_call(e, s))
+            {
+                emit_tail(e, s);
+                continue;
+            }
             emit_stmt(e, s, ret);
         }
     }
     e->indent = 0;
+    e->fn = 0;
     PUT(e, "}\n\n");
 }
 
@@ -1050,8 +1184,8 @@ static const char *const prelude =
     "#include <stdbool.h>\n"
     "#include <stddef.h>\n"
     "#include <stdint.h>\n"
-    "#include <stdio.h>\n"
-    "#include <stdlib.h>\n"
+    "#include <stdlib.h>\n" // exit
+    "#include <unistd.h>\n" // write: the only system interface the program uses (docs/std.md §1)
     "\n"
     "typedef struct\n"
     "{\n"
@@ -1060,24 +1194,59 @@ static const char *const prelude =
     "} m_str;\n"
     "\n"
     "#define M_STR(s) ((m_str){(const uint8_t *)(s), sizeof(s) - 1})\n"
+    // A tail call (`return f(...)` of the same prototype): Modal's loops are recursion.
+    "#if defined(__has_attribute)\n"
+    "#if __has_attribute(musttail)\n"
+    "#define M_TAIL __attribute__((musttail)) return\n"
+    "#endif\n"
+    "#endif\n"
+    "#ifndef M_TAIL\n"
+    "#define M_TAIL return\n"
+    "#endif\n"
     "#if defined(__GNUC__) || defined(__clang__)\n"
     "#define M_RT static inline __attribute__((unused))\n"
     "#else\n"
     "#define M_RT static inline\n"
     "#endif\n"
     "\n"
-    "M_RT void m_write_str(m_str s) { fwrite(s.ptr, 1, s.len, stdout); }\n"
+    // The program's output: a buffer written with write(2) when full and at the end, as the
+    // native runtime does. No stdio: the C backend's programs use only write and exit. (mrt_:
+    // no Modal name becomes it, so a program's own `out` or `put` cannot clash.)
+    "static uint8_t mrt_buf[4096];\n"
+    "static size_t mrt_len;\n"
+    "M_RT void mrt_out(int fd, const uint8_t *p, size_t n) {\n"
+    "    while (n) { ssize_t k = write(fd, p, n); if (k <= 0) return; p += k; n -= (size_t)k; }\n"
+    "}\n"
+    "M_RT void mrt_flush(void) { mrt_out(1, mrt_buf, mrt_len); mrt_len = 0; }\n"
+    "M_RT void mrt_put(const uint8_t *p, size_t n) {\n"
+    "    if (n > sizeof(mrt_buf) - mrt_len) { mrt_flush(); if (n > sizeof(mrt_buf)) { mrt_out(1, p, n); return; } }\n"
+    "    for (size_t i = 0; i < n; i++) mrt_buf[mrt_len + i] = p[i];\n"
+    "    mrt_len += n;\n"
+    "}\n"
+    "M_RT void m_write_str(m_str s) { mrt_put(s.ptr, s.len); }\n"
     // A trap: the output so far, then the place, then status 1 (as the native backends do).
-    "M_RT void m_trap(const char *m) { fflush(stdout); fputs(m, stderr); exit(1); }\n"
+    "M_RT void m_trap(const char *m) {\n"
+    "    size_t n = 0; while (m[n]) n++;\n"
+    "    mrt_flush(); mrt_out(2, (const uint8_t *)m, n); exit(1);\n"
+    "}\n"
+    // a part of trap(a, b, ...) (docs/std.md): written after the output so far, then the next
+    "M_RT void m_trap_part(m_str s) { mrt_flush(); mrt_out(2, s.ptr, s.len); }\n"
     // Division: a zero divisor traps; the smallest signed value by -1 wraps (as `0 - x` does).
     "#define M_DIV(T) M_RT T m_div_##T(T a, T b, const char *m) { if (!b) m_trap(m); \\\n"
     "    if ((T)-1 < 0 && b == (T)-1) return (T)(0 - (uint64_t)a); return (T)(a / b); }\n"
     "M_DIV(uint8_t) M_DIV(uint16_t) M_DIV(uint32_t) M_DIV(uint64_t)\n"
     "M_DIV(int8_t) M_DIV(int16_t) M_DIV(int32_t) M_DIV(int64_t)\n"
-    "M_RT void m_write_int(long long n) { printf(\"%lld\", n); }\n"
-    "M_RT void m_write_uint(unsigned long long n) { printf(\"%llu\", n); }\n"
-    "M_RT void m_write_bool(bool b) { fputs(b ? \"true\" : \"false\", stdout); }\n"
-    "M_RT void m_write_byte(uint8_t b) { putchar(b); }\n"
+    "M_RT void m_write_uint(unsigned long long n) {\n"
+    "    uint8_t b[24]; int i = 24;\n"
+    "    do { b[--i] = (uint8_t)('0' + n % 10); n /= 10; } while (n);\n"
+    "    mrt_put(b + i, (size_t)(24 - i));\n"
+    "}\n"
+    "M_RT void m_write_int(long long n) {\n"
+    "    if (n < 0) { uint8_t minus = '-'; mrt_put(&minus, 1); m_write_uint(0ull - (unsigned long long)n); }\n"
+    "    else m_write_uint((unsigned long long)n);\n"
+    "}\n"
+    "M_RT void m_write_bool(bool b) { m_write_str(b ? M_STR(\"true\") : M_STR(\"false\")); }\n"
+    "M_RT void m_write_byte(uint8_t b) { mrt_put(&b, 1); }\n"
     "\n"
     "/* output through the program's `out`: every byte to its put method */\n"
     "typedef void (*m_sink)(void *, uint8_t);\n"
@@ -1165,14 +1334,29 @@ static void backend_c_begin(const BackendJob *job)
     emit_state = (Emit){.u = u, .out = job->out};
     Emit *e = &emit_state;
 
-    // This backend translates one file. An import of another Modal file needs the linker's
-    // module graph on the C side as well, which is the next step.
-    for (NodeId id = 1; id < u->nodes.size; id++)
+    // Other files (std, imported modules) give their functions to the program: each is emitted
+    // in its own file's context, named m_u<file>_... Their types and module-level values are
+    // the next step, and are reported where they are declared.
+    for (uint16_t i = 1; i < cx.nunits; i++)
     {
-        if (NODE(u, id)->kind == AST_IMPORT && NODE(u, id)->aux)
+        Unit *m = &cx.units[i];
+        if (m->is_manifest || m->broken || m->provided) // (target's values are compile time only)
         {
-            unsupported(e, NODE(u, id)->tok, "importing another Modal file");
+            continue;
         }
+        e->u = m;
+        for (NodeId d = NODE(m, m->root)->a; d; d = NEXT(m, d))
+        {
+            const AstNode *n = NODE(m, d);
+            int value = n->kind == AST_FIELD_DECL ||
+                        (n->kind == AST_DEFINE && NODE(m, n->a)->kind != AST_FN_LIT && !ast_import_root(m, n->a));
+            if (n->kind == AST_STRUCT_DECL || value)
+            {
+                unsupported(e, n->tok, n->kind == AST_STRUCT_DECL ? "a type in an imported file"
+                                                                  : "a module-level value in an imported file");
+            }
+        }
+        e->u = u;
     }
 
     put(e, prelude);
@@ -1268,11 +1452,18 @@ static void backend_c_begin(const BackendJob *job)
     //    any order. Signatures need only the declarations.
     for (SymId fn = 1; fn < cx.syms.size; fn++)
     {
-        if (SYM(fn)->unit == u->id && SYM(fn)->kind == SYM_METHOD && emittable(e, fn, 1))
+        Unit *home = &cx.units[SYM(fn)->unit];
+        if (SYM(fn)->kind != SYM_METHOD || home->is_manifest || home->broken)
+        {
+            continue;
+        }
+        e->u = home;
+        if (emittable(e, fn, 1))
         {
             emit_signature(e, fn);
             PUT(e, ";\n");
         }
+        e->u = u;
     }
     PUT(e, "\n");
 
@@ -1310,10 +1501,13 @@ static void backend_c_function(const BackendJob *job, SymId fn)
                     "a function literal that uses a local of the function around it (a closure)");
         return;
     }
+    Unit *caller = emit_state.u;
+    emit_state.u = &cx.units[SYM(fn)->unit];
     if (emittable(&emit_state, fn, 0))
     {
         emit_function(&emit_state, fn);
     }
+    emit_state.u = caller;
 }
 
 static int backend_c_end(const BackendJob *job)
@@ -1333,13 +1527,13 @@ static int backend_c_end(const BackendJob *job)
     {
         PUT(e, "int main(void)\n{\n    ");
         out_fn_name(e, entry);
-        PUT(e, "();\n    return 0;\n}\n");
+        PUT(e, "();\n    mrt_flush();\n    return 0;\n}\n");
     }
     else
     {
-        PUT(e, "int main(void)\n{\n    return (int)");
+        PUT(e, "int main(void)\n{\n    int status = (int)");
         out_fn_name(e, entry);
-        PUT(e, "();\n}\n");
+        PUT(e, "();\n    mrt_flush();\n    return status;\n}\n");
     }
 
     flush(e);

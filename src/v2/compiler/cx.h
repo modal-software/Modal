@@ -97,6 +97,7 @@ struct Unit
     size_t max_body;     // bytes of the largest deferred body: a bound on its tokens and nodes
     uint32_t nimports;   // import(...) expressions in this file
     uint8_t is_manifest; // this file is a mod.modal
+    uint8_t provided;    // made by the compiler, not read from disk: import("target")
     uint8_t bound;       // the domain's mod.modal binds this module: it is part of the face
     uint8_t broken;      // did not scan, parse or declare cleanly: later phases skip it
     uint8_t cached;      // --cache: its bodies were checked in an earlier run; skipped now
@@ -180,6 +181,7 @@ typedef struct
     uint8_t timing; // --time: measure the per-function phases too
     uint8_t cache;  // --cache: skip checking the bodies of files that have not changed
     uint8_t show_mir; // --mir: print each function's MIR as it is generated
+    const char *std_dir; // where std's .modal files are ($MODAL_STD, or std/ next to the compiler); NULL: none
     uint8_t kinds;    // --sig: note what each function does, for its kind (sema/check.c)
     uint8_t stats;    // --stats: backends report what they produced (sizes, memory)
     const MachineTarget *target; // see target_get()
@@ -351,6 +353,7 @@ void module_body_nodes(Unit *u, NodeId from);
 void module_check_paths(Unit *u, NodeId from, NodeId to);
 void contract_print(void); // derived public signatures of every loaded domain
 SymId module_member(Unit *u, NodeId base, uint32_t name_tok); // `base.name` through imports
+SymId module_binding_function(SymId binding); // the function `f := import(x).f` names, or 0
 const char *domain_name(uint16_t domain);
 
 // What a mod.modal says for a domain; `fallback` when it does not say.
@@ -359,6 +362,7 @@ uint64_t domain_config_int(uint16_t domain, const char *key, uint64_t fallback);
 // Could a wildcard import of this file (`import(x).*`) supply `name`?
 int module_wildcard_provides(Unit *u, const char *name, size_t len);
 SymId module_domain_function(const Unit *u, const Token *name); // declared in the domain's mod.modal
+Unit *module_target_unit(void); // import("target"): made by the compiler
 
 // cache.c: Go's build cache, at the granularity of a file. Check-only runs.
 uint64_t hash_bytes(const void *data, size_t len, uint64_t seed);
@@ -404,18 +408,26 @@ typedef enum
     STD_NONE,
     STD_PRINT,
     STD_SYS_PUT, // one byte to the system output
-    STD_ASSERT,  // std.debug.assert(cond): at module level the compiler checks it, in a body the program
-    STD_SIZEOF,  // std.mem.sizeof(T or value): bytes in the target's C layout, a constant
 } StdMember;
 int sema_std_member(const Unit *u, SymId binding);
+// The language's primitives (docs/std.md §2): predeclared names, never keywords. The checker marks
+// a call to one in the call node's aux.
+enum
+{
+    PRIM_NONE,
+    PRIM_SIZEOF,  // sizeof(T or value)
+    PRIM_CONVERT, // u8(x): to the call's type, wrapping
+    PRIM_TRAP,    // trap(a, b, ...): its strings to the error output, then stop
+};
+int sema_primitive(const Unit *u, NodeId call);
+// The text of a `site` (AST_SITE at node id): `file:line:col: <the call as written>`.
+int sema_site_text(const Unit *u, NodeId site, char *text, size_t cap);
 // `sizeof(T)` at node `call`: its value (an unsized constant). 0 if call is not one.
 int sema_sizeof(const Unit *u, NodeId call, uint64_t *out);
 // `assert(cond)` at node `call`: 1 if call is one.
-int sema_is_assert(const Unit *u, NodeId call);
 // `n` naming an unsized module-level constant (`n := 5`, docs/comptime.md §3.1): its exact value as
 // 64 bits, and whether it is negative. 0 if id names no such constant.
 int sema_unsized_value(const Unit *u, NodeId id, uint64_t *bits, int *negative);
-int mir_assert_message(Unit *u, NodeId call, char *text, size_t cap); // what a failed assert says
 void sema_check(Unit *u);
 void sema_kinds_reset(void); // a fresh compilation: no function facts yet
 // Compile time (sema/comptime.c, docs/comptime.md step 1): module-level initializers the compiler
@@ -441,6 +453,23 @@ void comptime_capture(Unit *u, SymId fn); // check.c hands it the function it ju
 const char *sema_fn_kind(SymId fn, char *buf, size_t size);
 // Clauses (literal patterns: `u8 fact(u8 0): 1`).
 int sema_pattern(Unit *u, NodeId param, SymId owner, uint64_t *value, int loud);
+// What a pattern parameter matches: one value, a range (both ends included, in the parameter's
+// variant), or a string (its literal token; the bytes from sema_pattern_text).
+enum
+{
+    PATTERN_VALUE = 1,
+    PATTERN_RANGE,
+    PATTERN_TEXT,
+};
+typedef struct
+{
+    int kind;
+    uint64_t lo, hi; // PATTERN_VALUE: lo. PATTERN_RANGE: lo .. hi (an open range: hi is the max)
+    uint32_t tok;    // PATTERN_TEXT: the string literal
+} Pattern;
+int sema_pattern_of(Unit *u, NodeId param, SymId owner, Pattern *out, int loud);
+// A string literal's bytes, escapes decoded; returns the length (at most cap are written).
+size_t sema_pattern_text(const Unit *u, uint32_t tok, uint8_t *out, size_t cap);
 SymId sema_next_clause(Unit *u, SymId fn); // tried when fn's patterns do not match; 0: none
 int sema_clause_index(Unit *u, SymId fn);  // 0 for the first clause, which calls go to
 TypeId sema_type_of(Unit *u, NodeId type_node, SymId owner); // a written type, quietly

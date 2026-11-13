@@ -26,6 +26,7 @@ typedef enum
     AST_VAL_DECL,    // 'val'        items        source                 val (a as b): import(x)
     AST_TYPE_NAME,   // first ident  (aux = number of extra `.segment`s)
     AST_TYPE_SLICE,  // '['          element
+    AST_TYPE_ARRAY,  // '['          element, length (an expression: a literal or a constant's name)
     AST_TYPE_PTR,    // '*'          pointee
     AST_TYPE_STRUCT, // 'struct'     members
     AST_FN_LIT,      // '('          params       signature (AST_SIG: return type, body)
@@ -46,6 +47,7 @@ typedef enum
     AST_IMPORT_PICK, // '('          chain        items                  import(x).(a, b as c)
     AST_IMPORT_ITEM, // name                                   alias TOKEN index (0 = none)
     AST_SIG, // return type, body (a node, or the TOK_BODY token of a body not parsed yet)
+    AST_SITE, // the callee's name: a `site` the compiler filled, `file:line:col: <the call>`
     AST__COUNT,
 } AstNodeKind;
 
@@ -61,7 +63,7 @@ enum
     // a reference that calls fill in by themselves from the caller's value of that name.
     AST_F_CONTEXT = 1u << 4,
     // A type-first parameter with a literal where its name would be (`u8 fact(u8 0): 1`): a
-    // pattern. Its token is the literal; aux = 1 for a negative number.
+    // pattern. Its token is the literal (the first one of a range); aux: PAT_* below.
     AST_F_PATTERN = 1u << 5,
     // The last element of the list it belongs to. A list's elements are consecutive nodes, so
     // the next sibling of `id` is `id + 1` unless this is set: no link is stored (16-byte nodes).
@@ -72,6 +74,17 @@ enum
     // On an AST_FIELD_DECL: `b` is where it is placed (`@ n`), not an initializer. In a struct,
     // its offset; at module level, the address of a device (memory-mapped registers).
     AST_F_PLACED = 1u << 7,
+};
+
+// A pattern parameter's aux (AST_F_PATTERN). A range `lo..hi` is tokens lo, `..`, hi (each with
+// its `-` before it when negative); `lo..` has no hi and takes every value from lo up.
+enum
+{
+    PAT_NEG = 1u << 0,    // the literal (or the range's low end) is negative
+    PAT_RANGE = 1u << 1,  // `lo..hi`, both ends included
+    PAT_NEG_HI = 1u << 2, // the high end is negative
+    PAT_OPEN = 1u << 3,   // `lo..`: no high end
+    PAT_TEXT = 1u << 4,   // a string literal (`[]u8 "help"`)
 };
 
 typedef struct AstNode

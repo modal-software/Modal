@@ -84,8 +84,21 @@ static int same_pattern(const Unit *u, NodeId pa, NodeId pb)
     {
         return pat_a == pat_b;
     }
-    const Token *ta = TOK(u, a->tok), *tb = TOK(u, b->tok);
-    return a->aux == b->aux && ta->len == tb->len && memcmp(TSTART(ta), TSTART(tb), ta->len) == 0;
+    if (a->aux != b->aux)
+    {
+        return 0;
+    }
+    // the literal, and for a range its `..` and high end: the same text
+    uint32_t span = (a->aux & PAT_RANGE) ? ((a->aux & PAT_OPEN) ? 2 : (a->aux & PAT_NEG_HI) ? 4 : 3) : 1;
+    for (uint32_t k = 0; k < span; k++)
+    {
+        const Token *ta = TOK(u, a->tok + k), *tb = TOK(u, b->tok + k);
+        if (ta->len != tb->len || memcmp(TSTART(ta), TSTART(tb), ta->len) != 0)
+        {
+            return 0;
+        }
+    }
+    return 1;
 }
 
 static int has_patterns(const Unit *u, NodeId params)
@@ -117,6 +130,24 @@ static int same_signature(const Unit *u, NodeId pa, NodeId pb)
     while (pa && pb)
     {
         if (!type_equal(u, NODE(u, pa)->a, NODE(u, pb)->a) || !same_pattern(u, pa, pb))
+        {
+            return 0;
+        }
+        pa = NEXT(u, pa);
+        pb = NEXT(u, pb);
+    }
+    return pa == pb;
+}
+
+// The same parameter types in the same order, patterns aside: definitions of one clause group.
+// Overloads with other types are other functions (chosen at the call by the argument types).
+static int same_types(const Unit *u, NodeId pa, NodeId pb)
+{
+    pa = skip_self(u, pa);
+    pb = skip_self(u, pb);
+    while (pa && pb)
+    {
+        if (!type_equal(u, NODE(u, pa)->a, NODE(u, pb)->a))
         {
             return 0;
         }
@@ -189,7 +220,7 @@ static void declare_callable(Unit *u, Scope *scope, SymId owner, uint32_t tok, N
                        has_patterns(u, mine) ? " with the same patterns" : " with the same parameter types");
             return;
         }
-        if (arity(u, theirs) == arity(u, mine) && !has_patterns(u, theirs))
+        if (same_types(u, theirs, mine) && !has_patterns(u, theirs))
         {
             redeclared(u, tok, s,
                        ": that definition takes every value, so this clause would never run. Clauses "
@@ -437,7 +468,7 @@ void sema_declare(Unit *u)
         int n = arity(u, params), later = 0;
         for (SymId t = sym->next_overload; t && !later; t = SYM(t)->next_overload)
         {
-            later = arity(u, sema_callable_params(u, SYM(t)->decl)) == n;
+            later = same_types(u, sema_callable_params(u, SYM(t)->decl), params);
         }
         if (!later)
         {

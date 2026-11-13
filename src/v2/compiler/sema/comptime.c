@@ -16,6 +16,7 @@
 // the compilation, so a function runs as many times as needed for the price of one lowering.
 #include "v2/compiler/mir/mir.h"
 #include "v2/compiler/sema/types.h"
+#include <stdarg.h>
 #include <string.h>
 
 typedef struct
@@ -282,6 +283,11 @@ typedef struct
     uint64_t steps, max_steps;
     uint32_t max_depth;
     uint8_t overflow; // stopped for want of value stack: run again with more
+    uint8_t trapped;  // stopped by a trap: its text is in trap_text
+    struct CtFrame *frames; // the interpreter's own call stack (no C recursion per Modal call)
+    uint32_t frames_cap;
+    char trap_text[400];
+    int trap_len;
     char why[200];    // the reason it stopped
     struct
     {
@@ -309,6 +315,18 @@ static int stop(Vm *vm, SymId fn, const char *what)
     return 0;
 }
 
+// stop() with a formatted reason. Its buffer lives here, not in run(): run recurses once per
+// Modal call (comptime_depth deep), so its frame must stay small.
+static __attribute__((noinline, format(printf, 3, 4))) int stopf(Vm *vm, SymId fn, const char *fmt, ...)
+{
+    char what[240];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(what, sizeof(what), fmt, ap);
+    va_end(ap);
+    return stop(vm, fn, what);
+}
+
 // Is [p, p + n) memory the evaluation owns (its value stack, or a string it made)?
 static int reachable(const Vm *vm, uint64_t p, uint64_t n)
 {
@@ -328,29 +346,35 @@ static int reachable(const Vm *vm, uint64_t p, uint64_t n)
     return 0;
 }
 
-static int run(Vm *vm, SymId sym, const CtFunc *f, size_t fp, uint32_t depth)
+// A caller waiting for its callee: the interpreter keeps these itself, so a Modal call is not a
+// C call and comptime_depth is not bounded by the compiler's own stack.
+struct CtFrame
 {
-    if (depth > vm->max_depth)
-    {
-        char what[120];
-        snprintf(what, sizeof(what), "calls nest deeper than comptime_depth = %u (mod.modal) allows", vm->max_depth);
-        return stop(vm, 0, what);
-    }
+    SymId sym;
+    const CtFunc *f;
+    size_t fp, k; // its frame, and the call it is at
+};
+
+static int run(Vm *vm, SymId sym, const CtFunc *f, size_t fp)
+{
+    uint32_t depth = 0;
     if (fp + f->uses + 1 > vm->cap)
     {
         vm->overflow = 1;
         return stop(vm, 0, "uses more value stack than the compiler gives it");
     }
     uint64_t *s = vm->stack + fp;
-    for (size_t k = 0; k < f->n; k++)
+    for (size_t k = 0;; k++)
     {
+        if (k >= f->n)
+        {
+            return stop(vm, sym, "ends without returning");
+        }
         const MirInst *in = &f->code[k];
         if (++vm->steps > vm->max_steps)
         {
-            char what[120];
-            snprintf(what, sizeof(what), "takes more steps than comptime_steps = %llu (mod.modal) allows",
-                     (unsigned long long)vm->max_steps);
-            return stop(vm, 0, what);
+            return stopf(vm, 0, "takes more steps than comptime_steps = %llu (mod.modal) allows",
+                         (unsigned long long)vm->max_steps);
         }
         uint64_t r;
         switch (in->op)
@@ -427,6 +451,9 @@ static int run(Vm *vm, SymId sym, const CtFunc *f, size_t fp, uint32_t depth)
             break;
         case MIR_LABEL:
             break;
+        case MIR_JUMP:
+            k = f->label[in->imm];
+            break;
         case MIR_JZ:
         case MIR_JNZ:
             if ((s[in->a] == 0) == (in->op == MIR_JZ))
@@ -442,19 +469,64 @@ static int run(Vm *vm, SymId sym, const CtFunc *f, size_t fp, uint32_t depth)
             {
                 int len;
                 const char *name = symbol_name(callee, &len);
-                char what[160];
-                snprintf(what, sizeof(what), "calls '%.*s', which the compiler cannot run (%s)", len, name, g->why);
-                return stop(vm, sym, what);
+                return stopf(vm, sym, "calls '%.*s', which the compiler cannot run (%s)", len, name, g->why);
             }
-            if (!run(vm, callee, g, fp + f->frame_size, depth + 1))
+            if (in->sub == MIR_CALL_TAIL) // in this frame's place: no deeper
             {
-                return 0;
+                if (fp + g->uses + 1 > vm->cap)
+                {
+                    vm->overflow = 1;
+                    return stop(vm, 0, "uses more value stack than the compiler gives it");
+                }
+                memmove(s, s + f->frame_size, in->b * sizeof(uint64_t));
+                sym = callee;
+                f = g;
+                k = (size_t)-1;
+                break;
             }
+            if (depth + 1 > vm->max_depth)
+            {
+                return stopf(vm, 0, "calls nest deeper than comptime_depth = %u (mod.modal) allows", vm->max_depth);
+            }
+            size_t callee_fp = fp + f->frame_size;
+            if (callee_fp + g->uses + 1 > vm->cap)
+            {
+                vm->overflow = 1;
+                return stop(vm, 0, "uses more value stack than the compiler gives it");
+            }
+            if (depth == vm->frames_cap)
+            {
+                uint32_t cap = vm->frames_cap ? vm->frames_cap * 2 : 64;
+                struct CtFrame *grown = (struct CtFrame *)arena_alloc(cap * sizeof(struct CtFrame));
+                if (depth)
+                {
+                    memcpy(grown, vm->frames, depth * sizeof(struct CtFrame));
+                }
+                vm->frames = grown;
+                vm->frames_cap = cap;
+            }
+            vm->frames[depth++] = (struct CtFrame){sym, f, fp, k};
+            sym = callee;
+            f = g;
+            fp = callee_fp;
             s = vm->stack + fp;
+            k = (size_t)-1; // the loop goes on at the callee's first instruction
             break;
         }
         case MIR_RET:
-            return 1;
+        {
+            if (!depth)
+            {
+                return 1;
+            }
+            const struct CtFrame *back = &vm->frames[--depth];
+            sym = back->sym;
+            f = back->f;
+            fp = back->fp;
+            k = back->k; // the loop goes on after the call
+            s = vm->stack + fp;
+            break;
+        }
         case MIR_STR:
         {
             const MirString *str = &f->strings[in->imm];
@@ -478,31 +550,39 @@ static int run(Vm *vm, SymId sym, const CtFunc *f, size_t fp, uint32_t depth)
             return stop(vm, sym, "uses a mutable module variable (in the compiler it has only its first value)");
         case MIR_TRAP:
         {
-            // the message the program would print: a division by zero, or a failed assert
-            const char *what = "divides by zero";
-            char said[200];
+            // The text the program would print: its parts gather until the final trap. A
+            // division by zero says so; any other (a failed assert) is given as it is.
             for (int b = 0; b < vm->nblocks; b++)
             {
                 if ((uint64_t)(uintptr_t)vm->blocks[b].at == s[in->a])
                 {
-                    const char *text = (const char *)vm->blocks[b].at + 8;
-                    int len = (int)vm->blocks[b].n;
-                    len -= len && text[len - 1] == '\n';
-                    const char *rel = memchr(text, ' ', (size_t)len); // after "file:line:col:"
-                    if (rel && !(len >= 16 && memcmp(text + len - 16, "division by zero", 16) == 0))
-                    {
-                        snprintf(said, sizeof(said), "fails at %.*s", len, text);
-                        what = said;
-                    }
+                    int room = (int)sizeof(vm->trap_text) - 1 - vm->trap_len;
+                    int n = (int)vm->blocks[b].n < room ? (int)vm->blocks[b].n : room;
+                    memcpy(vm->trap_text + vm->trap_len, vm->blocks[b].at + 8, (size_t)n);
+                    vm->trap_len += n;
+                    break;
                 }
             }
-            return stop(vm, sym, what);
+            if (in->sub == MIR_TRAP_PART)
+            {
+                break;
+            }
+            vm->trapped = 1;
+            int len = vm->trap_len;
+            const char *text = vm->trap_text;
+            len -= len && text[len - 1] == '\n';
+            vm->trap_text[len] = 0;
+            vm->trap_len = len;
+            if (len >= 16 && memcmp(text + len - 16, "division by zero", 16) == 0)
+            {
+                return stop(vm, sym, "divides by zero");
+            }
+            return stopf(vm, sym, "fails at %.*s", len, text);
         }
         default:
             return stop(vm, sym, "does what the compiler cannot run");
         }
     }
-    return stop(vm, sym, "ends without returning");
 }
 
 // ---- module-level initializers --------------------------------------------------------------------
@@ -543,6 +623,8 @@ static void vm_ready(Vm *vm, const Unit *u)
     vm->why[0] = 0;
     vm->nblocks = 0;
     vm->overflow = 0;
+    vm->trapped = 0;
+    vm->trap_len = 0;
 }
 
 // Runs `expr` of `type` in the compiler; its value is in vm->stack from slot 0. 0: it could not
@@ -569,7 +651,7 @@ static int evaluate(Vm *vm, Unit *u, NodeId expr, TypeId type, SymId s, const ch
         if (top.uses + 1 <= vm->cap)
         {
             memset(vm->stack, 0, (top.uses + 1) * 8);
-            if (run(vm, 0, &top, 0, 0))
+            if (run(vm, 0, &top, 0))
             {
                 return 1;
             }
@@ -591,63 +673,65 @@ static int evaluate(Vm *vm, Unit *u, NodeId expr, TypeId type, SymId s, const ch
     }
 }
 
-// A module-level statement: `assert(sizeof(header) == 16)`, or a call made for its asserts. The
-// compiler runs it; a failed assert is an error at that line, with both sides of a comparison.
+// A module-level statement: `assert(sizeof(header) == 16)`, or any call (a function run for
+// the asserts inside it). The compiler runs it (docs/comptime.md §1). When it traps with its own
+// place (std's assert takes a `site`), the trap's text is the error, and a comparison as its first
+// argument gets both sides' values. Nothing here knows assert by name.
 static void statement(Vm *vm, Unit *u, NodeId d)
 {
     const AstNode *n = NODE(u, d);
     uint32_t at = NODE(u, n->a)->tok;
     const char *why;
-    if (sema_is_assert(u, d) && n->b)
+    TypeId type = u->types[d];
+    type = type == T_BOOL || type_is_int(type) ? type : T_VOID;
+    if (evaluate(vm, u, d, type == T_INT_LIT ? T_I64 : type, 0, &why))
     {
-        NodeId cond = n->b;
-        if (!evaluate(vm, u, cond, T_BOOL, 0, &why))
-        {
-            diag_at(u, at, "error", "the compiler cannot check this assert: %s%s", why ? why : vm->why,
-                    why ? " is not supported yet" : "");
-            return;
-        }
-        if (vm->stack[0])
-        {
-            return;
-        }
-        char text[600], values[200] = "";
-        mir_assert_message(u, d, text, sizeof(text));
-        const AstNode *c = NODE(u, cond);
-        const Token *op = TOK(u, c->tok);
-        TypeId lt = c->kind == AST_BIN_OP ? u->types[c->a] : T_NONE;
-        if (c->kind == AST_BIN_OP && (type_is_int(lt) || lt == T_BOOL) &&
-            (op->kind == TOK_LT || op->kind == TOK_GT || op->kind == TOK_LE || op->kind == TOK_GE ||
-             op->kind == TOK_NEQ || (op->len == 2 && memcmp(TSTART(op), "==", 2) == 0)))
-        {
-            // both sides, as the program would compute them
-            uint64_t v[2];
-            NodeId side[2] = {c->a, c->b};
-            int ok = 1;
-            for (int i = 0; i < 2 && ok; i++)
-            {
-                TypeId t = u->types[side[i]] == T_INT_LIT ? T_I64 : u->types[side[i]];
-                ok = evaluate(vm, u, side[i], t, 0, &why);
-                v[i] = vm->stack[0];
-            }
-            int is_signed = lt == T_I8 || lt == T_I16 || lt == T_I32 || lt == T_I64 || lt == T_INT || lt == T_INT_LIT;
-            if (ok)
-            {
-                snprintf(values, sizeof(values), is_signed ? " (%lld %.*s %lld)" : " (%llu %.*s %llu)",
-                         (long long)v[0], op->len, TSTART(op), (long long)v[1]);
-            }
-        }
-        size_t len = strlen(text);
-        len -= len && text[len - 1] == '\n';
-        const char *rel = strstr(text, "assertion failed");
-        diag_at(u, at, "error", "%.*s%s", (int)(text + len - rel), rel, values);
         return;
     }
-    if (!evaluate(vm, u, d, T_VOID, 0, &why))
+    if (why || !vm->trapped)
     {
         diag_at(u, at, "error", "the compiler cannot run this statement: %s%s", why ? why : vm->why,
                 why ? " is not supported yet" : "");
+        return;
     }
+    char here[600];
+    int line, col;
+    source_pos(u->src, TSTART(TOK(u, at)), &line, &col);
+    int k = snprintf(here, sizeof(here), "%s:%d:%d: ", u->path, line, col);
+    if (k <= 0 || strncmp(vm->trap_text, here, (size_t)k) != 0)
+    {
+        diag_at(u, at, "error", "the compiler cannot run this statement: %s", vm->why);
+        return;
+    }
+    char text[400];
+    snprintf(text, sizeof(text), "%s", vm->trap_text + k);
+    char values[200] = "";
+    NodeId cond = n->b;
+    const AstNode *c = cond ? NODE(u, cond) : NULL;
+    const Token *op = c ? TOK(u, c->tok) : NULL;
+    TypeId lt = c && c->kind == AST_BIN_OP ? u->types[c->a] : T_NONE;
+    if (c && c->kind == AST_BIN_OP && (type_is_int(lt) || lt == T_BOOL) &&
+        (op->kind == TOK_LT || op->kind == TOK_GT || op->kind == TOK_LE || op->kind == TOK_GE ||
+         op->kind == TOK_NEQ || (op->len == 2 && memcmp(TSTART(op), "==", 2) == 0)))
+    {
+        // both sides, as the program would compute them
+        uint64_t v[2];
+        NodeId side[2] = {c->a, c->b};
+        int ok = 1;
+        for (int i = 0; i < 2 && ok; i++)
+        {
+            TypeId t = u->types[side[i]] == T_INT_LIT ? T_I64 : u->types[side[i]];
+            ok = evaluate(vm, u, side[i], t, 0, &why);
+            v[i] = vm->stack[0];
+        }
+        int is_signed = lt == T_I8 || lt == T_I16 || lt == T_I32 || lt == T_I64 || lt == T_INT || lt == T_INT_LIT;
+        if (ok)
+        {
+            snprintf(values, sizeof(values), is_signed ? " (%lld %.*s %lld)" : " (%llu %.*s %llu)",
+                     (long long)v[0], op->len, TSTART(op), (long long)v[1]);
+        }
+    }
+    diag_at(u, at, "error", "%s%s", text, values);
 }
 
 void comptime_unit(Unit *u)
@@ -867,11 +951,13 @@ int comptime_fold_call(SymId fn, const uint64_t *args, uint32_t nargs, uint64_t 
     vm->max_depth = 200;
     vm->why[0] = 0;
     vm->nblocks = 0;
+    vm->trapped = 0;
+    vm->trap_len = 0;
     memset(vm->stack, 0, (g->uses + 1) * 8);
     memcpy(vm->stack, args, nargs * sizeof(uint64_t));
     // the callees it reaches are lowered as it runs: nested, like the function itself
     int nested = mir_nest_begin();
-    int ok = nested && run(vm, fn, g, 0, 0);
+    int ok = nested && run(vm, fn, g, 0);
     if (nested)
     {
         mir_nest_end();

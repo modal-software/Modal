@@ -4,6 +4,7 @@
 #define _XOPEN_SOURCE 700
 #include "v2/compiler/backend/backend.h"
 #include "v2/compiler/cx.h"
+#include <limits.h>
 #include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -181,6 +182,39 @@ static int build_and_run(const Backend *backend, const char *source, const char 
     return status;
 }
 
+// std is Modal source (docs/std.md): $MODAL_STD, or the std folder next to this executable. It is
+// only read when a program imports it.
+static void find_std(const char *argv0)
+{
+    static char dir[PATH_MAX];
+    const char *env = getenv("MODAL_STD");
+    char probe[PATH_MAX + 16];
+    if (env && *env)
+    {
+        snprintf(dir, sizeof(dir), "%s", env);
+    }
+    else
+    {
+        char exe[PATH_MAX];
+        if (!realpath(argv0, exe))
+        {
+            return;
+        }
+        char *slash = strrchr(exe, '/');
+        if (!slash)
+        {
+            return;
+        }
+        *slash = 0;
+        snprintf(dir, sizeof(dir), "%s/std", exe);
+    }
+    snprintf(probe, sizeof(probe), "%s/mod.modal", dir);
+    if (access(probe, R_OK) == 0)
+    {
+        cx.std_dir = dir;
+    }
+}
+
 int main(int argc, char **argv)
 {
     const char *entry = NULL;
@@ -191,6 +225,7 @@ int main(int argc, char **argv)
     const char *out_path = NULL;
     const Backend *backend = backend_default();
     int backend_given = 0;
+    find_std(argv[0]);
 
     for (int i = 1; i < argc; i++)
     {

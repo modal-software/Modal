@@ -145,12 +145,19 @@ RUNTIME void rt_write_bool(Ctx *c, u64 b)
 // A trap (a division by zero): the output written so far goes out first, then the message
 // (a length and its bytes) to the error output, and the program ends with status 1. `exit` is
 // the system's on macOS, exit_group on Linux, the halt on bare metal (each system layer).
-RUNTIME __attribute__((noreturn)) void rt_trap(Ctx *c, const uint8_t *msg)
+// A part of a trap's message (`trap(site, " is false")`, docs/std.md): the program's output so
+// far goes out first, then this part to the error output; the trap that follows ends it.
+RUNTIME void rt_trap_part(Ctx *c, const uint8_t *msg)
 {
     rt_flush(c);
     u64 n;
     __builtin_memcpy(&n, msg, 8);
     write(2, msg + 8, n);
+}
+
+RUNTIME __attribute__((noreturn)) void rt_trap(Ctx *c, const uint8_t *msg)
+{
+    rt_trap_part(c, msg); // (one copy of the code: clang would otherwise outline what they share)
     exit(1);
 }
 
@@ -384,6 +391,11 @@ STENCIL(jz_a)
     NEXT;
 }
 
+STENCIL(jump) // to JUMP (a loop's way back: a tail call to the function itself)
+{
+    __attribute__((musttail)) return JUMP(f, c, acc);
+}
+
 STENCIL(jnz) // to JUMP if f[A] is not 0
 {
     if (f[A])
@@ -408,6 +420,13 @@ STENCIL(call) // CALLEE with its frame at slot A of this one
     NEXT_FRESH;
 }
 
+// A tail call (MIR_CALL_TAIL): CALLEE in this function's place, its frame this one's; it
+// returns to this function's caller. The arguments were copied to the frame's start before.
+STENCIL(tail)
+{
+    __attribute__((musttail)) return CALLEE(f, c, 0);
+}
+
 STENCIL(ret)
 {
     (void)f;
@@ -426,7 +445,20 @@ WRITE(int, rt_write_int(c, (int64_t)x))
 WRITE(uint, rt_write_uint(c, x))
 WRITE(bool, rt_write_bool(c, x))
 
-WRITE(byte, { uint8_t ch = (uint8_t)x; rt_put(c, &ch, 1); })
+// One byte to the output in place (the byte sink, inline): a store while the buffer has room,
+// which is every byte but one in output_buffer; the flush is the only call, when it is full.
+// std's formatting writes byte by byte through it (docs/std.md §4).
+static inline __attribute__((always_inline)) void put_byte(Ctx *c, uint8_t ch)
+{
+    if (__builtin_expect(c->len == c->cap, 0))
+    {
+        rt_flush(c);
+    }
+    c->buf[c->len++] = ch;
+}
+
+WRITE(byte, put_byte(c, (uint8_t)x))
+WRITE(trap_part, rt_trap_part(c, (const uint8_t *)(uintptr_t)x)) // MIR_TRAP with sub MIR_TRAP_PART
 
 // A trap (MIR_TRAP): A holds the address of its message. It does not come back.
 STENCIL(trap) { rt_trap(c, (const uint8_t *)(uintptr_t)f[A]); }
@@ -438,14 +470,12 @@ STENCIL(trap_a)
 
 STENCIL(write_space)
 {
-    uint8_t ch = ' ';
-    rt_put(c, &ch, 1);
+    put_byte(c, ' ');
     NEXT_FRESH;
 }
 
 STENCIL(write_nl)
 {
-    uint8_t ch = '\n';
-    rt_put(c, &ch, 1);
+    put_byte(c, '\n');
     NEXT_FRESH;
 }

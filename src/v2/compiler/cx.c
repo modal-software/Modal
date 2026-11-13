@@ -392,7 +392,9 @@ void context_reset(void)
 {
     Region regions[REGION__COUNT];
     memcpy(regions, cx.regions, sizeof(regions));
+    const char *std_dir = cx.std_dir; // found once, by the driver
     memset(&cx, 0, sizeof(cx));
+    cx.std_dir = std_dir;
     cx.ok = 1;
     for (int i = 0; i < REGION__COUNT; i++)
     {

@@ -33,7 +33,7 @@ int type_starts_at(const Token *t)
     }
 }
 
-// type := '[' ']' type | '*' type | 'struct' '{' members '}' | IDENT ('.' IDENT)*
+// type := '[' ']' type | '[' length ']' type | '*' type | 'struct' '{' members '}' | IDENT ('.' IDENT)*
 NodeId parse_type(Parser *p)
 {
     Unit *u = p->unit;
@@ -49,7 +49,17 @@ NodeId parse_type(Parser *p)
     {
     case TOK_LBRACKET:
         parser_advance(p);
-        if (parser_consume(p, TOK_RBRACKET, "expected ']' (a slice type is written []T)"))
+        if (p->current->kind == TOK_NUMBER || p->current->kind == TOK_IDENTIFIER) // [N]T: an array
+        {
+            NodeId length = parse_expression(p);
+            if (length && parser_consume(p, TOK_RBRACKET, "expected ']' after the array's length"))
+            {
+                NodeId elem = parse_type(p);
+                type = elem ? node_new(u, AST_TYPE_ARRAY, tok_idx(p, t), elem, length) : 0;
+            }
+            break;
+        }
+        if (parser_consume(p, TOK_RBRACKET, "expected ']' (a slice type is written []T, an array [N]T)"))
         {
             NodeId elem = parse_type(p);
             type = elem ? node_new(u, AST_TYPE_SLICE, tok_idx(p, t), elem, 0) : 0;
@@ -123,7 +133,9 @@ NodeId parse_params(Parser *p, int *has_self)
             (t->kind == TOK_IDENTIFIER && !t[1].nl &&
              (t[1].kind == TOK_IDENTIFIER || t[1].kind == TOK_DOT || t[1].kind == TOK_NUMBER ||
               t[1].kind == TOK_STRING || (t[1].kind == TOK_MINUS && t[2].kind == TOK_NUMBER))) ||
-            t->kind == TOK_STAR || (t->kind == TOK_LBRACKET && t[1].kind == TOK_RBRACKET);
+            t->kind == TOK_STAR || (t->kind == TOK_LBRACKET && t[1].kind == TOK_RBRACKET) ||
+            (t->kind == TOK_LBRACKET && (t[1].kind == TOK_NUMBER || t[1].kind == TOK_IDENTIFIER) &&
+             t[2].kind == TOK_RBRACKET); // [N]T: an array, passed by reference
         if (type_first)
         {
             if (pending >= 0)
@@ -145,21 +157,40 @@ NodeId parse_params(Parser *p, int *has_self)
             int is_bool = lit->kind == TOK_IDENTIFIER &&
                           ((lit->len == 4 && memcmp(TSTART(lit), "true", 4) == 0) ||
                            (lit->len == 5 && memcmp(TSTART(lit), "false", 5) == 0));
-            if (lit->kind == TOK_STRING)
-            {
-                parser_error_at(p, lit, "a string pattern is not supported yet");
-                break;
-            }
-            if (lit->kind == TOK_NUMBER || is_bool)
+            if (lit->kind == TOK_NUMBER || is_bool || (lit->kind == TOK_STRING && !negative))
             {
                 if (negative)
                 {
                     parser_advance(p);
                 }
                 parser_advance(p);
+                uint16_t aux = (uint16_t)(negative ? PAT_NEG : 0);
+                if (lit->kind == TOK_STRING)
+                {
+                    aux = PAT_TEXT;
+                }
+                else if (!is_bool && p->current->kind == TOK_DOTDOT) // a range: `0..9`, `10..`
+                {
+                    parser_advance(p);
+                    aux |= PAT_RANGE;
+                    int neg_hi = p->current->kind == TOK_MINUS && p->current[1].kind == TOK_NUMBER;
+                    if (p->current->kind == TOK_NUMBER || neg_hi)
+                    {
+                        if (neg_hi)
+                        {
+                            parser_advance(p);
+                            aux |= PAT_NEG_HI;
+                        }
+                        parser_advance(p);
+                    }
+                    else
+                    {
+                        aux |= PAT_OPEN;
+                    }
+                }
                 NodeId param = node_new(u, AST_PARAM, tok_idx(p, lit), type, 0);
                 NODE(u, param)->flags |= AST_F_MUT | AST_F_PATTERN;
-                NODE(u, param)->aux = (uint16_t)negative;
+                NODE(u, param)->aux = aux;
                 node_list_push(u, &params, param);
                 index++;
                 if (!parser_match(p, TOK_COMMA))
@@ -511,9 +542,25 @@ int local_decl_at(const Token *t)
         return 1;
     }
     const Token *k = t;
-    while (k->kind == TOK_STAR || (k->kind == TOK_LBRACKET && k[1].kind == TOK_RBRACKET))
+    for (;;)
     {
-        k += k->kind == TOK_STAR ? 1 : 2;
+        if (k->kind == TOK_STAR)
+        {
+            k++;
+        }
+        else if (k->kind == TOK_LBRACKET && k[1].kind == TOK_RBRACKET)
+        {
+            k += 2;
+        }
+        else if (k->kind == TOK_LBRACKET && (k[1].kind == TOK_NUMBER || k[1].kind == TOK_IDENTIFIER) &&
+                 k[2].kind == TOK_RBRACKET) // [N]T
+        {
+            k += 3;
+        }
+        else
+        {
+            break;
+        }
     }
     if (k->kind != TOK_IDENTIFIER)
     {

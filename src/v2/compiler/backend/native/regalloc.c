@@ -206,11 +206,11 @@ static int liveness(const Blocks *bl, Live *lv)
             uint64_t *o = lv->out + b * words;
             uint32_t succ[2];
             int ns = 0;
-            if (end->op != MIR_RET && end->op != MIR_TRAP && b + 1 < nb)
+            if (!MIR_NO_FALLTHROUGH(end) && b + 1 < nb)
             {
                 succ[ns++] = b + 1;
             }
-            if ((end->op == MIR_JZ || end->op == MIR_JNZ) && end->imm < f->nlabels)
+            if (MIR_BRANCHES(end) && end->imm < f->nlabels)
             {
                 succ[ns++] = bl->label_block[end->imm];
             }
@@ -331,7 +331,8 @@ int regalloc(const MirFunc *f, int preserved, int scratch, const uint8_t *clobbe
         if (i > 0)
         {
             uint8_t p = f->code[i - 1].op;
-            leader |= p == MIR_JZ || p == MIR_JNZ || p == MIR_RET || p == MIR_TRAP;
+            leader |= MIR_BRANCHES(&f->code[i - 1]) || MIR_ENDS(&f->code[i - 1]);
+            (void)p;
         }
         bl.nb += leader;
         block_of[i] = bl.nb - 1;

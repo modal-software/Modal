@@ -125,7 +125,7 @@ static int live_after(const Opt *o, size_t i, MirSlot s)
         {
             return 0;
         }
-        if (in->op == MIR_RET || in->op == MIR_TRAP)
+        if (MIR_ENDS(in))
         {
             return in->op == MIR_RET ? s < f->ret_slots : 0;
         }

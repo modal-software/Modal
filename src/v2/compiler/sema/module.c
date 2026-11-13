@@ -190,6 +190,9 @@ static const char *read_source(const char *path, size_t *len, uint64_t *dev, uin
     return buffer;
 }
 
+static Unit *unit_from_source(const char *path, const char *canon, size_t canon_len, const char *src,
+                              size_t len, uint64_t dev, uint64_t ino);
+
 Unit *unit_load(const char *path)
 {
     char canon[PATH_MAX];
@@ -226,6 +229,13 @@ Unit *unit_load(const char *path)
             return &cx.units[i];
         }
     }
+    return unit_from_source(path, canon, canon_len, src, len, dev, ino);
+}
+
+// A unit from its source text, read from disk or made by the compiler.
+static Unit *unit_from_source(const char *path, const char *canon, size_t canon_len, const char *src,
+                              size_t len, uint64_t dev, uint64_t ino)
+{
     if (cx.nunits == MAX_UNITS)
     {
         fprintf(stderr, "fatal: too many source files (limit is %d)\n", MAX_UNITS);
@@ -290,6 +300,43 @@ Unit *unit_load(const char *path)
     return u;
 }
 
+// ---- import("target"): the machine compiled for, as compile-time values ------------------------
+//
+// `target := import("target")` reads what the compiler knows about the machine (MachineTarget,
+// sema/layout.c) as constants: `target.ptr_size`, `target.arch`, `target.os`, `target.has_output`.
+// They are compile-time values (docs/comptime.md §2.2): module level reads them, a body cannot.
+// The module is made from text, once per compilation, and needs no file.
+Unit *module_target_unit(void)
+{
+    for (uint16_t i = 0; i < cx.nunits; i++)
+    {
+        if (cx.units[i].provided)
+        {
+            return &cx.units[i];
+        }
+    }
+    const MachineTarget *t = target_get();
+    static const char *const arch[] = {[TCPU_ARM64] = "arm64", [TCPU_X86_64] = "x86_64"};
+    static const char *const os[] = {[TOS_MACOS] = "macos", [TOS_LINUX] = "linux", [TOS_NONE] = "none"};
+    char text[512];
+    int n = snprintf(text, sizeof(text),
+                     "-- made by the compiler: the machine this program is compiled for\n"
+                     "ptr_size := %u\nword_size := %u\narch := \"%s\"\nos := \"%s\"\n"
+                     "has_output := %s\nbig_endian := %s\n",
+                     t->ptr_size, t->word_size, arch[t->cpu], os[t->os],
+                     (t->caps & TCAP_SYSOUT) ? "true" : "false", t->big_endian ? "true" : "false");
+    char *src = (char *)arena_alloc((size_t)n + 1);
+    memcpy(src, text, (size_t)n + 1);
+    static const char path[] = "/(compiler)/target.modal";
+    Unit *u = unit_from_source(path, path, sizeof(path) - 1, src, (size_t)n, 0, 0);
+    if (u)
+    {
+        u->provided = 1;
+        u->bound = 1; // part of no domain's face rules: everyone may import it
+    }
+    return u;
+}
+
 // ---- import resolution -----------------------------------------------------------------------
 
 // Finds the file an import names, relative to the importing file:
@@ -327,16 +374,18 @@ static Unit *import_target(Unit *u, NodeId import)
         rel_len -= 2;
     }
 
-    // `std` lives outside the project and is reserved: no file is looked for, so importing
-    // it costs no system call.
-    static const char *const external_roots[] = {"std"};
-    for (size_t i = 0; i < sizeof(external_roots) / sizeof(external_roots[0]); i++)
+    // `std` is Modal source in the compiler's std folder (docs/std.md), read only when a
+    // program imports it. Without the folder it stays external: what the compiler itself
+    // provides (print, sys.put) still works, and nothing else is there.
+    if (!relative && len == 6 && memcmp(name, "target", 6) == 0)
     {
-        if (!relative && strlen(external_roots[i]) == (size_t)len &&
-            memcmp(external_roots[i], name, (size_t)len) == 0)
-        {
-            return NULL;
-        }
+        return module_target_unit();
+    }
+    if (!relative && len == 3 && memcmp(name, "std", 3) == 0)
+    {
+        char std_path[PATH_MAX];
+        int n = cx.std_dir ? snprintf(std_path, sizeof(std_path), "%s/mod.modal", cx.std_dir) : -1;
+        return n > 0 && (size_t)n < sizeof(std_path) ? unit_load(std_path) : NULL;
     }
 
     // A path (`./x`, `a/b`, `x.modal`) is looked for next to the importing file only. A bare
@@ -426,8 +475,9 @@ static int may_import(Unit *u, uint32_t tok, const Unit *target)
     const char *udir = cx.domains[u->domain];
     const char *slash = strrchr(tdir, '/');
     size_t plen = slash ? (size_t)(slash - tdir) : 0;
+    int is_std = cx.std_dir && strcmp(tdir, cx.std_dir) == 0; // a root wherever it lives
 
-    if (strncmp(udir, tdir, plen) != 0 || (udir[plen] != '/' && udir[plen] != '\0'))
+    if (!is_std && (strncmp(udir, tdir, plen) != 0 || (udir[plen] != '/' && udir[plen] != '\0')))
     {
         const char *parent_end = tdir + plen;
         const char *parent = parent_end;
@@ -502,9 +552,9 @@ static int may_see(Unit *u, uint32_t tok, SymId id)
         return 1;
     }
 
-    if (sees_inside(u, owner))
+    if (sees_inside(u, owner) || owner->provided)
     {
-        return 1; // files of one domain share everything at module level
+        return 1; // files of one domain share everything at module level; target is everyone's
     }
     if (owner->is_manifest)
     {
@@ -721,6 +771,30 @@ void module_check_paths(Unit *u, NodeId from, NodeId to)
 
 // Finds the file behind every import among the nodes [from, to) of a unit. Returns how many
 // imports were found.
+// `import("std").io...` and `import("std").sys...` are the compiler's namespaces (print, put:
+// docs/std.md §4): they stay external, so a program that only prints reads no std file. The
+// selector on an import is created right after it.
+static int compiler_namespace(const Unit *u, NodeId import)
+{
+    const Token *arg = TOK(u, NODE(u, import)->tok);
+    if (!((arg->len == 5 && memcmp(TSTART(arg), "\"std\"", 5) == 0) ||
+          (arg->len == 3 && memcmp(TSTART(arg), "std", 3) == 0)))
+    {
+        return 0;
+    }
+    for (NodeId id = import + 1; id < u->nodes.size && id <= import + 4; id++)
+    {
+        const AstNode *n = NODE(u, id);
+        if (n->kind == AST_SELECTOR && n->a == import)
+        {
+            const Token *t = TOK(u, n->tok);
+            return (t->len == 2 && memcmp(TSTART(t), "io", 2) == 0) ||
+                   (t->len == 3 && memcmp(TSTART(t), "sys", 3) == 0);
+        }
+    }
+    return 0;
+}
+
 static uint32_t discover_imports(Unit *u, NodeId from, NodeId to)
 {
     uint32_t found = 0;
@@ -728,7 +802,7 @@ static uint32_t discover_imports(Unit *u, NodeId from, NodeId to)
     {
         if (NODE(u, id)->kind == AST_IMPORT)
         {
-            Unit *target = import_target(u, id);
+            Unit *target = compiler_namespace(u, id) ? NULL : import_target(u, id);
             NODE(u, id)->aux = target ? (uint16_t)(target->id + 1) : 0;
             found++;
         }
@@ -762,6 +836,9 @@ static const struct
     {"max_ram", CONFIG_INT},  // bytes of memory it may use at run time: stacks and buffers
     {"stack", CONFIG_INT},    // bytes of value stack for a program whose depth is not known
     {"output_buffer", CONFIG_INT}, // bytes buffered before the system output is written
+    // Compile time (docs/comptime.md §4): what one evaluation may take.
+    {"comptime_steps", CONFIG_INT}, // MIR instructions (1,000,000 by default)
+    {"comptime_depth", CONFIG_INT}, // nested calls (1,000 by default)
     // The memory map of a bare-metal target (`--target arm64-none`): where the image goes and
     // where the stack is. flash_size and ram_size are also the default max_code and max_ram.
     {"flash_origin", CONFIG_INT},
@@ -808,8 +885,8 @@ static void check_config(Unit *u, NodeId decl)
     }
     diag_at(u, NODE(u, decl)->tok, "error",
             "'%.*s' is not a known configuration of a domain (known: implicit_self, nil_return, "
-            "profile, version, max_code, max_ram, stack, output_buffer, flash_origin, "
-            "flash_size, ram_origin, ram_size)",
+            "profile, version, max_code, max_ram, stack, output_buffer, comptime_steps, "
+            "comptime_depth, flash_origin, flash_size, ram_origin, ram_size)",
             name->len, TSTART(name));
 }
 
@@ -897,6 +974,10 @@ SymId module_domain_function(const Unit *u, const Token *name)
         if (m->is_manifest && m->domain == u->domain && !m->broken)
         {
             SymId s = scope_find_token(m->scope, name);
+            if (s && SYM(s)->kind == SYM_CONST && is_config(m, SYM(s)->decl))
+            {
+                return s; // the domain's configuration: a compile-time value (`max_ram`)
+            }
             return s && SYM(s)->kind == SYM_METHOD ? s : 0;
         }
     }
@@ -1067,6 +1148,24 @@ static void link_new_units(void)
                                    (cx.phase_ns[PHASE_SCAN] + cx.phase_ns[PHASE_PARSE] +
                                     cx.phase_ns[PHASE_DECLARE] - loading);
     }
+}
+
+// The function a binding names (`assert := import("std").assert`), through re-exports; 0 if it
+// names no function.
+SymId module_binding_function(SymId binding)
+{
+    for (int depth = 0; binding && SYM(binding)->kind == SYM_IMPORT && depth < FOLLOW_MAX; depth++)
+    {
+        Unit *owner = &cx.units[SYM(binding)->unit];
+        const AstNode *decl = NODE(owner, SYM(binding)->decl);
+        if (decl->kind != AST_DEFINE || NODE(owner, decl->a)->kind != AST_SELECTOR)
+        {
+            return 0;
+        }
+        const AstNode *sel = NODE(owner, decl->a);
+        binding = module_member(owner, sel->a, sel->tok);
+    }
+    return binding && SYM(binding)->kind == SYM_METHOD ? binding : 0;
 }
 
 // What `base.name` names when `base` leads to a module (an import binding, or a path through

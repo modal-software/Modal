@@ -23,14 +23,14 @@ static void type_map_put(TypeId id)
     type_map[i] = id;
 }
 
-static TypeId type_push(uint8_t kind, uint32_t ref)
+static TypeId type_push(uint8_t kind, uint32_t ref, uint32_t len)
 {
     if (cx.types.size == cx.types.cap)
     {
         cx.types.data = (Type *)region_grow_array(REGION_TYPES, cx.types.data, sizeof(Type),
                                                   &cx.types.cap, cx.types.size + 1);
     }
-    cx.types.data[cx.types.size] = (Type){kind, ref};
+    cx.types.data[cx.types.size] = (Type){kind, ref, len};
     return (TypeId)cx.types.size++;
 }
 
@@ -38,14 +38,14 @@ void types_init(void)
 {
     for (uint8_t k = 0; k < T__PRIM_COUNT; k++)
     {
-        type_push(k, 0); // a primitive's id is its kind
+        type_push(k, 0, 0); // a primitive's id is its kind
     }
     type_map_cap = 64;
     type_map = (uint32_t *)arena_alloc(type_map_cap * sizeof(uint32_t));
     memset(type_map, 0, type_map_cap * sizeof(uint32_t));
 }
 
-TypeId type_make(TypeKind kind, uint32_t ref)
+static TypeId type_intern(TypeKind kind, uint32_t ref, uint32_t len)
 {
     if (kind < T__PRIM_COUNT)
     {
@@ -55,13 +55,13 @@ TypeId type_make(TypeKind kind, uint32_t ref)
          i = (i + 1) & (type_map_cap - 1))
     {
         const Type *t = &cx.types.data[type_map[i]];
-        if (t->kind == kind && t->ref == ref)
+        if (t->kind == kind && t->ref == ref && t->len == len)
         {
             return type_map[i];
         }
     }
 
-    TypeId id = type_push((uint8_t)kind, ref);
+    TypeId id = type_push((uint8_t)kind, ref, len);
     if ((cx.types.size - T__PRIM_COUNT) * 2 > type_map_cap) // keep the table under half full
     {
         type_map_cap *= 2;
@@ -77,6 +77,21 @@ TypeId type_make(TypeKind kind, uint32_t ref)
         type_map_put(id);
     }
     return id;
+}
+
+TypeId type_make(TypeKind kind, uint32_t ref)
+{
+    return type_intern(kind, ref, 0);
+}
+
+TypeId type_array(TypeId elem, uint32_t len)
+{
+    return type_intern(T_ARRAY, elem, len);
+}
+
+uint32_t type_len(TypeId t)
+{
+    return cx.types.data[t].len;
 }
 
 TypeKind type_kind(TypeId t)
@@ -113,6 +128,16 @@ char *type_str(TypeId t, char *buf, size_t cap)
         {
             snprintf(buf + n, cap - n, "%s", prims[k]);
             return buf;
+        }
+        if (k == T_ARRAY)
+        {
+            n += (size_t)snprintf(buf + n, cap - n, "[%u]", type_len(t));
+            if (n >= cap)
+            {
+                return buf;
+            }
+            t = type_ref(t);
+            continue;
         }
         if (k == T_PTR || k == T_SLICE)
         {

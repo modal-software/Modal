@@ -792,7 +792,7 @@ static int to_acc(const MirFunc *f, size_t k)
     // Nobody else may read the slot before it is written again. A write only ends the search
     // while the code is straight: past a branch or a label, the write may be jumped over, so any
     // later read keeps the value in its slot.
-    int straight = next->op != MIR_JZ && next->op != MIR_JNZ;
+    int straight = !MIR_BRANCHES(next);
     for (size_t j = k + 2, n = 0; j < f->n; j++, n++)
     {
         const MirInst *later = &f->code[j];
@@ -800,7 +800,7 @@ static int to_acc(const MirFunc *f, size_t k)
         {
             return 0;
         }
-        if (later->op == MIR_LABEL || later->op == MIR_JZ || later->op == MIR_JNZ)
+        if (later->op == MIR_LABEL || MIR_BRANCHES(later))
         {
             straight = 0;
         }
@@ -884,6 +884,49 @@ static int R(MirSlot s)
     return r < keep ? x64_regs[ra_base + r] : x64_scratch[r - keep];
 }
 
+// Unsigned division by a constant (`n / 10`), done as a multiplication: the quotient is the high
+// half of n * m, shifted right by s (Granlund and Montgomery). `add`: m needs 65 bits, so the
+// sum (n - t) / 2 + t is shifted instead. A power of two is a shift alone (m = 0). Exact for every
+// 64-bit n, and so for the narrower unsigned variants, which a slot holds zero-extended.
+// 0: not this case (signed, a divisor above 2^63, or 0); the instruction divides.
+typedef unsigned __int128 u128;
+
+static int div_magic(const MirInst *in, uint64_t *m, int *s, int *add)
+{
+    uint64_t d = in->op == MIR_BINI ? mir_normalize(in->imm, in->var) : 0;
+    if (in->op != MIR_BINI || in->sub != MB_DIV || in->var >= MV_I8 || d == 0 || d > (1ull << 63))
+    {
+        return 0;
+    }
+    *add = 0;
+    if ((d & (d - 1)) == 0)
+    {
+        *m = 0;
+        *s = __builtin_ctzll(d);
+        return 1;
+    }
+    for (int k = 0; k < 64; k++)
+    {
+        u128 p = (u128)1 << (64 + k);
+        u128 mm = (p + d - 1) / d; // ceil(2^(64+k) / d)
+        if (mm >> 64)
+        {
+            break;
+        }
+        if (mm * d - p <= ((u128)1 << k)) // the error is small enough for every n
+        {
+            *m = (uint64_t)mm;
+            *s = k;
+            return 1;
+        }
+    }
+    int l = 64 - __builtin_clzll(d - 1); // ceil(log2 d), at most 63 here
+    *m = (uint64_t)(((u128)1 << (64 + l)) / d + 1 - ((u128)1 << 64));
+    *s = l - 1;
+    *add = 1;
+    return 1;
+}
+
 // Does instruction `in` run a stencil or call out, which may change the scratch registers?
 static int clobbers(const MirInst *in)
 {
@@ -897,7 +940,11 @@ static int clobbers(const MirInst *in)
         return in->imm > 16;
     case MIR_BIN:
     case MIR_BINI:
-        return x86 && in->sub == MB_DIV;
+        { // (a division by a constant is a multiplication, in place)
+            uint64_t m;
+            int sh, add;
+            return x86 && in->sub == MB_DIV && !div_magic(in, &m, &sh, &add);
+        }
     case MIR_LOAD:
     case MIR_STORE:
         return x86 && in->imm > 0x7fffffffull;
@@ -1101,6 +1148,35 @@ static void a64_bin(const MirInst *in)
             uint32_t k = (uint32_t)(sv >= 0 ? sv : -sv);
             put32((sv >= 0 ? 0xf100001fu : 0xb100001fu) | k << 10 | (uint32_t)ra_ << 5); // cmp / cmn
             a64_cset(rd, in->sub, in->var);
+            a64_fin(in->d, rd);
+            return;
+        }
+        uint64_t m;
+        int sh, add;
+        if (div_magic(in, &m, &sh, &add))
+        {
+            int t = ra_;
+            if (m)
+            {
+                a64_imm(16, m);
+                put32(0x9bc07c00u | 16u << 16 | (uint32_t)ra_ << 5 | 17u); // umulh x17, xn, x16
+                t = 17;
+                if (add)
+                {
+                    put32(0xcb000000u | 17u << 16 | (uint32_t)ra_ << 5 | 16u); // sub x16, xn, x17
+                    put32(0xd340fc00u | 1u << 16 | 16u << 5 | 16u);            // lsr x16, x16, #1
+                    put32(0x8b000000u | 17u << 16 | 16u << 5 | 16u);           // add x16, x16, x17
+                    t = 16;
+                }
+            }
+            if (sh)
+            {
+                put32(0xd340fc00u | (uint32_t)sh << 16 | (uint32_t)t << 5 | (uint32_t)rd); // lsr xd, xt, #s
+            }
+            else
+            {
+                a64_mov(rd, t);
+            }
             a64_fin(in->d, rd);
             return;
         }
@@ -1477,6 +1553,39 @@ static void reload_write(MirSlot d)
 
 static void x_bin(const MirInst *in)
 {
+    uint64_t m;
+    int sh, add;
+    if (div_magic(in, &m, &sh, &add)) // rax and rdx: no slot lives in either
+    {
+        int n = x_src(in->a, XCX);
+        if (m)
+        {
+            x_imm(XAX, m);
+            x_op(1, 0, "\xf7", 1, 4, n, 0, 0, 0); // mul n: rdx = the high half
+            if (add)
+            {
+                x_op(1, 0, "\x89", 1, n, XAX, 0, 0, 0);   // mov rax, n
+                x_op(1, 0, "\x29", 1, XDX, XAX, 0, 0, 0); // sub rax, rdx
+                x_op(1, 0, "\xd1", 1, 5, XAX, 0, 0, 0);   // shr rax, 1
+                x_op(1, 0, "\x01", 1, XDX, XAX, 0, 0, 0); // add rax, rdx
+            }
+            else
+            {
+                x_op(1, 0, "\x89", 1, XDX, XAX, 0, 0, 0); // mov rax, rdx
+            }
+        }
+        else
+        {
+            x_op(1, 0, "\x89", 1, n, XAX, 0, 0, 0); // mov rax, n
+        }
+        if (sh)
+        {
+            x_op(1, 0, "\xc1", 1, 5, XAX, 0, 0, 0); // shr rax, s
+            xb((uint8_t)sh);
+        }
+        x_store(XAX, in->d);
+        return;
+    }
     if (in->sub == MB_DIV)
     {
         spill_reads(in);
@@ -1719,12 +1828,79 @@ static void regs_runtime_call(MirSlot value, uint32_t rt, int returns)
     }
 }
 
+static void regs_restore(void);
+
 static void regs_epilogue(const MirFunc *f)
 {
     for (MirSlot s = 0; s < f->ret_slots; s++)
     {
         spill_reads(&(MirInst){.op = MIR_COPY, .a = s});
     }
+    regs_restore();
+    if (nat.arch->cpu == CPU_ARM64)
+    {
+        put32(0xd65f03c0u); // ret
+    }
+    else
+    {
+        xb(0xc3);
+    }
+}
+
+// A tail call (MIR_CALL_TAIL): the arguments move from the window to the frame's first slots,
+// where the callee reads its parameters (in its own numbering: no slot of this frame was
+// dropped before them); the registers come back as at a return, and the callee is entered by a
+// jump, so it returns to this function's caller. (Ascending: a slot is read before it is
+// written over, since the window is above.)
+static void regs_tail(const MirFunc *f, const MirInst *in)
+{
+    uint32_t win = H(f->frame_size);
+    for (uint32_t j = 0; j < in->b && win; j++)
+    {
+        uint32_t from = (win + j) * 8, to = j * 8;
+        if (nat.arch->cpu == CPU_ARM64)
+        {
+            if (win + j < 4096)
+            {
+                put32(0xf9400000u | (win + j) << 10 | 9u); // ldr x9, [x0, #from]
+            }
+            else
+            {
+                a64_imm(16, from);
+                put32(0xf8706809u); // ldr x9, [x0, x16]
+            }
+            if (j < 4096)
+            {
+                put32(0xf9000000u | j << 10 | 9u); // str x9, [x0, #to]
+            }
+            else
+            {
+                a64_imm(16, to);
+                put32(0xf8306809u); // str x9, [x0, x16]
+            }
+        }
+        else
+        {
+            x_op(1, 0, "\x8b", 1, XAX, XDI, 1, (int32_t)from, 0); // mov rax, [rdi + from]
+            x_op(1, 0, "\x89", 1, XAX, XDI, 1, (int32_t)to, 0);   // mov [rdi + to], rax
+        }
+    }
+    regs_restore();
+    SymId callee = (SymId)in->imm;
+    if (nat.arch->cpu == CPU_ARM64)
+    {
+        push_fixup(REGION_CALLS, &nat.calls, &nat.ncalls, &nat.calls_cap, (Fixup){nat.len, SR_BRANCH26, 0, callee});
+        put32(0x14000000u); // b callee
+        return;
+    }
+    xb(0xe9); // jmp callee
+    push_fixup(REGION_CALLS, &nat.calls, &nat.ncalls, &nat.calls_cap, (Fixup){nat.len, SR_REL32, -4, callee});
+    put32(0);
+}
+
+// The registers the prologue saved, back (a return, or a tail call).
+static void regs_restore(void)
+{
     for (int i = a64_nsave - 2; i >= 0 && nat.arch->cpu == CPU_ARM64; i -= 2)
     {
         put32(0xa8c103e0u | (uint32_t)a64_save[i + 1] << 10 | a64_save[i]); // ldp, [sp], #16
@@ -1741,14 +1917,6 @@ static void regs_epilogue(const MirFunc *f)
                 xb((uint8_t)(0x58 | (x64_regs[k] & 7))); // pop
             }
         }
-    }
-    if (nat.arch->cpu == CPU_ARM64)
-    {
-        put32(0xd65f03c0u); // ret
-    }
-    else
-    {
-        xb(0xc3);
     }
 }
 
@@ -2149,7 +2317,25 @@ static void emit_regs(const MirFunc *f)
                 put32(0);
             }
             break;
+        case MIR_JUMP:
+            if (arm)
+            {
+                push_jump(nat.len, SR_BRANCH26, 0, (uint32_t)in->imm);
+                put32(0x14000000u); // b label
+            }
+            else
+            {
+                xb(0xe9); // jmp label
+                push_jump(nat.len, SR_REL32, -4, (uint32_t)in->imm);
+                put32(0);
+            }
+            break;
         case MIR_CALL:
+            if (in->sub == MIR_CALL_TAIL)
+            {
+                regs_tail(f, in);
+                break;
+            }
             regs_call(f, (SymId)in->imm);
             break;
         case MIR_RET:
@@ -2161,13 +2347,15 @@ static void emit_regs(const MirFunc *f)
         case MIR_WRITE:
         case MIR_TRAP:
         {
-            int st = in->op == MIR_TRAP ? ST_trap : st_write[in->sub];
+            int part = in->op == MIR_TRAP && in->sub == MIR_TRAP_PART;
+            int st = part ? ST_write_trap_part : in->op == MIR_TRAP ? ST_trap : st_write[in->sub];
             int operand = in->op == MIR_TRAP || (in->sub != MW_SPACE && in->sub != MW_NL);
             if (ra_base && (in->op == MIR_TRAP || in->sub != MW_BYTE) && operand)
             {
                 static const uint8_t rt_of[] = {[MW_STR] = RT_write_str, [MW_INT] = RT_write_int,
                                                 [MW_UINT] = RT_write_uint, [MW_BOOL] = RT_write_bool};
-                regs_runtime_call(in->a, in->op == MIR_TRAP ? RT_trap : rt_of[in->sub], in->op != MIR_TRAP);
+                regs_runtime_call(in->a, part ? RT_trap_part : in->op == MIR_TRAP ? RT_trap : rt_of[in->sub],
+                                  in->op != MIR_TRAP || part);
             }
             else if (operand && R(in->a) >= 0)
             {
@@ -2243,7 +2431,7 @@ static void emit_stencils(const MirFunc *f)
         {
             label_index[in->imm] = (uint32_t)k;
         }
-        else if ((in->op == MIR_JZ || in->op == MIR_JNZ) && label_index[in->imm] != UINT32_MAX)
+        else if (MIR_BRANCHES(in) && label_index[in->imm] != UINT32_MAX)
         {
             if (nloops < MAX_LOOPS)
             {
@@ -2326,7 +2514,19 @@ static void emit_stencils(const MirFunc *f)
             emit((in->op == MIR_JZ ? ST_jz : ST_jnz) + (in_acc ? 1 : 0), in->a, 0, 0, 0,
                  (uint32_t)in->imm);
             break;
+        case MIR_JUMP:
+            emit(ST_jump, 0, 0, 0, 0, (uint32_t)in->imm);
+            break;
         case MIR_CALL:
+            if (in->sub == MIR_CALL_TAIL) // the arguments to the frame's start, then a jump
+            {
+                for (uint32_t j = 0; j < in->b && f->frame_size; j++)
+                {
+                    emit(ST_copy, j, f->frame_size + j, 0, 0, 0);
+                }
+                emit(ST_tail, 0, 0, 0, (SymId)in->imm, 0);
+                break;
+            }
             emit(ST_call, f->frame_size, 0, 0, (SymId)in->imm, 0);
             break;
         case MIR_RET:
@@ -2339,6 +2539,11 @@ static void emit_stencils(const MirFunc *f)
             emit(st_write[in->sub] + (in_acc && acc_operand(in) ? 1 : 0), in->a, 0, 0, 0, 0);
             break;
         case MIR_TRAP:
+            if (in->sub == MIR_TRAP_PART)
+            {
+                emit(in_acc ? ST_write_trap_part_a : ST_write_trap_part, in->a, 0, 0, 0, 0);
+                break;
+            }
             emit(in_acc ? ST_trap_a : ST_trap, in->a, 0, 0, 0, 0);
             break;
         case MIR_GLOAD:
@@ -2391,7 +2596,7 @@ static uint64_t out_bound(const MirFunc *f)
         {
             placed[in->imm] = 1;
         }
-        if ((in->op == MIR_JZ || in->op == MIR_JNZ) && in->imm < f->nlabels && placed[in->imm])
+        if (MIR_BRANCHES(in) && in->imm < f->nlabels && placed[in->imm])
         {
             loops = 1; // a branch back
         }
@@ -2407,7 +2612,7 @@ static uint64_t out_bound(const MirFunc *f)
             for (size_t j = k; j-- > 0;)
             {
                 const MirInst *p = &f->code[j];
-                if (p->op == MIR_LABEL || p->op == MIR_JZ || p->op == MIR_JNZ || p->op == MIR_CALL)
+                if (p->op == MIR_LABEL || MIR_BRANCHES(p) || p->op == MIR_CALL)
                 {
                     break;
                 }
@@ -3159,7 +3364,7 @@ static int native_end(const BackendJob *job)
     int writes_out = 0; // a stencil writes to the system output (a trap only flushes what they wrote)
     for (size_t i = 0; i < nat.nrtcalls && !writes_out; i++)
     {
-        writes_out = nat.rtcalls[i].ref != RT_trap;
+        writes_out = nat.rtcalls[i].ref != RT_trap && nat.rtcalls[i].ref != RT_trap_part;
     }
     // Output that is only constant text, a few times, with no recursion: each string goes straight
     // to the system. No buffer (RAM), no rt_put / rt_flush (code); the same bytes, in the same order.
@@ -3167,7 +3372,8 @@ static int native_end(const BackendJob *job)
     size_t sites = 0;
     for (size_t i = 0; i < nat.nrtcalls && direct; i++)
     {
-        direct = nat.rtcalls[i].ref == RT_write_str || nat.rtcalls[i].ref == RT_trap;
+        direct = nat.rtcalls[i].ref == RT_write_str || nat.rtcalls[i].ref == RT_trap ||
+                 nat.rtcalls[i].ref == RT_trap_part;
         sites += nat.rtcalls[i].ref == RT_write_str;
     }
     direct = direct && sites <= 16;
