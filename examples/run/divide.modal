@@ -1,0 +1,18 @@
+-- division: the smallest signed value by -1 wraps; a zero divisor stops the program with its
+-- place (the output so far first), status 1, the same on every backend.
+print := import("std").io.print
+d(a: u8, b: u8): u8 {
+    return a / b
+}
+inc(a: u8): u8 {
+    return a + 1
+}
+s32(a: i32, b: i32): i32 {
+    return a / b
+}
+main(): u8 {
+    print("ok", d(7, 2), s32(-2147483647 - 1, -1), d(9, inc(254)))
+    print("wrapped", d(9, inc(255)))
+    print("never")
+    return 3
+}

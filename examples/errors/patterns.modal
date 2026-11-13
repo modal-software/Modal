@@ -1,0 +1,22 @@
+u8 nocatch(u8 0): 1
+u8 nocatch(u8 1): 2
+
+u8 late(u8 n): n
+u8 late(u8 0): 1
+
+u8 dup(u8 0): 1
+u8 dup(u8 0): 2
+u8 dup(u8 n): n
+
+u8 big(u8 300): 1
+u8 big(u8 n): n
+
+u8 neg(u8 -1): 1
+u8 neg(u8 n): n
+
+u8 kind(u8 true): 1
+u8 kind(u8 n): n
+
+main(): u8 {
+    return 0
+}

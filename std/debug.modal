@@ -1,0 +1,8 @@
+-- assert(cond): stops the program when cond is false, with the place and the call as written.
+-- In a function body it runs in the program; at module level the compiler runs it, and a false
+-- condition is a compile error there (docs/comptime.md §3.5).
+-- `site: site` is filled by the compiler at each call: `file:line:col: assert(n < 4)`.
+assert(bool ok, site: site) {
+    true: {}
+    false: trap(site, " is false\n")
+}

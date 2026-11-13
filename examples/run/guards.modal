@@ -1,0 +1,37 @@
+-- assert and sizeof are std functions, and the position decides when they run
+-- (docs/comptime.md §3.5): at module level the compiler checks them, in a body the program does.
+print := import("std").io.print
+assert := import("std").assert
+
+header: struct {
+    u8 kind,
+    u32 len,
+    u16 flags,
+}
+
+u32 fact(u32 0): 1
+u32 fact(u32 n): n * fact(n - 1)
+
+-- a function called at module level is run for its asserts
+tables() {
+    assert(fact(5) == 120)
+    assert(sizeof(u16) + sizeof(i64) == 10)
+}
+
+assert(sizeof(header) == 12)    -- the target's C layout: 1, 3 of padding, 4, 2, 2 of padding
+assert(fact(6) / fact(5) == 6)
+tables()
+bytes := sizeof(header) * 4     -- an unsized constant, like a literal
+
+slot(n: u32): u32 {
+    assert(n < 4)               -- a run-time guard: it traps with what failed
+    return n * sizeof(header)
+}
+
+main(): u8 {
+    u8 word = sizeof(u64)
+    print(bytes, word, slot(2), slot(3))
+    print(slot(4))
+    print("never")
+    return 0
+}

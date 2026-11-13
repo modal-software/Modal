@@ -1,0 +1,12 @@
+-- checker errors: `:=` is immutable, a body must return, only numbers are ordered
+f(a: u8): u8 {
+    b: u8 = a
+}
+
+main(): u8 {
+    n := 1
+    n = 2
+    big := 3000000000
+    t := true < false
+    return 0
+}

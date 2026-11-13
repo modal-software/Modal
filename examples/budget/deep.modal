@@ -1,0 +1,24 @@
+-- over the budget: the chain of calls needs more memory than max_ram allows
+print := import("std").io.print
+
+a(x: i64): i64 {
+    l1 := x + 1
+    l2 := l1 * 2
+    l3 := l2 * 3
+    l4 := l3 * 4
+    print("a", x)
+    return b(l1 + l2 + l3 + l4)
+}
+b(x: i64): i64 {
+    print("b", x)
+    return c(x + 1) + c(x + 2)
+}
+c(x: i64): i64 {
+    print("c", x)
+    return x
+}
+
+main(): u8 {
+    print(a(1))
+    return 0
+}

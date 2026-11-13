@@ -1,0 +1,2 @@
+implict_self := false
+nil_return := "yes"

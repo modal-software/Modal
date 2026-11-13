@@ -1,0 +1,17 @@
+-- pattern mistakes: an empty range, a string for a number, a range end that does not fit
+u8 f(u8 9..0): 1
+u8 f(u8 n): 0
+u8 g(u8 "x"): 1
+u8 g(u8 n): 0
+u8 h(u8 1..5): 1
+u8 h(u8 n): 0
+u8 k(u8 0..300): 1
+u8 k(u8 n): 0
+main(): u8 {
+    return 0
+}
+nil show(u8 n) {}
+nil show(bool b) {}
+nil relay(u16 w) {
+    show(w)
+}

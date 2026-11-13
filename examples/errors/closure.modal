@@ -1,0 +1,12 @@
+f(k: u8): u8 {
+    add := (x: u8) u8 {
+        return x + k
+    }
+    sq := (x: u8) u8 {
+        return x * x
+    }
+    return add(1)
+}
+main(): u8 {
+    return f(2)
+}

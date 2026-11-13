@@ -1,0 +1,73 @@
+-- struct values: passed, returned, copied and kept by value; fields in their C layout
+print := import("std").io.print
+
+-- 1 + pad + 2 + 4 + 8 + 1 = 24 bytes: three slots
+rec: struct {
+    u8 a,
+    i16 b,
+    u32 c,
+    i64 d,
+    bool e,
+}
+
+fill(self: rec, x: i64): rec {
+    self.a = 250
+    self.b = -300
+    self.c = 4000000000
+    self.d = x
+    self.e = true
+    return self
+}
+
+bump(self: rec, n: u8): rec {
+    self.a = self.a + n
+    self.d = self.d * 2
+    return self
+}
+
+show(self: rec) {
+    print(self.a, self.b, self.c, self.d, self.e)
+}
+
+a(self: rec): u8 {
+    return self.a
+}
+
+d(self: rec): i64 {
+    return self.d
+}
+
+-- struct in the middle of scalars, from a call
+mix(k: i64, r: rec, m: i64): i64 {
+    return r.d() + m + k
+}
+
+pass(r: rec): rec {
+    return r
+}
+
+swap(x: rec, y: rec): rec {
+    return y
+}
+
+u8 pick(u8 0, r: rec): r.a()
+u8 pick(n: u8, r: rec): pick(n - 1, r.bump(1))
+
+main(): u8 {
+    r := rec.fill(-7)
+    r.show()
+    s := r.bump(10)
+    s.show()
+    r.show()
+    print(mix(3, rec.fill(100), 1000))
+    print(mix(1, pass(s), 2))
+    t := swap(r, s)
+    t.show()
+    pass(pass(t)).show()
+    print(pass(s).d(), swap(s, r).d())
+    print(pick(5, r))
+    rec u = r
+    u = s.bump(1)
+    u.show()
+    return 0
+}

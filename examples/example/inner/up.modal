@@ -1,0 +1,4 @@
+-- a bare name is looked for next to the file, then in every folder above it:
+-- `example` here is the domain two levels up, found through its own mod.modal
+john := import("example").john
+own := import("inner").deep

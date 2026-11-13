@@ -1,0 +1,24 @@
+-- errors of the program's own output
+print := import("std").io.print
+sysput := import("std").sys.put
+
+out: struct {
+    u64 bytes,
+}
+
+put(self: out, b: u8) {
+    self.bytes = self.bytes + 1
+    sysput(b)
+}
+
+-- no `out` here, and this file has its own: where would the bytes go?
+lost() {
+    print("where to?")
+}
+
+main(): u8 {
+    sysput(300)
+    sysput("a")
+    sysput()
+    return 0
+}

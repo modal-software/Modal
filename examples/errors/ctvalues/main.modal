@@ -1,0 +1,10 @@
+target := import("target")
+half(): u64 {
+    return max_ram / 2
+}
+bits(): u64 {
+    return target.ptr_size * 8
+}
+main(): u8 {
+    return 0
+}

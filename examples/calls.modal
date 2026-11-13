@@ -1,0 +1,54 @@
+counter: struct {
+    u8 total,
+
+    bump(self, by: u8): u8 {
+        return self.total + by
+    }
+
+    u8 mix(self, a: u8): self.total + a
+    u8 mix(self, a, b: u8): self.total + a + b
+}
+
+read(self: counter): u8 {
+    return self.total
+}
+
+advance(self: counter, by: u8): u8 {
+    once := self.bump(by)
+    twice := self.bump(once)
+    return self.mix(once) + self.mix(once, twice)
+}
+
+double(n: u8): u8 {
+    return n * 2
+}
+
+u8 scale(n: u8): n * 2
+u8 scale(n, factor: u8): n * factor
+
+first(): u8 {
+    return second(1)
+}
+
+second(n: u8): u8 {
+    return double(n)
+}
+
+print := import("std").io.print
+
+main(): u8 {
+    -- one definition
+    a := double(1)
+
+    b := scale(a)
+    d := scale(a, b)
+
+    {
+        inner := first()
+        print(a)
+    }
+
+    print "dont try"
+
+    return 1
+}

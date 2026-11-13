@@ -1,0 +1,21 @@
+ex := import("./")
+
+a := ex.secret
+b := ex.john.john_nested_class.my_name
+c := ex.john.print_file_name
+
+
+j := ex.john
+d := j.john_nested_class.check
+
+main(): u8 {
+    s := import("secret").vault
+    t := ex.john.john_nested_class.my_name
+    return 0
+}
+
+e := import("example/secret")
+
+f := import("example").secret.vault
+g := import(nowhere)
+ok := import("std").io

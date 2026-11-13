@@ -1,0 +1,33 @@
+-- the language's primitives (docs/std.md §2): predeclared names, never keywords, no import.
+--   sizeof(T)  u8(x)  trap(a, b, ...)  site: site
+print := import("std").io.print
+
+header: struct {
+    u8 kind,
+    u32 len,
+}
+
+u8 low(u64 n): u8(n)          -- a conversion wraps, as a C cast does
+i8 signed(u8 b): i8(b)
+
+-- a check of our own, written like std's assert: the compiler fills `site` at each call
+bool check(bool true, site: site): true
+bool check(bool ok, site: site) {
+    trap(site, " is false\n")
+    return ok
+}
+
+-- a function that takes `site` itself passes its caller's place on
+within(n: u32, site: site) {
+    check(n < 10)
+    check(n < 5, site)
+}
+
+main(): u8 {
+    print(sizeof(header), sizeof(u16), low(300), signed(200), u8(4100), i16(70000))
+    within(3)
+    print("then")
+    within(7)
+    print("never")
+    return 0
+}

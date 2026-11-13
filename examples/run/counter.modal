@@ -1,0 +1,60 @@
+-- structs, methods, overloads and constructors, compiled to C and run
+print := import("std").io.print
+
+limit: u8 = 200
+
+counter: struct {
+    u8 total,
+    step: u8,
+
+    -- inside the braces: helpers, private to counter
+    bump(self, by: u8): u8 {
+        self.total = self.total + by
+        return self.total
+    }
+
+    u8 mix(self, a: u8): self.total + a
+    u8 mix(self, a, b: u8): self.total + a + b
+}
+
+-- the face of counter
+new(self: counter): self {
+    self.total = 1
+    return &self
+}
+
+read(self: counter): u8 {
+    return self.total
+}
+
+advance(self: counter, by: u8): u8 {
+    once := self.bump(by)
+    twice := self.bump(once)
+    return self.mix(once) + self.mix(once, twice)
+}
+
+double(n: u8): u8 {
+    return n * 2
+}
+
+u8 scale(n: u8): n * 2
+u8 scale(n, factor: u8): n * factor
+
+main(): u8 {
+    c := counter.new()
+    print("start:", c.read())
+
+    a := double(21)
+    print("double(21) =", a)
+    print("scale(a) =", scale(a), "scale(a, 3) =", scale(a, 3))
+
+    g := c.advance(a)
+    print("advance:", g, "total now:", c.read())
+
+    -- u8 arithmetic wraps at 256, as the type says
+    big := limit + 100
+    print("200 + 100 as u8 =", big)
+
+    write("done", "\n")
+    return 0
+}

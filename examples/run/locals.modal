@@ -1,0 +1,40 @@
+-- locals declared like module-level variables: type last is immutable and needs its value,
+-- type first is mutable and starts at zero without one. `:=` takes the type from the value.
+print := import("std").io.print
+
+point: struct {
+    i32 x,
+    i32 y,
+}
+
+new(self: point, x: i32): self {
+    self.x = x
+    self.y = x + 1
+    return &self
+}
+
+sum(self: point): i32 {
+    return self.x + self.y
+}
+
+twice(n: u8): u8 {
+    return n + n
+}
+
+main(): u8 {
+    a: u8 = twice(21)
+    u64 total = 1000
+    total = total + 24
+    i16 n
+    n = n - 5
+    point zero
+    p: *point = point.new(4)
+    q: point = zero
+    label: []u8 = "done"
+    print("a", a, "total", total, "n", n, "zero", zero.sum(), "p", p.sum(), "q", q.sum(), label)
+    {
+        a: i32 = -7
+        print("inner", a)
+    }
+    return a
+}

@@ -1,0 +1,20 @@
+base: u8 = 40
+
+twice(n: u8): u8 {
+    return n * 2 + base - 40
+}
+
+greet(): []u8 {
+    return "hello from util"
+}
+
+unused(n: u8): u8 {
+    return n + 1
+}
+
+lambda_user(n: u8): u8 {
+    f := (x: u8) u8 {
+        return x + n
+    }
+    return f(n)
+}

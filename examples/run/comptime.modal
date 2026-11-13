@@ -1,0 +1,67 @@
+-- module level is compile time: the compiler runs these calls, and the program holds the numbers
+-- (docs/comptime.md). The same functions run in the program too, with the same results.
+print := import("std").io.print
+
+u64 fact(u64 0): 1
+u64 fact(u64 n): n * fact(n - 1)
+
+pt: struct {
+    i32 x,
+    i32 y,
+}
+make(self: pt, a: i32): pt {
+    self.x = a
+    self.y = a * 3
+    return self
+}
+sum(self: pt): i32 {
+    return self.x + self.y
+}
+area(n: i32): i32 {
+    p := pt.make(n)
+    return p.sum() - 100
+}
+i8 neg(i8 n): 0 - n
+
+-- strings and structs leave the compiler too: their bytes, in the target's C layout
+tagged: struct {
+    i16 code,
+    bool ok,
+    []u8 label,
+}
+mark(self: tagged, c: i16): tagged {
+    self.code = c
+    self.ok = c > 0
+    self.label = name(c)
+    return self
+}
+show(self: tagged) {
+    print(self.code, self.ok, self.label)
+}
+[]u8 name(i16 0): ""
+[]u8 name(i16 n): "tab\there \"quoted\""
+
+limit: u64 = fact(10)       -- a constant the compiler computed
+a := area(7)                -- its type is the value's: i32
+wrapped: i8 = neg(-128)     -- the same wrap as in the program
+u64 total = limit / 1000    -- a variable whose first value the compiler computed
+good := tagged.mark(-300)   -- a struct the compiler computed: its fields are data
+empty: tagged = tagged.mark(0)
+title := name(1)            -- a string the compiler computed
+n := 5                      -- unsized, as the literal is: it becomes what it meets
+huge := n * 3000000000000000000
+u8 inc(u8 b): b + 1
+[]u8 status = name(0)       -- a variable whose first string the compiler computed
+
+main(): u8 {
+    print(limit, fact(10), a, area(7), wrapped, total)
+    total = total + 1
+    print(total)
+    good.show()
+    empty.show()
+    print(title, status, "|")
+    status = title
+    print(status)
+    print(inc(n), n, huge)      -- a u8 argument, then printed as a literal would be
+    return 0
+}
