@@ -1836,6 +1836,397 @@ static void check_return(Check *c, NodeId id, NodeId value)
     }
 }
 
+static int signed_type(TypeId t);
+static uint64_t type_max(TypeId t);
+static int pattern_from(Unit *u, const AstNode *n, TypeId type, Pattern *out, int loud);
+
+// ---- arms (docs/std.md §8) -----------------------------------------------------------------------
+//
+// What the arms above take, as sorted disjoint ranges of one subject's values (an integer or a
+// bool, in the type's own order: signed types as signed), or the strings taken so far. It says
+// whether an arm can still run, and whether every value is taken.
+#define MAX_COVER 256
+typedef struct
+{
+    TypeId type;
+    int all;     // a name took every value
+    int n;
+    Exact lo[MAX_COVER], hi[MAX_COVER];
+    int nstr;
+    uint32_t str[MAX_COVER]; // string literal tokens
+    int overflow;
+} Cover;
+
+static Exact cover_value(TypeId t, uint64_t v)
+{
+    return signed_type(t) ? (Exact)(int64_t)v : (Exact)v;
+}
+
+static Exact cover_min(TypeId t)
+{
+    return t == T_BOOL ? 0 : signed_type(t) ? -(Exact)type_max(t) - 1 : 0;
+}
+
+static Exact cover_max(TypeId t)
+{
+    return t == T_BOOL ? 1 : (Exact)type_max(t);
+}
+
+static int cover_has(const Cover *cv, Exact lo, Exact hi) // is [lo, hi] taken already?
+{
+    if (cv->all)
+    {
+        return 1;
+    }
+    for (int i = 0; i < cv->n && lo <= hi; i++)
+    {
+        if (cv->lo[i] <= lo && lo <= cv->hi[i])
+        {
+            lo = cv->hi[i] + 1;
+        }
+    }
+    return lo > hi;
+}
+
+static void cover_add(Cover *cv, Exact lo, Exact hi)
+{
+    if (cv->n == MAX_COVER)
+    {
+        cv->overflow = 1;
+        return;
+    }
+    int at = 0;
+    while (at < cv->n && cv->lo[at] < lo)
+    {
+        at++;
+    }
+    memmove(&cv->lo[at + 1], &cv->lo[at], (size_t)(cv->n - at) * sizeof(Exact));
+    memmove(&cv->hi[at + 1], &cv->hi[at], (size_t)(cv->n - at) * sizeof(Exact));
+    cv->lo[at] = lo;
+    cv->hi[at] = hi;
+    cv->n++;
+    int k = 0; // merge what touches
+    for (int i = 1; i < cv->n; i++)
+    {
+        if (cv->lo[i] <= cv->hi[k] + 1)
+        {
+            cv->hi[k] = cv->hi[i] > cv->hi[k] ? cv->hi[i] : cv->hi[k];
+        }
+        else
+        {
+            k++;
+            cv->lo[k] = cv->lo[i];
+            cv->hi[k] = cv->hi[i];
+        }
+    }
+    cv->n = k + 1;
+}
+
+static int same_text(const Unit *u, uint32_t a, uint32_t b)
+{
+    const Token *x = TOK(u, a), *y = TOK(u, b);
+    return x->len == y->len && memcmp(TSTART(x), TSTART(y), x->len) == 0;
+}
+
+// Takes one arm's pattern into the cover. 0: it adds nothing (the arms above took all of it).
+static int cover_take(Unit *u, Cover *cv, NodeId pat)
+{
+    if (cv->all)
+    {
+        return 0;
+    }
+    if (NODE(u, pat)->kind == AST_IDENT)
+    {
+        int full = cv->type != T_STR && cover_has(cv, cover_min(cv->type), cover_max(cv->type));
+        cv->all = 1;
+        return !full;
+    }
+    Pattern pt;
+    if (!sema_arm_pattern(u, pat, cv->type, &pt))
+    {
+        return 1; // an error, reported
+    }
+    if (pt.kind == PATTERN_TEXT)
+    {
+        for (int i = 0; i < cv->nstr; i++)
+        {
+            if (same_text(u, cv->str[i], pt.tok))
+            {
+                return 0;
+            }
+        }
+        if (cv->nstr < MAX_COVER)
+        {
+            cv->str[cv->nstr++] = pt.tok;
+        }
+        return 1;
+    }
+    Exact lo = cover_value(cv->type, pt.lo), hi = pt.kind == PATTERN_RANGE ? cover_value(cv->type, pt.hi) : lo;
+    if (cover_has(cv, lo, hi))
+    {
+        return 0;
+    }
+    cover_add(cv, lo, hi);
+    return 1;
+}
+
+static int cover_full(const Cover *cv)
+{
+    return cv->all || (cv->type != T_STR && !cv->overflow &&
+                       cover_has(cv, cover_min(cv->type), cover_max(cv->type)));
+}
+
+// "10..255, 300" : the values no arm takes (the first few gaps).
+static void cover_gaps(const Cover *cv, char *out, size_t cap)
+{
+    size_t len = 0;
+    int shown = 0;
+    Exact at = cover_min(cv->type), end = cover_max(cv->type);
+    out[0] = 0;
+    for (int i = 0; i <= cv->n && at <= end && len < cap; i++)
+    {
+        Exact stop = i < cv->n ? cv->lo[i] - 1 : end;
+        if (stop >= at)
+        {
+            if (shown == 3)
+            {
+                len += (size_t)snprintf(out + len, cap - len, ", ...");
+                return;
+            }
+            const char *sep = shown ? ", " : "";
+            if (cv->type == T_BOOL)
+            {
+                len += (size_t)snprintf(out + len, cap - len, "%s%s", sep, at ? "true" : "false");
+            }
+            else if (stop == at)
+            {
+                len += (size_t)snprintf(out + len, cap - len, "%s%lld", sep, (long long)at);
+            }
+            else
+            {
+                char a[48], b[48];
+                snprintf(a, sizeof(a), at < 0 ? "%lld" : "%llu", at < 0 ? (long long)at : (unsigned long long)at);
+                snprintf(b, sizeof(b), stop < 0 ? "%lld" : "%llu", stop < 0 ? (long long)stop : (unsigned long long)stop);
+                len += (size_t)snprintf(out + len, cap - len, "%s%s..%s", sep, a, b);
+            }
+            shown++;
+        }
+        if (i < cv->n)
+        {
+            at = cv->hi[i] + 1;
+        }
+    }
+}
+
+// The subjects a match tests: its value, or (a = 0) the parameters of the function whose body
+// it is, `self` and context parameters aside. Returns how many, with their types (and, for
+// parameters, their nodes).
+static int match_subjects(Check *c, NodeId id, TypeId *types, NodeId *params, int cap)
+{
+    Unit *u = c->u;
+    const AstNode *n = NODE(u, id);
+    if (n->a)
+    {
+        types[0] = check_expr(c, n->a);
+        params[0] = 0;
+        return 1;
+    }
+    if (!c->fn || !c->in_callable)
+    {
+        diag_at(u, n->tok, "error", "arms without a value before them match a function's parameters: "
+                                    "they are a whole function body");
+        return 0;
+    }
+    int k = 0;
+    const Unit *home = &cx.units[SYM(c->fn)->unit];
+    for (NodeId p = fn_params(home, c->fn); p && k < cap; p = NEXT(home, p))
+    {
+        const AstNode *pn = NODE(home, p);
+        const Token *name = TOK(home, pn->tok);
+        if ((pn->flags & AST_F_CONTEXT) || is_self_token(TSTART(name), (int)name->len))
+        {
+            continue;
+        }
+        types[k] = param_type((Unit *)home, p, SYM(c->fn)->owner, 0);
+        params[k++] = p;
+    }
+    return k;
+}
+
+static int is_statement(const Unit *u, NodeId result)
+{
+    int k = NODE(u, result)->kind;
+    return k == AST_BLOCK || k == AST_RETURN || k == AST_ASSIGN || k == AST_FIELD_DECL;
+}
+
+static TypeId check_match(Check *c, NodeId id)
+{
+    Unit *u = c->u;
+    AstNode *m = NODE(u, id);
+    TypeId types[16];
+    NodeId params[16];
+    int ns = match_subjects(c, id, types, params, 16);
+    int on_params = m->a == 0;
+    if (!ns)
+    {
+        for (NodeId arm = m->b; arm; arm = NEXT(u, arm))
+        {
+            check_expr(c, NODE(u, arm)->b);
+        }
+        return T_NONE;
+    }
+    // One cover per subject; an arm adds to the subject it tests when the others are names
+    // (one column decides). With several literal columns only the last arm is followed.
+    static Cover covers[16];
+    for (int s = 0; s < ns; s++)
+    {
+        covers[s] = (Cover){.type = types[s]};
+    }
+    TypeId result = T_NONE;
+    int value_arms = 1, index = 0, all_names_last = 0;
+    NodeId last_arm = 0;
+    for (NodeId arm = m->b; arm; arm = NEXT(u, arm), index++)
+    {
+        last_arm = arm;
+        const AstNode *a = NODE(u, arm);
+        int saved = c->nlocals, saved_base = c->block_base;
+        c->block_base = c->nlocals;
+        int np = 0, literal_col = -1, literals = 0;
+        for (NodeId pat = a->a; pat; pat = NEXT(u, pat), np++)
+        {
+            if (np >= ns)
+            {
+                continue;
+            }
+            const AstNode *pn = NODE(u, pat);
+            if (pn->kind == AST_IDENT)
+            {
+                // a name: takes any value, and binds it (a parameter's own name is the parameter)
+                const Token *name = TOK(u, pn->tok);
+                int same = params[np] && same_text(u, pn->tok, NODE(&cx.units[SYM(c->fn)->unit], params[np])->tok) &&
+                           SYM(c->fn)->unit == u->id;
+                if (!same)
+                {
+                    push_local(c, pn->tok, types[np], 0);
+                    c->locals[c->nlocals - 1].bound = 1;
+                }
+                (void)name;
+                continue;
+            }
+            Pattern pt;
+            pattern_from(u, pn, types[np], &pt, 1);
+            literals++;
+            literal_col = np;
+        }
+        if (np != ns)
+        {
+            diag_at(u, a->tok, "error", "this arm has %d pattern%s, but the match has %d value%s (%s)", np,
+                    np == 1 ? "" : "s", ns, ns == 1 ? "" : "s",
+                    on_params ? "one per parameter" : "write them as `value { ... }`");
+        }
+        else if (all_names_last)
+        {
+            diag_at(u, a->tok, "error", "this arm never runs: an arm above takes every value (a name "
+                                        "in each place). Move it above that arm, or remove it");
+        }
+        else if (literals <= 1)
+        {
+            int col = literals ? literal_col : 0;
+            NodeId pat = a->a;
+            for (int k = 0; k < col; k++)
+            {
+                pat = NEXT(u, pat);
+            }
+            if (literals == 0)
+            {
+                all_names_last = 1;
+                int full = ns == 1 && cover_full(&covers[0]);
+                if (full)
+                {
+                    diag_at(u, a->tok, "error", "this arm never runs: the arms above already take every "
+                                                "value. Remove it");
+                }
+            }
+            else if (!cover_take(u, &covers[col], pat))
+            {
+                diag_at(u, a->tok, "error", "this arm never runs: the arms above already take every value "
+                                            "it takes. Move it above them, or remove it");
+            }
+        }
+        // the result: a value, or (a block, `return`, an assignment) a statement
+        NodeId r = a->b;
+        TypeId t;
+        if (on_params && !is_statement(u, r) && c->ret != T_VOID)
+        {
+            check_return(c, arm, r);
+            t = c->ret;
+        }
+        else
+        {
+            t = check_expr(c, r);
+            if (is_statement(u, r) || t == T_VOID)
+            {
+                value_arms = 0;
+            }
+        }
+        if (value_arms && !on_params)
+        {
+            char x[64], y[64];
+            if (result == T_NONE || result == T_INT_LIT)
+            {
+                if (result == T_INT_LIT && !fits(T_INT_LIT, t) && t != T_NONE)
+                {
+                    diag_at(u, a->tok, "error", "this arm gives %s, but the arms above give a number",
+                            type_str(t, x, sizeof(x)));
+                }
+                result = t == T_NONE ? result : t;
+            }
+            else if (!fits(t, result) && t != T_NONE)
+            {
+                diag_at(u, a->tok, "error", "this arm gives %s, but the arms above give %s: every arm of a "
+                                            "match used as a value gives the same type",
+                        type_str(t, x, sizeof(x)), type_str(result, y, sizeof(y)));
+            }
+        }
+        c->nlocals = saved;
+        c->block_base = saved_base;
+    }
+    // Every value must be taken: a name last, or literals that cover the whole type.
+    int full = all_names_last;
+    for (int s = 0; s < ns && !full; s++)
+    {
+        full = ns == 1 && cover_full(&covers[s]);
+    }
+    if (!full)
+    {
+        char gaps[160] = "";
+        if (ns == 1 && types[0] != T_STR && type_is_int(types[0]) | (types[0] == T_BOOL))
+        {
+            cover_gaps(&covers[0], gaps, sizeof(gaps));
+        }
+        if (gaps[0])
+        {
+            diag_at(u, m->tok, "error", "not every value is taken: no arm takes %s. Add arms for them, or end "
+                                        "with a name that takes the rest (`n: ...`)", gaps);
+        }
+        else
+        {
+            diag_at(u, m->tok, "error", "not every value is taken: end with an arm that names the value, "
+                                        "which takes the rest (`%s: ...`)",
+                    types[0] == T_STR ? "s" : "n");
+        }
+    }
+    else if (!all_names_last && last_arm)
+    {
+        m->aux |= MATCH_LAST_FREE; // literals that cover the type: the last one needs no test
+    }
+    if (on_params)
+    {
+        return T_VOID;
+    }
+    return value_arms ? (result == T_NONE ? T_NONE : result) : T_VOID;
+}
+
 // Makes sure the per-node tables cover every node, and clears the entries of [from, size).
 static void side_tables(Unit *u, NodeId from)
 {
@@ -1873,6 +2264,18 @@ static int always_returns(const Unit *u, NodeId block)
     const AstNode *n = NODE(u, block);
     if (n->kind == AST_RETURN)
     {
+        return 1;
+    }
+    if (n->kind == AST_MATCH) // every arm returns: on parameters, a value is the return
+    {
+        for (NodeId arm = n->b; arm; arm = NEXT(u, arm))
+        {
+            NodeId r = NODE(u, arm)->b;
+            if (!(n->a == 0 && !is_statement(u, r)) && !always_returns(u, r))
+            {
+                return 0;
+            }
+        }
         return 1;
     }
     if (n->kind != AST_BLOCK)
@@ -2141,6 +2544,9 @@ static TypeId check_expr(Check *c, NodeId id)
     }
     case AST_PAREN_GROUP:
         type = check_expr(c, n->a);
+        break;
+    case AST_MATCH:
+        type = check_match(c, id);
         break;
     case AST_INDEX: // a[i]: an array's element, or a []u8's byte (read only)
     {
@@ -2756,6 +3162,8 @@ static uint64_t type_max(TypeId t)
                                                    : 0x7fffffffffffffffull;
 }
 
+static int pattern_from(Unit *u, const AstNode *n, TypeId type, Pattern *out, int loud);
+
 int sema_pattern_of(Unit *u, NodeId param, SymId owner, Pattern *out, int loud)
 {
     const AstNode *n = NODE(u, param);
@@ -2763,8 +3171,19 @@ int sema_pattern_of(Unit *u, NodeId param, SymId owner, Pattern *out, int loud)
     {
         return 0;
     }
+    return pattern_from(u, n, resolve_type(u, n->a, owner, 0), out, loud);
+}
+
+// An arm's literal pattern (AST_PATTERN), for a subject of `type`. 0 for a name (or an error).
+int sema_arm_pattern(Unit *u, NodeId pat, TypeId type, Pattern *out)
+{
+    return NODE(u, pat)->kind == AST_PATTERN && pattern_from(u, NODE(u, pat), type, out, 0);
+}
+
+// What a literal pattern takes (a parameter's or an arm's: the literal token and PAT_* in aux).
+static int pattern_from(Unit *u, const AstNode *n, TypeId type, Pattern *out, int loud)
+{
     const Token *t = TOK(u, n->tok);
-    TypeId type = resolve_type(u, n->a, owner, 0);
     *out = (Pattern){.kind = PATTERN_VALUE, .tok = n->tok};
     if (n->aux & PAT_TEXT)
     {
