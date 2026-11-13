@@ -34,6 +34,13 @@ typedef struct
 } Emit;
 
 static void emit_expr(Emit *e, NodeId id);
+static void emit_match(Emit *e, NodeId id);
+
+static int same_name(const Unit *u, uint32_t a, uint32_t b)
+{
+    const Token *x = TOK(u, a), *y = TOK(u, b);
+    return x->len == y->len && memcmp(TSTART(x), TSTART(y), x->len) == 0;
+}
 
 // ---- output helpers --------------------------------------------------------------------------
 
@@ -974,6 +981,9 @@ static void emit_expr(Emit *e, NodeId id)
         unsupported(e, n->tok, "a function literal inside another function");
         PUT(e, "0");
         break;
+    case AST_MATCH:
+        emit_match(e, id);
+        break;
     case AST_INDEX:
         unsupported(e, n->tok, "indexing");
         PUT(e, "0");
@@ -1173,35 +1183,7 @@ static void emit_clause_test(Emit *e, SymId fn, TypeId ret)
         }
         put(e, first ? "" : " && ");
         first = 0;
-        char num[64];
-        if (pat.kind == PATTERN_TEXT) // its length, then each byte (no libc: no memcmp)
-        {
-            static uint8_t text[4096];
-            size_t len = sema_pattern_text(u, pat.tok, text, sizeof(text));
-            PUT(e, "(");
-            out_param_name(e, p, index);
-            snprintf(num, sizeof(num), ".len == %zu", len);
-            put(e, num);
-            for (size_t k = 0; k < len && k < sizeof(text); k++)
-            {
-                PUT(e, " && ");
-                out_param_name(e, p, index);
-                snprintf(num, sizeof(num), ".ptr[%zu] == %u", k, (unsigned)text[k]);
-                put(e, num);
-            }
-            PUT(e, ")");
-            continue;
-        }
-        // A value: ==. A range: both ends, compared in the parameter's own C type.
-        for (int end = 0; end < (pat.kind == PATTERN_RANGE ? 2 : 1); end++)
-        {
-            put(e, end ? " && " : "");
-            out_param_name(e, p, index);
-            put(e, pat.kind == PATTERN_VALUE ? " == (" : end ? " <= (" : " >= (");
-            out_type(e, sema_param_type(u, fn, p), NODE(u, p)->tok);
-            snprintf(num, sizeof(num), ")%lluull", (unsigned long long)(end ? pat.hi : pat.lo));
-            put(e, num);
-        }
+        emit_pattern_cond(e, &pat, sema_param_type(u, fn, p), (Subject){p, index, NULL});
     }
     PUT(e, "))\n    {\n        ");
     int tail = scalar_type(ret) && !SYM(fn)->owner; // the same prototype: a tail call
