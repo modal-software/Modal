@@ -468,6 +468,10 @@ typedef struct
     uint32_t tok;    // PATTERN_TEXT: the string literal
 } Pattern;
 int sema_pattern_of(Unit *u, NodeId param, SymId owner, Pattern *out, int loud);
+int sema_arm_pattern(Unit *u, NodeId pat, TypeId type, Pattern *out); // an arm's (0: a name)
+// AST_MATCH aux: MATCH_LAST_FREE: the arms above cover every value but the last arm's, so the
+// last needs no test (the compiler proved it).
+#define MATCH_LAST_FREE 1
 // A string literal's bytes, escapes decoded; returns the length (at most cap are written).
 size_t sema_pattern_text(const Unit *u, uint32_t tok, uint8_t *out, size_t cap);
 SymId sema_next_clause(Unit *u, SymId fn); // tried when fn's patterns do not match; 0: none
