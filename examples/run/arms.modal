@@ -1,24 +1,24 @@
--- Arms: `pattern: result`, tried in order; the first that takes the value gives the result.
--- A function body of arms matches its parameters (one pattern per parameter, `self` and
--- context parameters aside); `value { ... }` matches a value. A name takes any value and binds
--- it. Every value must be taken: the compiler names what is missing, and an arm that can never
--- run is an error.
+-- Arms: `pattern: result`, tried against a value; `:` takes the value (only `=` assigns).
+-- A pattern is a literal, a range (`1..9`, `100..`), a string, true / false, or `_` (every
+-- value). Several values: one pattern each, in parentheses; `_` alone takes all of them.
+-- An arm binds no name: the value keeps its own, and inside an arm it is known to be one of the
+-- arm's values. Arms take disjoint values, and every value must be taken: the compiler checks.
 print := import("std").io.print
 
-u8 command([]u8 s) {
+u8 command([]u8 s) {          -- a body of arms matches the parameters
     "help": 1
     "quit": 2
     "": 4
-    s: 0
+    _: 0
 }
 
 []u8 kind(c: u8) {
     48..57: "digit"
     32: "space"
-    c: "other"
+    _: "other"
 }
 
--- literals that cover every u8: no catch-all needed, and the last arm needs no test
+-- literals that cover every u8: no `_` needed, and the last arm needs no test
 []u8 size(u8 n) {
     0: "none"
     1..9: "small"
@@ -27,13 +27,20 @@ u8 command([]u8 s) {
 
 -- a loop: the arm's call is a tail call, so ten million turns run as a loop
 u64 sum(u64 n, u64 acc) {
-    0, acc: acc
-    n, acc: sum(n - 1, acc + n)
+    (0, _): acc
+    _: sum(n - 1, acc + n)
+}
+
+-- inside 1..9, n is known not to be 0: `100 / n` has no zero guard
+u64 share(u64 n) {
+    0: 0
+    1..9: 100 / n
+    _: n / 10
 }
 
 nil countdown(u8 n) {
     0: print("go")
-    n: {
+    _: {
         print(n)
         countdown(n - 1)
     }
@@ -47,23 +54,76 @@ nil countdown(u8 n) {
 
 main(): u8 {
     u8 c = 50
-    word := c {
-        48..57: "a digit"
-        c: "not a digit"
+    word := if c {
+        48..57: "a digit",
+        _: "not a digit"
     }
     print(word, kind(c), kind(32), kind(7), size(0), size(5), size(200))
     print(command("help"), command("quit"), command(""), command("x"), sum(10000000, 0))
-    c > 40 {
-        true: print("above 40")
-        false: print("40 or less")
+    if c {
+        48..57: print("digit", c - 48)
+        _: print("not a digit")
     }
+    --if c > 40: print("above 40") else print("40 or less")
+    if c {
+        40..: print("above 40"),
+        _: print("40 or less")
+    }
+    if c > 60 {
+        print("big")
+    } else if c > 45 {
+        print("middle")
+    } else print("small")
     i32 k = 0
     print(sign(k - 7), sign(k), sign(k + 7))
-    doubled := c {
-        0: 0
-        n: n * 2
+    u64 x = 0
+    print(share(x), share(x + 4), share(x + 70))
+    countdown(3)
+    print(word, kind(c), kind(32), kind(7), size(0), size(5), size(200))
+    print(command("help"), command("quit"), command(""), command("x"), sum(10000000, 0))
+    if c {
+        48..57: print("digit", c - 48)
+        _: print("not a digit")
     }
-    print("doubled", doubled)
+    if c > 40 print("above 40") else print("40 or less")
+    if c > 60 {
+        print("big")
+    } else if c > 45 {
+        print("middle")
+    } else print("small")
+    print(sign(k - 7), sign(k), sign(k + 7))
+    print(share(x), share(x + 4), share(x + 70))
+    countdown(3)
+
+    print(word, kind(c), kind(32), kind(7), size(0), size(5), size(200))
+    print(command("help"), command("quit"), command(""), command("x"), sum(10000000, 0))
+    if c {
+        48..57: print("digit", c - 48)
+        _: print("not a digit")
+    }
+    if c > 40 print("above 40") else print("40 or less")
+    if c > 60 {
+        print("big")
+    } else if c > 45 {
+        print("middle")
+    } else print("small")
+    print(sign(k - 7), sign(k), sign(k + 7))
+    print(share(x), share(x + 4), share(x + 70))
+    countdown(3)
+    print(word, kind(c), kind(32), kind(7), size(0), size(5), size(200))
+    print(command("help"), command("quit"), command(""), command("x"), sum(10000000, 0))
+    if c {
+        48..57: print("digit", c - 48)
+        _: print("not a digit")
+    }
+    if c > 40 print("above 40") else print("40 or less")
+    if c > 60 {
+        print("big")
+    } else if c > 45 {
+        print("middle")
+    } else print("small")
+    print(sign(k - 7), sign(k), sign(k + 7))
+    print(share(x), share(x + 4), share(x + 70))
     countdown(3)
     return 0
 }

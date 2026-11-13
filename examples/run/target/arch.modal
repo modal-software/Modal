@@ -3,7 +3,9 @@ print := import("std").io.print
 target := import("target")
 where := target.arch
 sys := target.os
+-- a match at module level: the compiler takes one arm; the others are not in the program
+family: []u8 = if target.arch { "arm64": "arm", "x86_64": "intel", _: "other" }
 main(): u8 {
-    print(where, sys)
+    print(where, sys, family)
     return 0
 }

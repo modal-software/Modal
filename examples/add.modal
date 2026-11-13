@@ -1,6 +1,7 @@
--- write("('('')('')('')')")
--- write("write('write('write('aa')')')")
--- write("aa")
+std := import("std")
+print := import("std").io.print
+print("('('')('')('')')")
+print("write('write('write('aa')')')")
+print("aa")
 print("this are a invoke\n")
-write("this invoke compile too")
--- aadada.print("this are a selector invoke, should not compile")
+print("this invoke compile too")
