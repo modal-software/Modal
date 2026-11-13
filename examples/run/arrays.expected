@@ -1,0 +1,8 @@
+7 8 0 200 7 99 7
+60005 200
+filled 0 -21
+c is still 0
+50 8 1 200
+104 111
+200
+./examples/run/arrays.modal:51:12: index out of range (0 to 3)

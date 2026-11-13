@@ -1,0 +1,44 @@
+-- struct literals (std.md §10). A struct is written once: no face line. Inside its domain every
+-- member is seen; a member another domain uses is public by that use (see run/domains/).
+-- Position still decides writing: a type-first field is writable, a type-last one is not.
+print := import("std").io.print
+
+point: struct {
+    i32 x,
+    y: i32,
+}
+
+span: struct {
+    lo: i32,
+    hi: i32,
+    u32 reads,
+}
+
+-- a constructor: the literal is built in self's storage (no copy), and self is the result
+new(self: span, lo: i32, hi: i32): *span {
+    return &span{ lo, hi, reads: 0 }
+}
+
+width(self: span): i32 {
+    self.reads = self.reads + 1
+    return self.hi - self.lo
+}
+
+shift(p: point, d: i32): point {
+    return point{ x: p.x + d, y: p.y + d }
+}
+
+main(): u8 {
+    p := point{ x: 3, y: 4 }        -- used only as p.x, p.y: each field lives in a register
+    x: i32 = 10
+    q := point{ x, y: -1 }          -- `x` alone: the x here
+    print(p.x, p.y, q.x, q.y)
+    r := shift(q, 5)                -- passed whole: a value in memory
+    print(r.x, r.y)
+    point m = point{ x: 1, y: 2 }
+    m.x = 7                         -- x is type-first: writable
+    print(m.x, m.y)
+    s := span.new(2, 9)
+    print(s.lo, s.hi, s.width(), s.width(), s.reads)
+    return 0
+}

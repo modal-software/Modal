@@ -1,0 +1,70 @@
+print := import("std").io.print
+
+limit: u8 = 50
+space := 32
+
+[]u8 kind(u8 c, u8 mine) {
+    w := if c {
+        limit: "the limit",          -- a constant: checked like a literal
+        space: "a space",
+        mine: "mine",                -- a parameter: compared when it runs, in its place
+        0..9: "small",
+        _: "other"
+    }
+    return w
+}
+
+u8 both(u8 a, u8 b) {
+    (limit, _): 1
+    (_, a): 2
+    _: 3
+}
+
+u64 total(u64 n, u64 acc) {          -- each arm returns: the call is a jump (1M turns, no stack)
+    return if n { 0: acc, _: total(n - 1, acc + n) }
+}
+
+only(u8 n) {                     -- no result: values no arm takes do nothing
+    7: print("seven")
+    8..9: print("eight or nine")
+}
+
+main(): u8 {
+    bool ok = true
+    bool no = false
+    u8 c = 50
+    u8 k = 3
+    if ok {
+        x: u8 = 3                -- a declaration first: a block, not arms
+        print("decl", x)
+    }
+    if ok { true: print("arm true"), false: print("arm false") }
+    if c == 50 { true: print("equal"), false: print("not equal") }
+    if (c) { 50: print("grouped"), _: print("other") }
+    if (c > 3) { print("grouped condition") }
+    u8 r = 0
+    if c { 50: r = 1, _: r = 2 }
+    print("assigned", r)
+    if c
+    {
+        50: print("brace on the next line")
+        _: {}
+    }
+    if c { 50: print("fifty") }      -- a statement may leave values untaken
+    if c { 49: print("never") }
+    only(7)
+    only(3)
+    only(9)
+    if ok if no print("both") else print("ok, not no")      -- else: the nearest if
+    if ok if c { 50: print("arms"), _: print("other") } else print("not ok")
+    print(kind(c, 9), kind(32, 9), kind(9, 9), kind(3, 9), kind(200, 200), kind(201, 200))
+    if k { c: print("k is c"), 3: print("three") }
+    print(both(50, 0), both(1, 1), both(1, 2))
+    print(total(1000000, 0))
+    u8 a = 0
+    u8 b = 7
+    if a, b { (0, 7): print("zero seven"), (0, _): print("zero"), _: print("other") }
+    w: u8 = if a, b > 5 { (0, true): 1, (0, false): 2, _: 3 }   -- a condition is a column too
+    print("columns", w)
+    return 0
+}

@@ -1,0 +1,12 @@
+-- a clause set with no result may leave values to nobody: the call then does nothing (a warning)
+print := import("std").io.print
+nil g(u8 0): print("zero")
+nil g(u8 1..3): print("small")
+nil g(u8 4..): print("above 3")
+main(): u8 {
+    g(0)
+    g(2)
+    g(9)
+    print("\n\n")
+    return 0
+}

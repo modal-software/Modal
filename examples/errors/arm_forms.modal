@@ -1,0 +1,53 @@
+print := import("std").io.print
+u8 old(u8 c) {
+    x := c: { 0: 1, _: 2 }
+    return x
+}
+u8 noelse(u8 c) {
+    if c { 0: return 1, _: return 2 } else return 3
+}
+u8 novalue(u8 c) {
+    x: u8 = if c > 3 { 1: 1, _: 0 }
+    return x
+}
+main(): u8 {
+    return 0
+}
+u8 several(u8 c) {
+    if c {
+        50: print("a")
+            print("b")
+        _: {}
+    }
+    return 0
+}
+limit: u8 = 50
+big := 300
+u8 again(u8 n) {
+    limit: 1,
+    50: 2,
+    _: 3
+}
+u8 wide(u8 n) {
+    big: 1,
+    nope: 2,
+    _: 3
+}
+u8 valued(u8 c) {
+    w := if c { 50: 1 }
+    return w
+}
+u8 novalue2(u8 c) {
+    x := if c > 3 { 1 }
+    return x
+}
+u8 columns(u8 a) {
+    if a, a { 0: return 1, _: return 2 }
+    return 0
+}
+u8 moving = 5
+u8 ends(u8 c) {
+    moving..9: 1,
+    9..3: 2,
+    _: 0
+}
