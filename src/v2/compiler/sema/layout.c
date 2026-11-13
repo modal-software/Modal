@@ -598,3 +598,10 @@ uint32_t layout_member_offset(SymId strct, NodeId member)
     struct_layout_at(strct, member, &off);
     return off;
 }
+
+int layout_member_gone(SymId strct, NodeId member)
+{
+    const Unit *home = &cx.units[SYM(strct)->unit];
+    SymId f = sema_is_register_block(strct) ? 0 : field_of(strct, home, member);
+    return f && layout_field_use(f, NULL) != FIELD_KEPT;
+}

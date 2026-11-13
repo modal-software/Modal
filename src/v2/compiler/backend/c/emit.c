@@ -944,24 +944,39 @@ static void emit_expr(Emit *e, NodeId id)
         PUT(e, ")");
         break;
     case AST_STRUCT_LIT: // a compound literal: C zeroes what it does not name (here, nothing)
-        PUT(e, "((");
-        out_type(e, u->types[id], n->tok);
-        PUT(e, "){");
+    {
+        PUT(e, "(");
+        // a field with no bytes (nothing reads it, or a constant): its value is still computed
         for (NodeId f = n->a; f; f = NEXT(u, f))
         {
             SymId field = u->refs[f];
-            if (!field)
+            if (field && layout_field_use(field, NULL) != FIELD_KEPT)
+            {
+                PUT(e, "(void)(");
+                emit_as(e, NODE(u, f)->a, sema_value_type(&cx.units[SYM(field)->unit], field));
+                PUT(e, "), ");
+            }
+        }
+        PUT(e, "(");
+        out_type(e, u->types[id], n->tok);
+        PUT(e, "){");
+        int any = 0;
+        for (NodeId f = n->a; f; f = NEXT(u, f))
+        {
+            SymId field = u->refs[f];
+            if (!field || layout_field_use(field, NULL) != FIELD_KEPT)
             {
                 continue;
             }
-            PUT(e, " .");
+            put(e, any ? ", ." : " .");
+            any = 1;
             out_tok(e, NODE(u, f)->tok);
             PUT(e, " = ");
             emit_as(e, NODE(u, f)->a, sema_value_type(&cx.units[SYM(field)->unit], field));
-            put_c(e, NEXT(u, f) ? ',' : ' ');
         }
-        PUT(e, "})");
+        PUT(e, any ? " })" : "0})");
         break;
+    }
     case AST_UNARY_OP:
         if (t->kind == TOK_AMP && is_self_ident(u, n->a))
         {
@@ -1081,6 +1096,23 @@ static void emit_expr(Emit *e, NodeId id)
             PUT(e, "0");
             break;
         }
+        uint64_t constant;
+        if (layout_field_use(member, &constant) != FIELD_KEPT) // no bytes: the constant it always is
+        {
+            char num[48];
+            PUT(e, "(");
+            if (NODE(u, n->a)->kind != AST_IDENT)
+            {
+                PUT(e, "(void)(");
+                emit_expr(e, n->a);
+                PUT(e, "), ");
+            }
+            PUT(e, "(");
+            out_type(e, u->types[id], n->tok);
+            snprintf(num, sizeof(num), ")%lluull)", (unsigned long long)constant);
+            put(e, num);
+            break;
+        }
         if (is_self_ident(u, n->a))
         {
             PUT(e, "self->");
@@ -1098,6 +1130,14 @@ static void emit_expr(Emit *e, NodeId id)
         emit_call(e, id);
         break;
     case AST_ASSIGN:
+        if (NODE(u, n->a)->kind == AST_SELECTOR && u->refs[n->a] && SYM(u->refs[n->a])->kind == SYM_FIELD &&
+            layout_field_use(u->refs[n->a], NULL) != FIELD_KEPT)
+        {
+            PUT(e, "(void)("); // a field with no bytes: the value is computed, and goes nowhere
+            emit_as(e, n->b, u->types[n->a]);
+            PUT(e, ")");
+            break;
+        }
         emit_expr(e, n->a);
         PUT(e, " = ");
         emit_as(e, n->b, u->types[n->a]);
@@ -1544,9 +1584,9 @@ static void emit_struct(Emit *e, NodeId decl)
         {
             unsupported(e, NODE(u, m)->tok, "a struct declared inside another struct");
         }
-        if (NODE(u, m)->kind != AST_FIELD_DECL)
+        if (NODE(u, m)->kind != AST_FIELD_DECL || (self && layout_member_gone(self, m)))
         {
-            continue;
+            continue; // no bytes: not declared in C either
         }
         total++;
         uint32_t at = self ? layout_member_offset(self, m) : 0, k = nf < 64 ? nf++ : 64;
@@ -1566,7 +1606,7 @@ static void emit_struct(Emit *e, NodeId decl)
          m = as_written ? NEXT(u, m) : (++next < nf ? by_offset[next] : 0))
     {
         const AstNode *member = NODE(u, m);
-        if (member->kind != AST_FIELD_DECL)
+        if (member->kind != AST_FIELD_DECL || (self && layout_member_gone(self, m)))
         {
             continue;
         }
@@ -1605,7 +1645,7 @@ static void emit_struct(Emit *e, NodeId decl)
     for (NodeId m = n->a; m && !has_str && self; m = NEXT(u, m))
     {
         const AstNode *member = NODE(u, m);
-        if (member->kind != AST_FIELD_DECL)
+        if (member->kind != AST_FIELD_DECL || (self && layout_member_gone(self, m)))
         {
             continue;
         }
@@ -1805,7 +1845,7 @@ static void emit_computed(Emit *e, const ComptimeAggregate *c, TypeId t, uint32_
         int first = 1;
         for (NodeId m = NODE(home, SYM(st)->decl)->a; m; m = NEXT(home, m))
         {
-            if (NODE(home, m)->kind != AST_FIELD_DECL)
+            if (NODE(home, m)->kind != AST_FIELD_DECL || layout_member_gone(st, m))
             {
                 continue;
             }

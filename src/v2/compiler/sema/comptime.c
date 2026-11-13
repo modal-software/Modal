@@ -178,7 +178,7 @@ static const char *portable(TypeId t, uint32_t off, uint8_t *is_str, uint32_t k)
         Unit *home = &cx.units[SYM(st)->unit];
         for (NodeId m = NODE(home, SYM(st)->decl)->a; m; m = NEXT(home, m))
         {
-            if (NODE(home, m)->kind != AST_FIELD_DECL)
+            if (NODE(home, m)->kind != AST_FIELD_DECL || layout_member_gone(st, m))
             {
                 continue;
             }

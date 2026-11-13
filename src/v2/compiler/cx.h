@@ -520,5 +520,6 @@ uint32_t layout_member_offset(SymId strct, NodeId member); // a field declaratio
 // has no bytes, its writes are dropped) or FIELD_CONSTANT (always *value: reads are the constant).
 enum { FIELD_KEPT, FIELD_UNREAD, FIELD_CONSTANT };
 int layout_field_use(SymId field, uint64_t *value);
+int layout_member_gone(SymId strct, NodeId member); // that field declaration has no bytes
 
 #endif // MODAL_V2_CX_H
