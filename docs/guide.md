@@ -15,6 +15,7 @@ MODAL_REGS=0 ./modal ...               # the same without register allocation (t
 ./modal --target arm64-linux -o prog f.modal        # also x86_64-linux, x86_64-macos
 ./modal --target arm64-none -o image f.modal        # bare metal, from mod.modal's memory map
 make test                              # the suite;  make bench   the performance table
+# working on the compiler itself: docs/development.md
 ```
 
 Useful flags:
@@ -109,14 +110,53 @@ uart: struct { u8 dr @ 0x00, u32 status @ 0x04 }   -- a register block (offsets)
 uart0: uart @ 0x0900_0000                          -- a device at an address
 ```
 
+The compiler fills one context itself: a parameter `site: site` receives the place of each call,
+`file:line:col: <the call as written>`. A function that has its own `site` passes it on.
+
+## 5b. Primitives and std
+
+The language has a few predeclared names. They are not keywords, so a declaration of your own
+with the same name wins. Everything else comes from std, which is written in Modal
+(`docs/std.md`).
+
+```
+sizeof(header)      -- bytes in the target's layout, an unsized constant (no import)
+u8(300)             -- 44: a conversion between integer types wraps, as a C cast does
+trap("why: ", msg)  -- its strings to the error output, then status 1
+assert := import("std").assert    -- std: assert(n < 4) prints `f.modal:9:5: assert(n < 4) is false`
+print := import("std").io.print   -- still the compiler's (variadic), by this path
+```
+
+At module level, `assert(...)` or any call is a statement the compiler runs, and a false assert is
+a compile error there.
+
+Compile-time values are read at module level only (a body that reads one is an error):
+
+```
+target := import("target")      -- the machine compiled for
+words := target.ptr_size * 8    -- also word_size, arch ("arm64"), os ("macos", "linux", "none"),
+                                -- has_output, big_endian
+budget := max_ram / 2           -- the domain's mod.modal values, by name
+assert(target.ptr_size == 8)
+```
+
 ## 6. Known gaps (what to expect)
 
 - **Control flow:** pattern clauses, recursion and `and`/`or` only. No `if`, loops or `match`.
-- **No arrays,** slice operations, casts, floats, `%`, bitwise operators or shifts.
+  A loop is a clause that calls its function again as its last act (`u64 sum(u64 n, u64 acc):
+  sum(n - 1, acc + n)`): that call is a jump, so it runs in constant stack on every backend, and
+  in registers on native. A call that is not the last act (`n + sum(n - 1)`) takes a frame per turn.
+- **No arrays,** slice operations, casts, floats, `%`, bitwise operators or shifts, if we want support array we wan to have 
+several modalities to working with it. fixed-width arrays, 0 to k with T[..], grow-only, shrink-only, grow-n-shrink. in those modalities im accepting design suggestions to design. because our core philosophy its developer have control,safety but without taking hand-off perfomance.   
 - **Overloads** are chosen by argument count only. `T f(u8)` and `T f([]u8)` collide.
 - **Module-level values are computed by the compiler:** `limit: u64 = fact(10)` runs `fact`
-  while compiling, for numbers and bools so far. A function that prints, touches a device or
-  uses a mutable module variable cannot run there; the error says which one.
+  while compiling. That covers numbers, bools, strings and structs of these.
+  - A function that prints, touches a device or uses a mutable module variable cannot run there;
+    the error says which one.
+  - `n := 5` stays unsized, like the literal, until it meets a type.
+  - Functions declared in `mod.modal` run only there, for the files of their domain.
+  - A module-level `assert(...)` is checked by the compiler.
+  - Calls whose arguments are all constant are computed while optimizing (native backends).
 - **Not supported in code generation yet,** though the checker accepts them, so the error
   comes late: function values (`f := double` then `f(1)`), closures, `==` on strings, pointers
   and structs, and structs inside structs.
@@ -124,7 +164,7 @@ uart0: uart @ 0x0900_0000                          -- a device at an address
   members are typed as "anything", so mistakes there are found only by the backend.
 - **Diagnostics:** a syntax error in a deferred body can repeat as "expected '{'" at another
   place. An unsized literal prints as `int`.
-- **Tooling:** no warnings, test runner (`test`/`assert` are reserved), formatter, LSP,
+- **Tooling:** no warnings, test runner (`test` is reserved), formatter, LSP,
   debugger info, or REPL.
 
 ## 7. HPC and HPD: where Modal stands

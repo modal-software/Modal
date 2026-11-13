@@ -104,12 +104,29 @@ and a failure is a compile error. In a body it is a run-time check that traps wi
 
 1. **Done:** wrapping defined in C; division by zero and `INT_MIN / -1` the same everywhere;
    a literal zero divisor is a compile error.
-2. **Stack overflow:** a check of the value stack's top at each call into a recursive cycle
-   (the call graph already knows which ones), trapping with kind `stack`.
+2. **Stack overflow:** a check of the value stack's top at each call into a recursive cycle,
+   trapping with kind `stack`. Analysed 2026-11-12 (context.md §27); not built yet:
+   - **When the cycles are known:** the native backend generates each function as soon as it is
+     checked, and learns whether the program recurses only at the end (`stack_need`). A guard
+     that costs nothing in programs that do not recurse must therefore be patched out after the
+     fact (a reserved sequence turned into a jump), or every function that calls another must
+     check. The second costs a load, a compare and a branch per call. Speed comes first, so it
+     is the patched form.
+   - **The same depth on every backend:** the ground rule asks for the same output, and a
+     program that overflows prints what it printed before the trap. So the limit must be in
+     calls, `stack / largest frame of the cycle`. The C backend would then need the MIR frame
+     sizes: it does not lower MIR today.
+   - Today an overflow runs over the value stack on the native backends, and over C's stack in
+     the C backend.
+   - **Since context.md §28 loops do not use the stack:** a tail call (a clause calling its
+     function again, the clause chain, `return f(...)`) is a jump on every backend. What can
+     still overflow is recursion that is not a tail call (`n + f(n - 1)`), which the guard is for.
+     A tail call needs no check, so the guard goes only on the calls that stay calls in a cycle.
 3. **The `fault` context:** routing, the boundary (resetting the value stack's top, and the
    native stack to the boundary's frame), and the target defaults.
 4. ~~**`assert` as a std function**~~ done (context.md §24): in a body it traps with
-   `file:line:col: assertion failed: <condition>`, status 1, the same on every backend; at
+   `file:line:col: assert(<condition>) is false`, status 1, the same on every backend. Since
+   context.md §26 it is std code in Modal, on the `trap` and `site` primitives (docs/std.md). At
    module level a failure is a compile error. Left: `--stats` listing the fault points, and the
    `fault` context (step 3) receiving it with kind `assert`.
 

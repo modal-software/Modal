@@ -1433,6 +1433,213 @@ Comptime steps 1 and 2 (docs/comptime.md), and what p.md B5 left: calls with con
 
 ---
 
+## 25. The development guide, and two tools
+
+- **`docs/development.md`:** how to work on the compiler. It covers:
+  - the priority order the owner set on 2026-11-12: **speed first, binary size second**;
+  - the language rules a change keeps, including the new **core/std rule**: the compiler holds
+    only primitives Modal cannot express, std is Modal source, and neither the bootstrap nor std
+    depends on libc;
+  - the map of `src/v2`, build and test, what makes a change done;
+  - how each phase is documented, and the pitfalls met so far.
+- **`make backends F=file.modal`** (`tools/backends.sh`): one program on C, arm64, x86-64 and
+  both Linux ELFs, with each status and output hash. It replaces the ad-hoc script of §24.
+- **`make asan`:** builds `./modal-asan`. `BIN=./modal-asan make test` runs the suite under the
+  sanitizers.
+- **`guide.md`:** module-level strings and structs, mod.modal functions, unsized constants and
+  folded calls are no longer listed as gaps. `assert` is no longer reserved.
+- **Decided, for the phases after this one** (the owner's answers): std moves into Modal files
+  on core primitives (§26, `docs/std.md`); then the stack overflow guard and target/config
+  values at compile time. Partial specialization is deferred, and will be opt-in when it comes.
+
+---
+
+## 26. The core and std: primitives, std as Modal files, C without stdio
+
+docs/std.md steps 1–3. The owner chose "core primitives + std in Modal" (§25): the compiler
+implements only what Modal cannot express. std is Modal source, never needed to build the
+compiler, and using no libc.
+
+- **Primitives** (predeclared names, not keywords; a program's own declaration wins). The checker
+  marks a call to one in the call node's `aux` (`PRIM_*`, `sema_primitive`):
+  - `sizeof(T)`: no import any more (it was `import("std").mem.sizeof` in §24);
+  - `u8(x)`, `i32(x)`, ...: a conversion, wrapping as a C cast does. It is `lower_as` in the MIR
+    (a `norm`), folded when constant, and a C cast in the C backend;
+  - `trap(a, b, ...)`: its strings to the error output after the program's output, then status 1.
+    - Literal parts are joined into one message. Any other part (a parameter) is a
+      `MIR_TRAP` with sub `MIR_TRAP_PART`, which ends no block (`MIR_ENDS`).
+    - Native: `rt_trap_part` and the stencil `write_trap_part`. `rt_trap` now calls
+      `rt_trap_part`, because clang's machine outliner otherwise made a shared function
+      stencilgen cannot patch.
+    - C: `m_trap_part`.
+    - The interpreter gathers the parts: a trap at compile time is a compile error with that
+      text;
+  - `site: site`: a context parameter of type `[]u8`. When the caller has no `site` of its own,
+    `fill_contexts` inserts an `AST_SITE` node, whose text `sema_site_text` computes from the
+    call's tokens: `file:line:col: <the call as written>`.
+- **std is files** (`std/mod.modal`, `std/debug.modal`):
+  - found through `$MODAL_STD` or `std/` next to the executable (`find_std`, kept across
+    `context_reset`);
+  - a root domain wherever it lives. Its face is what its mod.modal binds:
+    `assert := import("std").assert`;
+  - `std.io` and `std.sys` stay the compiler's namespaces (`compiler_namespace`), so a program
+    that only prints reads no std file. hello.modal: 1 file, as before;
+  - without a std folder, `import("std")` is external, as it was before std had files.
+- **assert is Modal:** `bool assert(bool true, site: site): true`, then
+  `bool assert(bool ok, site: site) { trap(site, " is false\n") ... }`.
+  - The compiler's assert is gone (`STD_ASSERT`, `check_assert`, its lowering and C emission).
+  - A module-level call statement is generic (`statement` in comptime.c). When the trap names
+    the statement's own place, its text is the error, and a comparison as the first argument
+    gets both sides: `assert(sizeof(header) == 12) is false (8 == 12)`.
+  - Messages changed: `assertion failed: n < 4` is now `assert(n < 4) is false`.
+- **A binding that names a function is that function:** `module_binding_function` follows
+  re-exports, so `assert := import("std").assert` is a direct call.
+- **The C backend emits the functions of every file,** each in its own file's context and named
+  `m_u<file>_...`.
+  - A type or a module-level value in an imported file is reported as not supported yet. That
+    is the remaining multi-file work; it was "importing another Modal file" before.
+  - Its programs no longer use stdio. A 4 KB buffer is written with `write`, numbers are
+    formatted by the prelude, and traps use `write` and `exit`. The helpers are `mrt_*`, a
+    prefix no Modal name can become: a program's own `out` became `m_out` and clashed with the
+    first version.
+- **Found on the way:**
+  - `comptime_depth` and `comptime_steps` (§23) were never in the list of known mod.modal keys,
+    so setting one was an error. They are now known, and checked (`budget_ct/`).
+  - The interpreter's C frame held message buffers at every Modal call, and ASan's larger frames
+    overflowed the C stack at depth 1,000. The messages moved to `stopf`.
+  - A very high `comptime_depth` could overflow the compiler's own stack. First a guard turned
+    that into an error; §27 removes the cause, since the interpreter no longer recurses in C.
+  - A pattern mismatch said "parameter 'true' is bool". It now says "argument 1 of 'assert' is
+    int, but it takes bool".
+- **Measured:**
+  - assert as a call: 10,000,000 asserts in a recursive walk take 116 ms, against 118 ms with no
+    assert at all (best of 10). Within noise, so the speed gate passes;
+  - guards.modal: code 1,060 → 1,164 B and RAM 496 → 624 B (the assert calls). Accepted under
+    speed first, size second;
+  - traps: divide.modal 1,100 → 1,120 B (`rt_trap_part` is always beside `rt_trap`);
+  - compiling a program that imports std: 2 more files, 0.018 ms checking for guards.modal,
+    61.3 KB of compiler memory.
+- **Verified:**
+  - suite: 223 passing, the 8 known failures only. New: primitives.modal on every backend and
+    both ELFs, the comptime budget check, and the assert checks updated to the new messages;
+  - fuzz: 0 differ in 269 programs (mix, struct, scalar, pressure, and registers off). The C
+    backend, the reference, now writes through `write`;
+  - ASan/UBSan: the suite (all but the 8 known), `--repeat 3` and `--sig` on the std examples,
+    and the fuzzer.
+- **Not yet:** formatting in Modal (std.md step 4, behind the speed gate), and types and values in
+  imported files on the C backend.
+
+---
+
+## 27. Target and config values at compile time; the interpreter's own call stack
+
+comptime.md step 2's remainder, and guards.md step 2 analysed.
+
+- **`target := import("target")`:** a module the compiler makes from `MachineTarget`
+  (`module_target_unit`). It is text scanned and parsed like a file, at `/(compiler)/target.modal`,
+  marked `provided`.
+  - Members: `ptr_size`, `word_size` (unsized), `arch` (`"arm64"`, `"x86_64"`), `os` (`"macos"`,
+    `"linux"`, `"none"`), `has_output` and `big_endian`.
+  - Visible from every domain. Its values are compile time only, so the C backend never emits
+    them.
+  - `unit_load` was split: `unit_from_source` builds a unit from text, from disk or not.
+- **Configuration by name:** a domain's mod.modal values (`max_ram := 4096`) are readable by name
+  in its files, after their own declarations, as mod.modal functions are
+  (`module_domain_function`).
+- **Compile time only:** reading either one from a function body is an error that says how to use
+  it (`compile_time_value` in check.c):
+  `'max_ram' is configuration of the domain, a compile-time value: a function body cannot read it.
+  Give its value a name at module level (n := ... max_ram ...) and use that name here`.
+- **A bool constant of another file** (`has_output := true`) now folds (`const_value`). It was
+  "a module-level constant that is not a literal".
+- **The interpreter keeps its own call stack** (`struct CtFrame` in comptime.c). A Modal call
+  pushes a frame record instead of recursing in C. `comptime_depth` is bounded only by itself
+  and the 512 KB value stack, no longer by the compiler's own stack, which under ASan stopped
+  evaluations at 523 calls. The guard of §26 is gone with its cause.
+- **The stack overflow guard (guards.md step 2) is analysed, not built:**
+  - the native backend learns that a program recurses only after its functions are generated;
+  - a guard that costs nothing elsewhere needs patching afterwards;
+  - and the same depth on every backend needs MIR frame sizes in the C backend.
+  guards.md records both.
+- **Measured:** big: emit 29–30 ms, 41.26 MB, the same as §24.
+- **Verified:**
+  - suite: 230 passing, the 8 known failures only. New: `run/target/` on C, arm64 and x86-64;
+    `target.arch` on arm64 and x86-64; two compile-time value errors;
+  - fuzz: 0 differ (mix, 181 programs since §26);
+  - ASan/UBSan: the full suite with the 8 known failures only (the depth check now passes
+    under ASan). The target and primitives examples with `--repeat`, `--sig` and two targets.
+- **Not yet:** the stack overflow guard (above), arrays `[N]T`, formatting in Modal (std.md step 4).
+
+## 28. Tail calls, clause loops, the inline byte sink, constant division (std.md step 4)
+
+std.md step 4's optimizer prerequisites. Measuring a formatter written in Modal found a crash
+first: a loop of more than ~16,000 turns (`u64 loop(u64 n, ...): loop(n - 1, ...)`) ended with
+SIGSEGV on native, and the C backend overflowed too (`--run` builds with no `-O`; even clang
+`-O2` did not make it a jump). Modal's loops are recursion, so a tail call is semantics, not an
+optimization. Since this section every backend runs them in constant stack.
+
+- **MIR_CALL_TAIL** (a `sub` of MIR_CALL; `b`: the callee's parameter slots). `mark_tail_calls`
+  in lower.c turns `call g; copy s0.. = window; ret` into one, after the function is optimized
+  and kept for inlining (a spliced body must return to its caller).
+  - Not in a function with MIR_ADDR (a struct it built, a local passed by reference): the
+    callee's frame takes this one's place.
+  - Native, registers: the arguments move from the window to slots 0.. in the callee's own
+    numbering, the saved registers come back (`regs_restore`, split from the epilogue), then
+    `b callee` / `jmp callee`.
+  - Native, stencils: `copy` stencils, then the new `tail` stencil (`musttail CALLEE(f, c, 0)`).
+  - The interpreter moves the arguments and changes function in the same frame (no CtFrame), so
+    `comptime_depth` does not count tail calls: `total := sum(100000, 0)` at module level was "calls
+    nest deeper than comptime_depth = 1000" and is now 5000050000.
+  - C: `M_TAIL` is clang's and GCC's `musttail` (`return` elsewhere), on `return f(...)`, a
+    one-line body, a void function's last call, and the clause fall-through. Only with the same
+    prototype and numbers and bools as parameters and result: musttail's rule, and no argument
+    can point into the frame that the callee takes over.
+- **Pattern clauses joined** (`mir_clause_hold` / `mir_clause_merge`, registry.c): every clause
+  is its own function, and a loop went through two of them per turn (the first clause's tests,
+  the tail call to the next, its tail call back to the first).
+  - A clause that ends by going on to the next is held (copied to the arena) until the next is
+    lowered. The two then become one function: the first up to its miss label, then the next,
+    with its labels, strings and window renumbered (`reframe_inst`). A chain joins in turn.
+  - In the joined function the recursion is a tail call to itself. `self_loops` makes it
+    `copy params = window; jump top`, with **MIR_JUMP** (new, made only after the optimizer) and
+    a label before the first instruction. The register allocator sees an ordinary loop.
+  - The next clause is still generated on its own; nothing calls it, so the shake drops it.
+- **The inline byte sink:** the `write_byte`, `write_space` and `write_nl` stencils store into the
+  buffer and call `rt_flush` only when it is full (`put_byte`), instead of `rt_put` for one byte.
+  Direct mode is unchanged: it is chosen from the runtime calls, and `rt_flush` is not
+  `rt_write_str`.
+- **Unsigned division by a constant** (native): `umulh` and a shift on arm64, `mul` (rdx) and
+  `shr` on x86-64, the add form when the multiplier needs 65 bits, a shift for a power of two
+  (`div_magic`, Granlund–Montgomery, validated on 20 million divisor and value pairs). Not for
+  signed division or a divisor above 2^63, which still divide. On x86-64 it no longer goes
+  through the division stencil, so its operands no longer need frame homes.
+- **Measured:**
+  - `sum` over 100,000,000 turns: 290 ms (two calls per turn) → 23.5 ms on native registers;
+    stencil mode 87.7 ms.
+  - The formatter experiment (std.md §6): a million numbers printed, the compiler's 16.1 →
+    10.7 ms; Modal digits by recursion 44.3 → 28.1 ms; Modal by tail calls 23.0 ms. 2.1×: the
+    gate is not met, and the rest is the algorithm without arrays.
+  - `make bench` (Apple M4, best of 10): exec 0.87–1.45 ms for every program, at the process
+    start (0.73 ms); code secret 40 B, hello 56, output 1,336, structs 3,016 (3,072 in §21),
+    patterns 1,252; big: check 18.7 ms, emit 32.1 ms, 41.26 MB as in §27. No regression.
+- **Verified:**
+  - suite: 240 passing, the 8 known failures only. New: `run/loops.modal` (ten million turns:
+    a clause loop, two functions calling each other, a loop that prints) and
+    `run/quotients.modal` (18 constant divisors, from 1 to above 2^63, on values from module
+    variables so nothing is folded), each on C, arm64, x86-64 and both Linux ELFs;
+  - the fuzzer now generates accumulator loops (a tail call, up to 3,000 turns, also at module
+    level for the compiler). 0 differ in 12 rounds: mix, struct, scalar, pressure, MODAL_REGS=0
+    and 2, before and after the sink and division (about 1,050 programs);
+  - ASan/UBSan: the suite with no sanitizer report; the 8 known failures, and `loops.modal` on the
+    four native lines because the example was edited after its `.expected` (a `print("sum")` in
+    `count`, at 00:34) — not by this work, left as it is. Every backend agrees on the edited
+    program (`make backends`).
+- **Not yet:** formatting in Modal (std.md §6: arrays first); signed division by a constant;
+  the stack overflow guard for the calls that stay calls (guards.md step 2); `print` as std
+  (designed, std.md §7, for the owner).
+
+---
+
 ## Appendix A. The owner's original specification inputs
 
 These are the inputs the design started from, as the owner wrote them. Where the

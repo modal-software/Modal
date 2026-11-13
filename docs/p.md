@@ -38,6 +38,9 @@ Done (details in context.md):
 | comptime 0, 1 | function kinds in `--sig`; module-level initializers computed by the compiler (MIR interpreter) | §22, §23 |
 | comptime 1, 2 | string and struct values, `mod.modal` functions, unsized constants, `assert` / `sizeof` | §24 |
 | B5 | calls with constant arguments computed by the compiler (big: code 16,680 → 52 B, RAM 6,336 → 64 B, emit 35 → 31.5 ms) | §24 |
+| std 1–3 | primitives (`sizeof`, `u8(x)`, `trap`, `site`), std as Modal files (assert), C backend without stdio; assert as a call costs no measurable time | §26 |
+| comptime 2 | `import("target")` and mod.modal values at compile time; the interpreter keeps its own call stack (no C recursion per Modal call) | §27 |
+| std 4 (prerequisites) | tail calls as jumps on every backend, pattern clauses joined so a clause loop is a loop in registers (100M turns: 290 → 23.5 ms, and no crash past ~16K turns); inline byte sink; unsigned division by a constant as a multiplication. Formatting in Modal is 2.1× the C stencil: waits on arrays (std.md §6) | §28 |
 
 Not done: the Cortex-M backend (register allocation, its base, is done: §20), interrupts (need
 QEMU or a board to verify).

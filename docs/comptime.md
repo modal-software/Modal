@@ -173,10 +173,9 @@ sides of a comparison. In a body it is a run-time guard (`docs/guards.md`). One 
 the position chooses the time. Done (context.md §24):
 
 ```
-assert := import("std").debug.assert
-sizeof := import("std").mem.sizeof
+assert := import("std").assert   -- std, written in Modal (docs/std.md); sizeof is a primitive
 
-assert(sizeof(header) == 12)   -- error: assertion failed: sizeof(header) == 12 (8 == 12)
+assert(sizeof(header) == 12)   -- error: assert(sizeof(header) == 12) is false (8 == 12)
 tables()                       -- a call at module level runs for the asserts inside it
 ```
 
@@ -229,8 +228,14 @@ These are implemented after the binary work of p.md. Each is usable on its own.
    callees in files not checked yet, unsized integer constants (§24). Verified by a
    differential that cannot be gamed: generated programs print `f(args)` from a body and the
    same call bound at module level, and they must agree on C, arm64, x86-64 and Linux.
-2. ~~**`assert`, `sizeof`**~~ done (§24). Left of this step: target and config values. Arrays
-   (`[N]T`, with `N` a compile-time value) are designed here: the main embedded use is a table
-   computed once, in flash.
+2. ~~**`assert`, `sizeof`**~~ done (§24, and §26 moves them to a primitive and std).
+   ~~**Target and config values**~~ done (§27):
+   - `target := import("target")` gives `ptr_size`, `word_size`, `arch`, `os`, `has_output` and
+     `big_endian`;
+   - a domain's mod.modal values are readable by name in its files;
+   - both at module level only. A body that reads one is an error that says how to use it.
+
+   Left of this step: arrays (`[N]T`, with `N` a compile-time value). The main embedded use is a
+   table computed once, in flash.
 3. **`type` parameters** and specialization.
 4. **Lambdas** as compile-time arguments.
