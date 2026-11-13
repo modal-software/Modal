@@ -62,6 +62,15 @@ bench: modal
 fuzz: modal
 	python3 -I ./src/v2/tools/fuzz.py $(or $(N),100) $(or $(SEED),1)
 
+# One program on every backend: each line must show the same status and output hash.
+backends: modal
+	sh ./src/v2/tools/backends.sh $(F)
+
+# The compiler with AddressSanitizer and UndefinedBehaviorSanitizer, as ./modal-asan. Run the
+# suite with it: BIN=./modal-asan make test (and the fuzzer the same way).
+asan: $(SRCS) $(HDRS) $(NATIVE)/stencils_arm64.h $(NATIVE)/stencils_x86_64.h
+	clang -g -O0 -fsanitize=address,undefined -fno-sanitize-recover=undefined -std=c17 -I src $(SRCS) -o ./modal-asan
+
 test_parser3: src/v2/tests/ll1_parsing_3.c
 	$(CC) -Wall -Wextra -O2 -std=c17 -pthread src/v2/tests/ll1_parsing_3.c -o src/v2/tests/test_parser3
 
@@ -74,6 +83,6 @@ bench3: test_parser3
 	./src/v2/tests/test_parser3 dyn 32
 
 clean:
-	rm -f $(OBJS) $(OBJS:.o=.d) modal modal-v2
+	rm -f $(OBJS) $(OBJS:.o=.d) modal modal-v2 modal-asan
 
 -include $(OBJS:.o=.d)
