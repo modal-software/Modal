@@ -110,6 +110,21 @@ static int pattern_len(const Token *t)
         return 2 + (is_name_token(h) || h->kind == TOK_NUMBER ? 1
                     : h->kind == TOK_MINUS && (h[1].kind == TOK_NUMBER || is_name_token(h + 1)) ? 2 : 0);
     }
+    if (is_name_token(t) && t[1].kind == TOK_LPAREN) // `fieldsof(T)`: a constant made by a call
+    {
+        int depth = 0, k = 1;
+        do
+        {
+            depth += t[k].kind == TOK_LPAREN;
+            depth -= t[k].kind == TOK_RPAREN;
+            if (t[k].kind == TOK_EOF || t[k].kind == TOK_LBRACE || t[k].kind == TOK_RBRACE)
+            {
+                return 0;
+            }
+            k++;
+        } while (depth > 0);
+        return k;
+    }
     if (is_any_token(t) || is_bool_token(t) || t->kind == TOK_STRING || is_name_token(t))
     {
         return 1;
@@ -225,6 +240,17 @@ static NodeId parse_pattern(Parser *p)
                 return n;
             }
         }
+    }
+    if (is_name_token(t) && t[1].kind == TOK_LPAREN) // `fieldsof(T)`: the value of a call, a constant
+    {
+        NodeId call = parse_expression(p);
+        if (!call)
+        {
+            return 0;
+        }
+        NodeId n = node_new(u, AST_PATTERN, tok_idx(p, t), call, 0);
+        NODE(u, n)->aux = PAT_NAME;
+        return n;
     }
     if (is_name_token(t)) // an existing value: the arm takes what equals it
     {

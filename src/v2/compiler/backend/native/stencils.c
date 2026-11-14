@@ -287,6 +287,18 @@ STORE_STENCILS(64, uint64_t)
 
 // ---- module-level variables ----------------------------------------------------------------------
 
+STENCIL(gaddr) // f[A] = the address of global B (data that holds addresses)
+{
+    f[A] = (uint64_t)(uintptr_t)&c->globals[B];
+    NEXT;
+}
+
+STENCIL(gaddr_r) // acc = the address of global B
+{
+    acc = (uint64_t)(uintptr_t)&c->globals[B];
+    NEXT;
+}
+
 STENCIL(gload) // f[A] = global B
 {
     f[A] = c->globals[B];

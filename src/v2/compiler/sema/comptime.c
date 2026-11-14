@@ -18,6 +18,7 @@
 #include "v2/compiler/sema/types.h"
 #include <stdarg.h>
 #include <string.h>
+#include <stdlib.h>
 
 typedef struct
 {
@@ -328,7 +329,62 @@ static __attribute__((noinline, format(printf, 3, 4))) int stopf(Vm *vm, SymId f
     return stop(vm, fn, what);
 }
 
-// Is [p, p + n) memory the evaluation owns (its value stack, or a string it made)?
+// Descriptors (std's type, then its member table) in the compiler's memory, made once per type
+// with real addresses: the interpreter's MIR_DESC. Each evaluation that reaches one may read them.
+#define CT_DESCS 256
+static struct
+{
+    TypeId t;
+    uint64_t *at;
+    uint32_t words;
+} ct_descs[CT_DESCS];
+static int nct_descs;
+
+static int ct_desc_index(TypeId t)
+{
+    for (int i = 0; i < nct_descs; i++)
+    {
+        if (ct_descs[i].t == t)
+        {
+            return i;
+        }
+    }
+    if (nct_descs == CT_DESCS)
+    {
+        return -1;
+    }
+    uint64_t d[4];
+    sema_type_desc(t, d);
+    int me = nct_descs++;
+    uint32_t words = 5 + 2 * (uint32_t)d[3];
+    uint64_t *w = (uint64_t *)arena_alloc(words * 8);
+    memset(w, 0, words * 8);
+    ct_descs[me].t = t;
+    ct_descs[me].at = w;
+    ct_descs[me].words = words;
+    memcpy(w, d, 4 * 8);
+    w[4] = d[3] ? (uint64_t)(uintptr_t)(w + 5) : 0;
+    if (type_kind(t) == T_STRUCT)
+    {
+        SymId st = type_ref(t);
+        Unit *home = &cx.units[SYM(st)->unit];
+        uint32_t k = 0;
+        for (NodeId m = NODE(home, SYM(st)->decl)->a; m; m = NEXT(home, m))
+        {
+            if (NODE(home, m)->kind != AST_FIELD_DECL)
+            {
+                continue;
+            }
+            int of = ct_desc_index(sema_type_of(home, NODE(home, m)->a, st));
+            w[5 + 2 * k] = layout_member_offset(st, m);
+            w[6 + 2 * k] = of >= 0 ? (uint64_t)(uintptr_t)ct_descs[of].at : 0;
+            k++;
+        }
+    }
+    return me;
+}
+
+// Is [p, p + n) memory the evaluation owns (its value stack, a string it made, a descriptor)?
 static int reachable(const Vm *vm, uint64_t p, uint64_t n)
 {
     uint64_t lo = (uint64_t)(uintptr_t)vm->stack, hi = lo + vm->cap * 8;
@@ -340,6 +396,14 @@ static int reachable(const Vm *vm, uint64_t p, uint64_t n)
     {
         uint64_t b = (uint64_t)(uintptr_t)vm->blocks[i].at;
         if (p >= b && p + n <= b + vm->blocks[i].n + 8)
+        {
+            return 1;
+        }
+    }
+    for (int i = 0; i < nct_descs; i++) // (read only: a store there is refused by the checker's types)
+    {
+        uint64_t b = (uint64_t)(uintptr_t)ct_descs[i].at;
+        if (p >= b && p + n <= b + ct_descs[i].words * 8ull)
         {
             return 1;
         }
@@ -544,10 +608,21 @@ static int run(Vm *vm, SymId sym, const CtFunc *f, size_t fp)
             s[in->d] = (uint64_t)(uintptr_t)b;
             break;
         }
+        case MIR_DESC:
+        {
+            int k = ct_desc_index((TypeId)in->imm);
+            if (k < 0)
+            {
+                return stop(vm, sym, "describes more types than the compiler keeps");
+            }
+            s[in->d] = (uint64_t)(uintptr_t)ct_descs[k].at;
+            break;
+        }
         case MIR_WRITE:
             return stop(vm, sym, "prints (it runs only in the program)");
         case MIR_GLOAD:
         case MIR_GSTORE:
+        case MIR_GADDR:
             return stop(vm, sym, "uses a mutable module variable (in the compiler it has only its first value)");
         case MIR_TRAP:
         {
@@ -686,6 +761,68 @@ static int evaluate(Vm *vm, Unit *u, NodeId expr, TypeId type, SymId s, const ch
     }
 }
 
+// A number known while compiling that the checker could not fold (it calls std code, as
+// `T.at(i).offset` does): run now by the interpreter. 0 when it cannot be.
+int comptime_value_u64(Unit *u, NodeId expr, uint64_t *out)
+{
+    static Vm nvm;
+    const char *why;
+    int nested = mir_nest_begin();
+    int ok = nested && evaluate(&nvm, u, expr, u->types[expr], 0, &why);
+    if (nested)
+    {
+        mir_nest_end();
+    }
+    if (ok)
+    {
+        *out = nvm.stack[0];
+    }
+    return ok;
+}
+
+// The type a value of std's type stands for (`T.at(i).of`, a `type` or a `*type`), run now by
+// the interpreter: its id. 0 when it cannot be run while compiling.
+static char type_value_why[400];
+
+const char *comptime_type_value_why(void)
+{
+    return type_value_why;
+}
+
+int comptime_type_value(Unit *u, NodeId expr, TypeId *out)
+{
+    type_value_why[0] = 0;
+    static Vm tvm;
+    TypeId t = u->types[expr];
+    const char *why;
+    int nested = mir_nest_begin();
+    int ok = nested && evaluate(&tvm, u, expr, t, 0, &why);
+    if (nested)
+    {
+        mir_nest_end();
+    }
+    if (!ok)
+    {
+        snprintf(type_value_why, sizeof(type_value_why), "%s", tvm.trapped ? tvm.trap_text : tvm.why);
+        return 0;
+    }
+    uint64_t v = tvm.stack[0];
+    if (type_kind(t) == T_PTR) // a *type: the descriptor it points to, one of the compiler's own
+    {
+        for (int i = 0; i < nct_descs; i++)
+        {
+            if ((uint64_t)(uintptr_t)ct_descs[i].at == v)
+            {
+                *out = ct_descs[i].t;
+                return 1;
+            }
+        }
+        return 0;
+    }
+    *out = (TypeId)v; // a type value: its id is the first word
+    return 1;
+}
+
 // A module-level statement: `assert(sizeof(header) == 16)`, or any call (a function run for
 // the asserts inside it). The compiler runs it (docs/comptime.md §1). When it traps with its own
 // place (std's assert takes a `site`), the trap's text is the error, and a comparison as its first
@@ -795,13 +932,6 @@ void comptime_unit(Unit *u)
                         TSTART(name), why);
             }
             continue; // a function, a type, an import: nothing to compute
-        }
-        if (type_kind(type) == T_STRUCT && n->kind == AST_FIELD_DECL && (n->flags & AST_F_MUT))
-        {
-            diag_at(u, n->tok, "error",
-                    "'%.*s': a module-level variable holding a struct is not supported yet (an immutable one is)",
-                    name->len, TSTART(name));
-            continue;
         }
         const char *cannot;
         if (!evaluate(&vm, u, init, type, s, &cannot))

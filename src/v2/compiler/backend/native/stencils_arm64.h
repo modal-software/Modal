@@ -224,6 +224,8 @@ enum
     ST_eqi_u8_a,
     ST_eqi_u8_ar,
     ST_eqi_u8_r,
+    ST_gaddr,
+    ST_gaddr_r,
     ST_ge_i16,
     ST_ge_i16_a,
     ST_ge_i16_ar,
@@ -812,7 +814,7 @@ enum
 };
 #endif
 
-#define STENCIL_SET_HASH 0x07303d0c9d3ebfa1ull
+#define STENCIL_SET_HASH 0x478008e7b1399d0cull
 
 #ifndef STENCIL_IDS_ONLY
 
@@ -6682,6 +6684,53 @@ static const StencilReloc crelocs_st_eqi_u8_r[] = {
     {24, SR_BRANCH26, 0, ST_CONTINUE},
 };
 #define STENCIL_st_eqi_u8_r {code_st_eqi_u8_r, 52, 9, relocs_st_eqi_u8_r, ccode_st_eqi_u8_r, 28, 3, crelocs_st_eqi_u8_r}
+
+static const uint8_t code_st_gaddr[] = {
+    0x08,0x00,0x80,0xd2,0x09,0x00,0x80,0xd2,0x2a,0x08,0x40,0xf9,0x08,0x00,0xa0,0xf2,
+    0x09,0x00,0xa0,0xf2,0x08,0x00,0xc0,0xf2,0x09,0x00,0xc0,0xf2,0x08,0x00,0xe0,0xf2,
+    0x09,0x00,0xe0,0xf2,0x48,0x0d,0x08,0x8b,0x08,0x78,0x29,0xf8,0x00,0x00,0x00,0x14,
+};
+static const StencilReloc relocs_st_gaddr[] = {
+    {0, SR_MOVW_G0, 0, ST_HOLE_B},
+    {4, SR_MOVW_G0, 0, ST_HOLE_A},
+    {12, SR_MOVW_G1, 0, ST_HOLE_B},
+    {16, SR_MOVW_G1, 0, ST_HOLE_A},
+    {20, SR_MOVW_G2, 0, ST_HOLE_B},
+    {24, SR_MOVW_G2, 0, ST_HOLE_A},
+    {28, SR_MOVW_G3, 0, ST_HOLE_B},
+    {32, SR_MOVW_G3, 0, ST_HOLE_A},
+    {44, SR_BRANCH26, 0, ST_CONTINUE},
+};
+static const uint8_t ccode_st_gaddr[] = {
+    0x08,0x00,0x80,0xd2,0x09,0x00,0x80,0xd2,0x2a,0x08,0x40,0xf9,0x48,0x0d,0x08,0x8b,
+    0x08,0x78,0x29,0xf8,0x00,0x00,0x00,0x14,
+};
+static const StencilReloc crelocs_st_gaddr[] = {
+    {0, SR_MOVW_G0, 0, ST_HOLE_B},
+    {4, SR_MOVW_G0, 0, ST_HOLE_A},
+    {20, SR_BRANCH26, 0, ST_CONTINUE},
+};
+#define STENCIL_st_gaddr {code_st_gaddr, 48, 9, relocs_st_gaddr, ccode_st_gaddr, 24, 3, crelocs_st_gaddr}
+
+static const uint8_t code_st_gaddr_r[] = {
+    0x08,0x00,0x80,0xd2,0x29,0x08,0x40,0xf9,0x08,0x00,0xa0,0xf2,0x08,0x00,0xc0,0xf2,
+    0x08,0x00,0xe0,0xf2,0x22,0x0d,0x08,0x8b,0x00,0x00,0x00,0x14,
+};
+static const StencilReloc relocs_st_gaddr_r[] = {
+    {0, SR_MOVW_G0, 0, ST_HOLE_B},
+    {8, SR_MOVW_G1, 0, ST_HOLE_B},
+    {12, SR_MOVW_G2, 0, ST_HOLE_B},
+    {16, SR_MOVW_G3, 0, ST_HOLE_B},
+    {24, SR_BRANCH26, 0, ST_CONTINUE},
+};
+static const uint8_t ccode_st_gaddr_r[] = {
+    0x08,0x00,0x80,0xd2,0x29,0x08,0x40,0xf9,0x22,0x0d,0x08,0x8b,0x00,0x00,0x00,0x14,
+};
+static const StencilReloc crelocs_st_gaddr_r[] = {
+    {0, SR_MOVW_G0, 0, ST_HOLE_B},
+    {12, SR_BRANCH26, 0, ST_CONTINUE},
+};
+#define STENCIL_st_gaddr_r {code_st_gaddr_r, 28, 5, relocs_st_gaddr_r, ccode_st_gaddr_r, 16, 2, crelocs_st_gaddr_r}
 
 static const uint8_t code_st_ge_i16[] = {
     0x08,0x00,0x80,0xd2,0x09,0x00,0x80,0xd2,0x0a,0x00,0x80,0xd2,0x08,0x00,0xa0,0xf2,
@@ -22209,6 +22258,8 @@ static const Stencil stencils[ST__COUNT] = {
     [ST_eqi_u8_a] = STENCIL_st_eqi_u8_a,
     [ST_eqi_u8_ar] = STENCIL_st_eqi_u8_ar,
     [ST_eqi_u8_r] = STENCIL_st_eqi_u8_r,
+    [ST_gaddr] = STENCIL_st_gaddr,
+    [ST_gaddr_r] = STENCIL_st_gaddr_r,
     [ST_ge_i16] = STENCIL_st_ge_i16,
     [ST_ge_i16_a] = STENCIL_st_ge_i16_a,
     [ST_ge_i16_ar] = STENCIL_st_ge_i16_ar,

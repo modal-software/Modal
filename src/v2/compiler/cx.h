@@ -386,6 +386,7 @@ struct Backend;
 void codegen_start(const struct Backend *backend, void *out_file, const char *path);
 void codegen_begin(Unit *u);              // declarations are checked: types, prototypes
 void codegen_function(Unit *u, SymId fn); // one function is checked and still in memory
+void codegen_declare(SymId fn);            // fn will be generated later (a specialization)
 int codegen_finish(void);                 // returns the number of errors the backend reported
 int codegen_run(void); // started with no output: run the program in memory (Backend.run)
 // Why `fn` could not be generated, if it could not: reported when the program needs it.
@@ -427,12 +428,36 @@ enum
     PRIM_ALIGNOF,  // alignof(T or value)
     PRIM_OFFSETOF, // offsetof(T.field)
     PRIM_FIELDSOF, // fieldsof(T or value): how many fields (0: not a struct)
-    PRIM_TYPEID,   // typeid(T or value): a number per type of the program, no name
+    PRIM_TYPEID,   // typeof(T or value): a number per type of the program, no name
+    PRIM_UNANY,    // T(a) with a: *any: a's *T back, checked at run time (refs[call] = T)
+    PRIM_LOAD,     // load(T, p, offset): the T at p + offset bytes (the call's type is T)
 };
+// std's `any` (std/any.modal): a reference that carries the type of what it points to.
+int sema_is_any(SymId strct);
+int sema_is_generic(SymId fn);   // made once per type (docs/comptime.md §3.2): never generated itself
+int sema_spec_index(SymId fn);   // a specialization's number (1 on), or 0
+void sema_drain_specs(void);     // check the specializations waiting for their turn
+int sema_capturing(void);        // lowering a function for the compiler to run (comptime.c)
+int comptime_type_value(Unit *u, NodeId expr, TypeId *out); // the type a `type` value names, now
+const char *comptime_type_value_why(void); // why the last one could not be computed
+int comptime_value_u64(Unit *u, NodeId expr, uint64_t *out);
+// A value the checker computed while compiling for node `id` of fn (a load's offset), or 0.
+int sema_known(SymId fn, NodeId id, uint64_t *out);
+// In a specialization: the value a parameter made known while compiling has (`i` of field(v, i)).
+int sema_bound_value(const Unit *u, NodeId ident, uint64_t *out);
+// The arm of a match a specialization takes while compiling (its subjects are known), or 0.
+NodeId sema_taken_arm(SymId fn, NodeId match);
+int sema_is_any_ref(TypeId t); // *any
+// std's `type` (std/type.modal): what `typeof` gives. Its fields, in order: id, size, align, fields.
+SymId sema_std_type(void);    // 0 when std's type is not loaded
+TypeId sema_named_type(const Unit *u, NodeId id); // the type a name (`point`, `u32`) names, or T_NONE
+int sema_typeof_desc(const Unit *u, NodeId call, uint64_t desc[4]); // a typeof known while compiling
+int sema_typeof_field(const Unit *u, NodeId selector, uint64_t *out); // `typeof(point).size`
+void sema_type_desc(TypeId t, uint64_t desc[4]);                     // the descriptor of a type
 int sema_primitive(const Unit *u, NodeId call);
 // The text of a `site` (AST_SITE at node id): `file:line:col: <the call as written>`.
 int sema_site_text(const Unit *u, NodeId site, char *text, size_t cap);
-// A type query at node `call` (sizeof, alignof, offsetof, fieldsof, typeid): its value (an
+// A type query at node `call` (sizeof, alignof, offsetof, fieldsof, typeof): its value (an
 // unsized constant). 0 if call is not one.
 int sema_sizeof(const Unit *u, NodeId call, uint64_t *out);
 // `assert(cond)` at node `call`: 1 if call is one.

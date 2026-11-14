@@ -684,6 +684,32 @@ int scan_all(const char *filename, const char *src, size_t len, int eager, Token
     return scan_into(filename, src, src, NULL, out, !eager, max_body);
 }
 
+int scan_whole(const char *filename, const char *src, size_t len, TokenVec *out)
+{
+    token_base = cx.regions[REGION_ARENA].base;
+    out->cap = len + 2;
+    out->size = 0;
+    out->data = (Token *)malloc(out->cap * sizeof(Token));
+    if (!out->data)
+    {
+        return 1;
+    }
+    return scan_into(filename, src, src, NULL, out, 0, NULL);
+}
+
+int scan_span(const char *filename, const char *src, const char *start, size_t len, TokenVec *out)
+{
+    token_base = cx.regions[REGION_ARENA].base;
+    out->cap = len + 2;
+    out->size = 0;
+    out->data = (Token *)malloc(out->cap * sizeof(Token));
+    if (!out->data)
+    {
+        return 1;
+    }
+    return scan_into(filename, src, start, start + len, out, 0, NULL);
+}
+
 int scan_body(const char *filename, const char *src, const Token *body, TokenVec *out)
 {
     return scan_into(filename, src, TSTART(body), TSTART(body) + body->len, out, 0, NULL);

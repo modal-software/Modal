@@ -61,6 +61,7 @@ typedef enum
     // An arm binds no name: inside it the subject keeps its own, known to be in the arm's values.
     // In an expression, an AST_IDENT's aux may hold IDENT_NONZERO: inside an arm, it names the
     // subject, whose values there exclude 0 (no divisor guard).
+    AST_TYPE_EXPR,   // first token  expression   a type written as a value known while compiling
     AST__COUNT,
 } AstNodeKind;
 

@@ -139,6 +139,12 @@ typedef struct
 int scan_all(const char *filename, const char *src, size_t len, int eager, TokenVec *out,
              size_t *max_body);
 
+// Every token of a file, bodies too, into a malloc'd array of its own (the token region is left
+// alone): for a pass that reads the whole program. Free out->data after.
+int scan_whole(const char *filename, const char *src, size_t len, TokenVec *out);
+// The tokens of len bytes of src from start (a body), into a malloc'd array of its own.
+int scan_span(const char *filename, const char *src, const char *start, size_t len, TokenVec *out);
+
 // Tokenizes one deferred body: appends its tokens, '{' through '}' and then an EOF, to the
 // end of `out`, which must have room for them (see `max_body` above).
 // Returns the number of lexical errors in the body.

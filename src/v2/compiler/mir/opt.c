@@ -55,6 +55,8 @@ static int produces(uint8_t op)
     case MIR_NORM:
     case MIR_STR:
     case MIR_GLOAD:
+    case MIR_GADDR:
+    case MIR_DESC:
         return 1;
     default:
         return 0;
@@ -344,6 +346,8 @@ static int fold(Opt *o)
         case MIR_ADDR:
         case MIR_STR:
         case MIR_GLOAD:
+    case MIR_GADDR:
+    case MIR_DESC:
             forget(o, in->d);
             break;
         case MIR_CALL:

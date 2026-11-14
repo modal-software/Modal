@@ -143,6 +143,12 @@ static void out_fn_name(Emit *e, SymId fn)
         PUT(e, "_");
     }
     out_sym_name(e, fn);
+    if (sema_spec_index(fn)) // made for one type: one C function per specialization
+    {
+        char k[16];
+        snprintf(k, sizeof(k), "__s%d", sema_spec_index(fn));
+        put(e, k);
+    }
     if (SYM(fn)->flags & SYM_F_MUT)
     {
         int arity = 0;
@@ -260,9 +266,190 @@ static int literal_above_i64(const Unit *u, NodeId id);
 
 // Emits `id` where a value of type `want` is expected. `self` is a reference, so a struct
 // value may stand where *T is wanted: its address is taken.
+// ---- type descriptors (std's type and its member table) as C data ----------------------------
+//
+// C relocates addresses in data itself, so a descriptor is a static object: std's type, and for
+// a struct its member table, each `of` the address of its field type's descriptor. Made in
+// begin for every type known then; one met only later is given as a value with no members.
+static int c_struct(SymId st);
+static uint8_t *c_desc;  // per TypeId: 1 when m_desc_<t> exists
+static size_t c_desc_cap;
+
+static int c_has_desc(TypeId t)
+{
+    return t < c_desc_cap && c_desc[t];
+}
+
+static void out_desc_value(Emit *e, TypeId t) // std's type for t, as a C value
+{
+    char num[160];
+    if (c_has_desc(t))
+    {
+        snprintf(num, sizeof(num), "m_desc_%u", (unsigned)t);
+        put(e, num);
+        return;
+    }
+    uint64_t d[4];
+    sema_type_desc(t, d);
+    PUT(e, "((");
+    out_struct_name(e, sema_std_type());
+    snprintf(num, sizeof(num), "){ %lluull, %lluull, %lluull, %lluull, 0 })", (unsigned long long)d[0],
+             (unsigned long long)d[1], (unsigned long long)d[2], (unsigned long long)d[3]);
+    put(e, num);
+}
+
+static void out_desc_address(Emit *e, TypeId t)
+{
+    if (c_has_desc(t))
+    {
+        char num[48];
+        snprintf(num, sizeof(num), "(&m_desc_%u)", (unsigned)t);
+        put(e, num);
+        return;
+    }
+    PUT(e, "&");
+    out_desc_value(e, t);
+}
+
+static void c_desc_collect(TypeId t)
+{
+    if (type_kind(t) == T_TYPE)
+    {
+        t = type_make(T_STRUCT, type_ref(t));
+    }
+    if (t >= c_desc_cap)
+    {
+        size_t cap = c_desc_cap ? c_desc_cap : 256;
+        while (cap <= t)
+        {
+            cap *= 2;
+        }
+        c_desc = realloc(c_desc, cap);
+        memset(c_desc + c_desc_cap, 0, cap - c_desc_cap);
+        c_desc_cap = cap;
+    }
+    if (c_desc[t])
+    {
+        return;
+    }
+    c_desc[t] = 1;
+    if (type_kind(t) == T_STRUCT)
+    {
+        SymId st = type_ref(t);
+        Unit *home = &cx.units[SYM(st)->unit];
+        for (NodeId m = NODE(home, SYM(st)->decl)->a; m; m = NEXT(home, m))
+        {
+            if (NODE(home, m)->kind == AST_FIELD_DECL)
+            {
+                c_desc_collect(sema_type_of(home, NODE(home, m)->a, st));
+            }
+        }
+    }
+}
+
+static void emit_descriptors(Emit *e)
+{
+    SymId st = sema_std_type();
+    if (!st)
+    {
+        return;
+    }
+    SymId member = scope_find(cx.units[SYM(st)->unit].scope, "member", 6);
+    for (TypeId t = T_BOOL; t < T__PRIM_COUNT; t++)
+    {
+        if (t != T_NIL && t != T_INT_LIT && t != T_EXTERN && t != T_MODULE && type_layout(t).size)
+        {
+            c_desc_collect(t);
+        }
+    }
+    for (SymId s = 1; s < cx.syms.size; s++)
+    {
+        if (c_struct(s))
+        {
+            c_desc_collect(type_make(T_STRUCT, s));
+        }
+    }
+    char line[200];
+    for (TypeId t = 0; t < c_desc_cap; t++) // declared first: a member table points at any of them
+    {
+        if (c_desc[t])
+        {
+            PUT(e, "static __attribute__((unused)) ");
+            out_struct_name(e, st);
+            snprintf(line, sizeof(line), " m_desc_%u;\n", (unsigned)t);
+            put(e, line);
+        }
+    }
+    for (TypeId t = 0; t < c_desc_cap; t++)
+    {
+        if (!c_desc[t])
+        {
+            continue;
+        }
+        uint64_t d[4];
+        sema_type_desc(t, d);
+        if (d[3] && member && type_kind(t) == T_STRUCT)
+        {
+            SymId s = type_ref(t);
+            Unit *home = &cx.units[SYM(s)->unit];
+            PUT(e, "static __attribute__((unused)) ");
+            out_struct_name(e, member);
+            snprintf(line, sizeof(line), " m_desc_%u_m[] = {", (unsigned)t);
+            put(e, line);
+            for (NodeId m = NODE(home, SYM(s)->decl)->a; m; m = NEXT(home, m))
+            {
+                if (NODE(home, m)->kind != AST_FIELD_DECL)
+                {
+                    continue;
+                }
+                TypeId ft = sema_type_of(home, NODE(home, m)->a, s);
+                snprintf(line, sizeof(line), " { %uull, &m_desc_%u },", (unsigned)layout_member_offset(s, m),
+                         (unsigned)(type_kind(ft) == T_TYPE ? type_make(T_STRUCT, type_ref(ft)) : ft));
+                put(e, line);
+            }
+            PUT(e, " };\n");
+        }
+        PUT(e, "static ");
+        out_struct_name(e, st);
+        snprintf(line, sizeof(line), " m_desc_%u = { %lluull, %lluull, %lluull, %lluull, ", (unsigned)t,
+                 (unsigned long long)d[0], (unsigned long long)d[1], (unsigned long long)d[2],
+                 (unsigned long long)d[3]);
+        put(e, line);
+        if (d[3] && member && type_kind(t) == T_STRUCT)
+        {
+            snprintf(line, sizeof(line), "m_desc_%u_m };\n", (unsigned)t);
+        }
+        else
+        {
+            snprintf(line, sizeof(line), "0 };\n");
+        }
+        put(e, line);
+    }
+    PUT(e, "\n");
+}
+
 static void emit_as(Emit *e, NodeId id, TypeId want)
 {
     TypeId have = e->u->types[id];
+    TypeId named = sema_named_type(e->u, id);
+    if (named != T_NONE && sema_std_type() && want == type_make(T_STRUCT, sema_std_type()))
+    {
+        out_desc_value(e, named); // `describe(point)`: the type's descriptor
+        return;
+    }
+    if (sema_is_any_ref(want) && type_kind(have) == T_PTR && !sema_is_any_ref(have))
+    {
+        char tid[48];
+        PUT(e, "(&(");
+        out_struct_name(e, type_ref(type_ref(want)));
+        PUT(e, "){ .at = (uint64_t)(uintptr_t)(");
+        emit_expr(e, id);
+        PUT(e, "), .of = ");
+        out_desc_address(e, type_ref(have));
+        PUT(e, " })");
+        (void)tid;
+        return;
+    }
     if (type_kind(want) == T_PTR && type_kind(have) == T_STRUCT)
     {
         if (is_self_ident(e->u, id))
@@ -448,6 +635,57 @@ static void emit_call(Emit *e, NodeId id)
     const AstNode *n = NODE(u, id);
     const AstNode *callee = NODE(u, n->a);
     SymId fn = u->refs[id];
+    uint64_t desc[4];
+    if (sema_typeof_desc(u, id, desc)) // typeof(point): its descriptor
+    {
+        out_desc_value(e, (TypeId)desc[0]);
+        return;
+    }
+    if (sema_primitive(u, id) == PRIM_TYPEID && n->b && sema_is_any_ref(u->types[n->b])) // typeof(a)
+    {
+        PUT(e, "(*(");
+        emit_expr(e, n->b);
+        PUT(e, ")->of)");
+        return;
+    }
+    if (sema_primitive(u, id) == PRIM_LOAD && n->b) // load(T, p, offset): `*(T *)((uint8_t *)p + offset)`
+    {
+        NodeId p = NEXT(u, n->b), off = NEXT(u, p);
+        uint64_t k;
+        PUT(e, "(*(");
+        out_type(e, u->types[id], n->tok);
+        PUT(e, " *)((uint8_t *)(");
+        emit_expr(e, p);
+        PUT(e, ") + (");
+        if (sema_known(e->fn, off, &k))
+        {
+            char num[32];
+            snprintf(num, sizeof(num), "%lluull", (unsigned long long)k);
+            put(e, num);
+        }
+        else
+        {
+            emit_expr(e, off);
+        }
+        PUT(e, ")))");
+        return;
+    }
+    if (sema_primitive(u, id) == PRIM_UNANY && n->b) // point(a)
+    {
+        int line, col;
+        source_pos(u->src, TSTART(TOK(u, n->tok)), &line, &col);
+        char tail[120];
+        PUT(e, "((");
+        out_type(e, u->types[id], n->tok);
+        PUT(e, ")m_unany((const uint64_t *)(");
+        emit_expr(e, n->b);
+        snprintf(tail, sizeof(tail), "), %lluull, \"", (unsigned long long)type_make(T_STRUCT, u->refs[id]));
+        put(e, tail);
+        put(e, u->path);
+        snprintf(tail, sizeof(tail), ":%d:%d: the *any holds another type\\n\"))", line, col);
+        put(e, tail);
+        return;
+    }
     if (sema_primitive(u, id) == PRIM_CONVERT && n->b)
     {
         PUT(e, "((");
@@ -664,12 +902,17 @@ static void emit_match_as(Emit *e, NodeId id, int returned)
         }
         PUT(e, "{\n");
     }
+    NodeId only = e->fn ? sema_taken_arm(e->fn, id) : 0; // decided while compiling: that arm, untested
     for (NodeId arm = m->b; arm; arm = NEXT(u, arm))
     {
+        if (only && arm != only)
+        {
+            continue;
+        }
         const AstNode *a = NODE(u, arm);
-        int last = !NEXT(u, arm);
+        int last = !NEXT(u, arm) || only;
         int tests = 0, k = 0;
-        for (NodeId pat = a->a; pat && k < ns; pat = NEXT(u, pat), k++)
+        for (NodeId pat = a->a; pat && k < ns && !only; pat = NEXT(u, pat), k++)
         {
             Pattern pt;
             NodeId name;
@@ -945,36 +1188,62 @@ static void emit_expr(Emit *e, NodeId id)
         break;
     case AST_STRUCT_LIT: // a compound literal: C zeroes what it does not name (here, nothing)
     {
-        PUT(e, "(");
-        // a field with no bytes (nothing reads it, or a constant): its value is still computed
-        for (NodeId f = n->a; f; f = NEXT(u, f))
-        {
-            SymId field = u->refs[f];
-            if (field && layout_field_use(field, NULL) != FIELD_KEPT)
-            {
-                PUT(e, "(void)(");
-                emit_as(e, NODE(u, f)->a, sema_value_type(&cx.units[SYM(field)->unit], field));
-                PUT(e, "), ");
-            }
-        }
-        PUT(e, "(");
+        // A field with no bytes (nothing reads it, or a constant) is not in the C struct, but a
+        // value of it that does something (a call) still runs: inside the first initializer
+        // there is, so the literal stays one (`&(T){ ... }` takes its address).
+        PUT(e, "((");
         out_type(e, u->types[id], n->tok);
         PUT(e, "){");
-        int any = 0;
-        for (NodeId f = n->a; f; f = NEXT(u, f))
+        int any = 0, pending = 1;
+        for (NodeId f = n->a; f || pending; f = f ? NEXT(u, f) : 0)
         {
-            SymId field = u->refs[f];
-            if (!field || layout_field_use(field, NULL) != FIELD_KEPT)
+            SymId field = f ? u->refs[f] : 0;
+            if (f && (!field || layout_field_use(field, NULL) != FIELD_KEPT))
             {
                 continue;
             }
             put(e, any ? ", ." : " .");
             any = 1;
-            out_tok(e, NODE(u, f)->tok);
+            if (f)
+            {
+                out_tok(e, NODE(u, f)->tok);
+            }
+            else
+            {
+                PUT(e, "m_empty"); // every field is gone: C's one byte
+            }
             PUT(e, " = ");
-            emit_as(e, NODE(u, f)->a, sema_value_type(&cx.units[SYM(field)->unit], field));
+            if (pending)
+            {
+                pending = 0;
+                for (NodeId g = n->a; g; g = NEXT(u, g))
+                {
+                    SymId gone = u->refs[g];
+                    const AstNode *v = NODE(u, NODE(u, g)->a);
+                    if (gone && layout_field_use(gone, NULL) != FIELD_KEPT && v->kind != AST_NUMBER_LIT &&
+                        v->kind != AST_STRING_LIT && v->kind != AST_IDENT &&
+                        !(v->kind == AST_UNARY_OP && NODE(u, v->a)->kind == AST_NUMBER_LIT))
+                    {
+                        PUT(e, "(void)(");
+                        emit_as(e, NODE(u, g)->a, sema_value_type(&cx.units[SYM(gone)->unit], gone));
+                        PUT(e, "), ");
+                    }
+                }
+            }
+            if (f)
+            {
+                emit_as(e, NODE(u, f)->a, sema_value_type(&cx.units[SYM(field)->unit], field));
+            }
+            else
+            {
+                PUT(e, "0");
+            }
+            if (!f)
+            {
+                break;
+            }
         }
-        PUT(e, any ? " })" : "0})");
+        PUT(e, " })");
         break;
     }
     case AST_UNARY_OP:
@@ -1089,6 +1358,14 @@ static void emit_expr(Emit *e, NodeId id)
         if (member && SYM(member)->kind == SYM_CONST && emit_unsized(e, id))
         {
             break; // `util.limit`, an unsized constant of another module
+        }
+        uint64_t known;
+        if (sema_typeof_field(u, id, &known)) // `typeof(point).size`
+        {
+            char num[32];
+            snprintf(num, sizeof(num), "%lluull", (unsigned long long)known);
+            put(e, num);
+            break;
         }
         if (!member || SYM(member)->kind != SYM_FIELD)
         {
@@ -1549,6 +1826,10 @@ static void emit_function(Emit *e, SymId fn)
 // Is this a function the backend can emit? Module-level `self` functions are not, yet.
 static int emittable(Emit *e, SymId fn, int report)
 {
+    if (sema_is_generic(fn))
+    {
+        return 0; // made once per type: only its specializations are C functions
+    }
     const AstNode *n = fn_node(e->u, fn);
     if (!SYM(fn)->owner && (n->flags & AST_F_SELF))
     {
@@ -1780,6 +2061,10 @@ static const char *const prelude =
     "}\n"
     // a part of trap(a, b, ...) (docs/std.md): written after the output so far, then the next
     "M_RT void m_trap_part(m_str s) { mrt_flush(); mrt_out(2, s.ptr, s.len); }\n"
+    // std's any (std/any.modal): T(a) gives a's address when a holds a T, and traps otherwise.
+    "M_RT void *m_unany(const uint64_t *a, uint64_t id, const char *m) {\n"
+    "    if (((const uint64_t *)(uintptr_t)a[1])[0] != id) m_trap(m); return (void *)(uintptr_t)a[0];\n"
+    "}\n"
     // Division: a zero divisor traps; the smallest signed value by -1 wraps (as `0 - x` does).
     "#define M_DIV(T) M_RT T m_div_##T(T a, T b, const char *m) { if (!b) m_trap(m); \\\n"
     "    if ((T)-1 < 0 && b == (T)-1) return (T)(0 - (uint64_t)a); return (T)(a / b); }\n"
@@ -2017,6 +2302,9 @@ static void backend_c_begin(const BackendJob *job)
     }
     PUT(e, "\n");
 
+    // Type descriptors (std's type), for typeof and *any: data that holds addresses.
+    emit_descriptors(e);
+
     // 4. For each `put(self: out, b: u8)`: the adapter print and write call it through.
     for (SymId fn = 1; fn < cx.syms.size; fn++)
     {
@@ -2039,6 +2327,22 @@ static void backend_c_begin(const BackendJob *job)
         PUT(e, "((m_out *)o, b); }\n");
     }
     PUT(e, "\n");
+}
+
+// A specialization made while checking: its prototype now, between two functions, so the
+// function that calls it (written before it) can.
+static void backend_c_declare(const BackendJob *job, SymId fn)
+{
+    (void)job;
+    Emit *e = &emit_state;
+    Unit *saved = e->u;
+    e->u = &cx.units[SYM(fn)->unit];
+    if (emittable(e, fn, 0))
+    {
+        emit_signature(e, fn);
+        PUT(e, ";\n");
+    }
+    e->u = saved;
 }
 
 // Called once per function, right after it is checked, while its body is still in memory.
@@ -2097,5 +2401,6 @@ void backend_c_init(Backend *b)
     b->toolchain = "cc";
     b->begin = backend_c_begin;
     b->function = backend_c_function;
+    b->declare = backend_c_declare;
     b->end = backend_c_end;
 }

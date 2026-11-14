@@ -424,7 +424,41 @@ void audit_print(void)
         printf("  none\n");
     }
 
-    // 5. The system: who writes.
+    // 5. Fields with no bytes (std.md §10): what the program does with them, read from its tokens.
+    printf("fields with no bytes (nothing reads them, or they are always one constant)\n");
+    size_t gone = 0;
+    for (SymId f = 1; f < cx.syms.size; f++)
+    {
+        const Symbol *sym = SYM(f);
+        uint64_t v = 0;
+        if (sym->kind != SYM_FIELD || !sym->owner || is_std(&cx.units[sym->unit]) ||
+            cx.units[sym->unit].is_manifest)
+        {
+            continue;
+        }
+        int use = layout_field_use(f, &v);
+        if (use == FIELD_KEPT)
+        {
+            continue;
+        }
+        printf("  %s  ", where(f, at, sizeof(at)));
+        print_name(f);
+        if (use == FIELD_UNREAD)
+        {
+            printf("  never read: its writes are dropped\n");
+        }
+        else
+        {
+            printf("  always %lld: its reads are the constant\n", (long long)v);
+        }
+        gone++;
+    }
+    if (!gone)
+    {
+        printf("  none\n");
+    }
+
+    // 6. The system: who writes.
     printf("system interface (write)\n");
     for (size_t i = 0; i < A.nwriters; i++)
     {

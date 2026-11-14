@@ -77,6 +77,8 @@ static int inst_writes(const MirInst *in)
     case MIR_NORM:
     case MIR_STR:
     case MIR_GLOAD:
+    case MIR_GADDR:
+    case MIR_DESC:
         return 1;
     default:
         return 0;

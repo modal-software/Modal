@@ -216,8 +216,8 @@ static size_t value_end(const Token *t, size_t i, size_t n)
 
 static int is_query(const Token *k)
 {
-    static const char *const q[] = {"sizeof", "alignof", "fieldsof", "offsetof"};
-    for (int j = 0; j < 4; j++)
+    static const char *const q[] = {"sizeof", "alignof", "fieldsof", "offsetof", "typeof"};
+    for (int j = 0; j < 5; j++)
     {
         if (k->len == strlen(q[j]) && memcmp(TSTART(k), q[j], k->len) == 0)
         {
@@ -281,6 +281,14 @@ static void scan_facts(const Token *t, size_t n)
                 }
             }
         }
+        else if (k->kind == TOK_IDENTIFIER && i > 0 && (t[i - 1].kind == TOK_LPAREN || t[i - 1].kind == TOK_COMMA) &&
+                 (t[i + 1].kind == TOK_COMMA || t[i + 1].kind == TOK_RPAREN))
+        {
+            // a name alone as an argument: when it names a struct, it is a type given as a value
+            // (`size_of(rgb, &c)`), whose descriptor reports the layout as declared
+            fact_fit(k->match);
+            F.bits[k->match] |= FN_PINNED;
+        }
         else if (k->kind == TOK_IDENTIFIER && is_query(k) && t[i + 1].kind == TOK_LPAREN && i + 2 < n &&
                  t[i + 2].kind == TOK_IDENTIFIER)
         {
@@ -335,9 +343,8 @@ static void gather_facts(void)
             continue;
         }
         TokenVec all = {0};
-        size_t max_body = 0;
         scan_quiet = 1;
-        int errors = scan_all(u->path, u->src, u->len, 1, &all, &max_body);
+        int errors = scan_whole(u->path, u->src, u->len, &all);
         scan_quiet = 0;
         if (errors == 0)
         {
@@ -402,7 +409,8 @@ int layout_field_use(SymId field, uint64_t *value)
         SymId s = SYM(field)->owner;
         gather_facts();
         if (!F.off && !F.pin_all && SYM(field)->kind == SYM_FIELD && s && !sema_is_register_block(s) &&
-            !struct_marked(s, FN_PINNED))
+            !sema_is_any(s) && !(sema_std_type() && SYM(s)->unit == SYM(sema_std_type())->unit) &&
+            !struct_marked(s, FN_PINNED)) // std's any, type and member: read by the compiler
         {
             NameId name = cx.sym_names[field];
             uint8_t bits = name < F.n ? F.bits[name] : 0;

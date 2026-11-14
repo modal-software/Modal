@@ -123,6 +123,14 @@ static void emit_mir(MirFunc *f)
 
 // Every backend gets the functions of every file: the program is linked as a whole (machine
 // code drops what is unreachable; the C compiler, unused static functions).
+void codegen_declare(SymId fn)
+{
+    if (codegen.begun && codegen.backend->declare)
+    {
+        codegen.backend->declare(&codegen.job, fn);
+    }
+}
+
 void codegen_function(Unit *u, SymId fn)
 {
     if (!codegen.begun)

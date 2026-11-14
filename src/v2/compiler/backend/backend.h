@@ -45,6 +45,8 @@ typedef struct Backend
     void (*begin)(const BackendJob *job);
     // `fn` is checked and its body is in memory until this returns.
     void (*function)(const BackendJob *job, SymId fn);
+    // Optional: fn exists now and is generated later (a specialization): declare it (C: a prototype).
+    void (*declare)(const BackendJob *job, SymId fn);
     // Or, for a machine-code backend: the function already lowered to MIR (mir/mir.h).
     void (*function_mir)(const BackendJob *job, const struct MirFunc *f);
     // Every function has been handed over: emit the entry point and finish the output.

@@ -82,6 +82,24 @@ NodeId parse_type(Parser *p)
     }
     case TOK_IDENTIFIER:
     {
+        // `T.at(i).of`: a path with a call in it is a value known while compiling whose type is
+        // std's type; it stands for the type it describes (std.md §11)
+        const Token *k = t + 1;
+        int call = 0;
+        while (!call && ((k->kind == TOK_DOT && k[1].kind == TOK_IDENTIFIER) || k->kind == TOK_LPAREN))
+        {
+            if (k->kind == TOK_LPAREN)
+            {
+                call = 1;
+            }
+            k += 2;
+        }
+        if (call)
+        {
+            NodeId value = parse_expression(p);
+            type = value ? node_new(u, AST_TYPE_EXPR, tok_idx(p, t), value, 0) : 0;
+            break;
+        }
         uint16_t extra = 0;
         parser_advance(p);
         while (p->current->kind == TOK_DOT && !(p->current->nl) &&

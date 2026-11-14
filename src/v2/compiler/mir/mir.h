@@ -53,6 +53,8 @@ typedef enum
                 // sub MIR_TRAP_PART: write that message part to the error output, and go on
     MIR_JUMP,   // go to label imm (a match's arm to its end; a tail call to the function itself,
                 // which self_loops makes a loop)
+    MIR_GADDR,  // d = the address of module-level slot imm: data that holds addresses (descriptors)
+    MIR_DESC,   // d = the address of the descriptor of type imm, in the compiler (comptime.c)
     MIR__COUNT,
 } MirOp;
 
@@ -155,6 +157,7 @@ typedef struct MirFunc
 int mir_lower(Unit *u, SymId fn, MirFunc *out);
 
 void audit_function(const MirFunc *f); // --audit: its calls, writes and guards (sema/audit.c)
+SymId mir_entry_routine(void); // the program's entry when it has descriptors (else 0: main)
 void mir_reset(void); // a fresh compilation: no kept bodies, globals or output routines
 
 // A module-level initializer as a function returning it (slot 0), for the compiler to run.

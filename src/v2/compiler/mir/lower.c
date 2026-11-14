@@ -41,6 +41,7 @@ typedef struct
     int has_self;   // slot 0 holds self (a reference)
     int struct_abi; // a parameter or the result is a struct value: never inlined
     int loops;      // the function calls itself (a loop): larger bodies are inlined into it
+    int for_compiler; // lowered for the compiler to run (comptime.c): descriptors are its own
     TypeId ret;
     uint8_t is_local[MAX_TRACKED];
 } Lower;
@@ -80,6 +81,82 @@ static int is_global(SymId s, NodeId *init)
     return 1;
 }
 
+// A module-level struct variable has a global slot per scalar field (its leaves, nested
+// structs and arrays flattened, in declaration order; fields with no bytes have none): the same
+// global slots every backend has, so a struct needs no address of its own. `&g` is not given.
+static uint32_t global_leaves(TypeId t)
+{
+    if (type_kind(t) == T_ARRAY)
+    {
+        return type_len(t) * global_leaves(type_ref(t));
+    }
+    if (type_kind(t) != T_STRUCT)
+    {
+        return 1;
+    }
+    SymId st = type_ref(t);
+    Unit *home = &cx.units[SYM(st)->unit];
+    uint32_t n = 0;
+    for (NodeId m = NODE(home, SYM(st)->decl)->a; m; m = NEXT(home, m))
+    {
+        if (NODE(home, m)->kind == AST_FIELD_DECL && !layout_member_gone(st, m))
+        {
+            n += global_leaves(sema_type_of(home, NODE(home, m)->a, st));
+        }
+    }
+    return n;
+}
+
+// The first leaf of field `field` inside struct type t.
+static uint32_t global_leaf_of(TypeId t, SymId field)
+{
+    SymId st = type_ref(t);
+    Unit *home = &cx.units[SYM(st)->unit];
+    uint32_t n = 0;
+    const Token *want = TOK(home, SYM(field)->tok);
+    for (NodeId m = NODE(home, SYM(st)->decl)->a; m; m = NEXT(home, m))
+    {
+        if (NODE(home, m)->kind != AST_FIELD_DECL || layout_member_gone(st, m))
+        {
+            continue;
+        }
+        if (NODE(home, m)->tok == SYM(field)->tok || TOK(home, NODE(home, m)->tok) == want)
+        {
+            return n;
+        }
+        n += global_leaves(sema_type_of(home, NODE(home, m)->a, st));
+    }
+    return n;
+}
+
+static uint32_t global_index(SymId s);
+
+// The leaves an expression names inside a module-level struct variable (`g`, `g.a`, `g.a.x`,
+// `util.g.x`): its variable and the first leaf. 0 if it is not one.
+static int global_path(NodeId id, SymId *var, uint32_t *leaf)
+{
+    Unit *u = L.u;
+    const AstNode *n = NODE(u, id);
+    SymId s = u->refs ? u->refs[id] : 0;
+    NodeId init;
+    if (s && is_global(s, &init) && type_kind(sema_value_type(&cx.units[SYM(s)->unit], s)) == T_STRUCT)
+    {
+        *var = s;
+        *leaf = 0;
+        return 1;
+    }
+    if (n->kind == AST_SELECTOR && s && SYM(s)->kind == SYM_FIELD && global_path(n->a, var, leaf))
+    {
+        *leaf += global_leaf_of(u->types[n->a], s);
+        return 1;
+    }
+    return 0;
+}
+
+// A struct of type t at address src + off, into the leaves of a global from `leaf` on.
+static void global_store_fields(uint32_t leaf, MirSlot src, uint32_t off, TypeId t);
+static void global_load_fields(uint32_t leaf, MirSlot dst, uint32_t off, TypeId t);
+
 static uint32_t global_index(SymId s)
 {
     if (global_cap < cx.syms.cap)
@@ -96,7 +173,9 @@ static uint32_t global_index(SymId s)
     }
     if (!global_of[s])
     {
-        global_of[s] = ++nglobals;
+        TypeId t = sema_value_type(&cx.units[SYM(s)->unit], s);
+        global_of[s] = nglobals + 1;
+        nglobals += type_kind(t) == T_STRUCT ? global_leaves(t) : 1; // a struct: a slot per field
     }
     return global_of[s] - 1;
 }
@@ -390,6 +469,8 @@ static void reframe_inst(MirInst *in, uint32_t from, uint32_t to)
     case MIR_CONST:
     case MIR_STR:
     case MIR_GLOAD:
+    case MIR_GADDR:
+    case MIR_DESC:
         in->d = reframe(in->d, from, to);
         break;
     case MIR_BIN:
@@ -542,6 +623,8 @@ static int inst_writes(const MirInst *in, MirSlot s)
     case MIR_NORM:
     case MIR_STR:
     case MIR_GLOAD:
+    case MIR_GADDR:
+    case MIR_DESC:
         return in->d == s;
     default:
         return 0;
@@ -732,6 +815,8 @@ static int produces_value(uint8_t op)
     case MIR_NORM:
     case MIR_STR:
     case MIR_GLOAD:
+    case MIR_GADDR:
+    case MIR_DESC:
         return 1;
     default:
         return 0;
@@ -779,6 +864,10 @@ static void place_label(uint32_t label)
 // A struct local whose every use is `p.field`: each field in a slot of its own (in declaration
 // order), so it lives in registers. It is never in memory, so nothing takes its address.
 #define LOCAL_FIELDS 2
+// A number or bool local whose address was taken (`&n`): its slot is memory from then on (the
+// register allocator leaves addressed slots alone), and a write through the reference stores
+// only its width, so every later read loads it in its width.
+#define LOCAL_BOXED 3
 
 static void push_local_n(NameId name, MirSlot slot, uint32_t k);
 static void push_local(NameId name, MirSlot slot)
@@ -1083,6 +1172,10 @@ int mir_compute(int op, int v, uint64_t a, uint64_t b, uint64_t *out)
 // The value of an expression made of literals only, as the generated code would compute it.
 static int const_value(NodeId id, uint64_t *out)
 {
+    if (L.f && sema_known(L.f->sym, id, out))
+    {
+        return 1; // computed while compiling for this specialization (a load's offset)
+    }
     Unit *u = L.u;
     const AstNode *n = NODE(u, id);
     switch (n->kind)
@@ -1119,6 +1212,14 @@ static int const_value(NodeId id, uint64_t *out)
     case AST_SELECTOR: // `util.limit`: a constant of another module
     case AST_IDENT:
     {
+        if (n->kind == AST_SELECTOR && sema_typeof_field(u, id, out))
+        {
+            return 1; // `typeof(point).size`: known while compiling
+        }
+        if (n->kind == AST_IDENT && sema_bound_value(u, id, out))
+        {
+            return 1; // a value parameter of a specialization: known while compiling
+        }
         // A module-level constant with a literal initializer is a constant of its own type.
         // It may live in another file: its declaration is read there.
         SymId s = u->refs[id];
@@ -1202,6 +1303,7 @@ static int const_value(NodeId id, uint64_t *out)
 static MirSlot lower_expr(NodeId id);
 static MirSlot lower_call(NodeId id);
 static MirSlot lower_struct_addr(NodeId id);
+static MirSlot lower_field_base(NodeId base, uint32_t tok, int *ok);
 static MirSlot array_addr(NodeId arr, uint32_t tok);
 static void lower_struct_into(NodeId id, MirSlot dst);
 
@@ -1253,6 +1355,176 @@ static int contains_call(NodeId id)
 static MirSlot lower_match(NodeId id, TypeId want);
 static void lower_stmt(NodeId id);
 
+static MirSlot string_slot(const uint8_t *bytes, size_t len);
+static MirInst *bini(uint8_t op, int var, MirSlot d, MirSlot a, uint64_t imm);
+
+// ---- type descriptors (std's type, std/type.modal) ----------------------------------------------
+//
+// A descriptor is std's `type` (id, size, align, fields, members) followed by its member table
+// (offset, of) per field. They hold addresses (members, of), and machine code has no data that
+// holds an address at load time, so they live in module-level slots, written by a routine the
+// compiler makes when it knows them all (mir_next_helper), which the program's entry runs before
+// main (mir_entry_routine). A use is then the descriptor's address (MIR_GADDR). For the compiler
+// to run (comptime), MIR_DESC asks the interpreter for its own copy instead.
+#define MAX_DESCS 1024
+static struct
+{
+    TypeId t;
+    uint32_t base, fields;
+} descs[MAX_DESCS];
+static int ndescs;
+static SymId desc_init;  // the routine that writes them
+static SymId desc_start; // the entry when there are descriptors: desc_init, then main
+static int desc_written, start_written;
+
+static uint32_t desc_alloc(TypeId t)
+{
+    for (int i = 0; i < ndescs; i++)
+    {
+        if (descs[i].t == t)
+        {
+            return descs[i].base;
+        }
+    }
+    if (ndescs == MAX_DESCS)
+    {
+        return 0;
+    }
+    uint64_t d[4];
+    sema_type_desc(t, d);
+    int me = ndescs++;
+    descs[me].t = t;
+    descs[me].fields = (uint32_t)d[3];
+    descs[me].base = nglobals;
+    nglobals += 5 + 2 * (uint32_t)d[3];
+    if (type_kind(t) == T_STRUCT) // the types of its fields have descriptors too
+    {
+        SymId st = type_ref(t);
+        Unit *home = &cx.units[SYM(st)->unit];
+        for (NodeId m = NODE(home, SYM(st)->decl)->a; m; m = NEXT(home, m))
+        {
+            if (NODE(home, m)->kind == AST_FIELD_DECL)
+            {
+                desc_alloc(sema_type_of(home, NODE(home, m)->a, st));
+            }
+        }
+    }
+    return descs[me].base;
+}
+
+// The address of t's descriptor, plus `slot` words (5: its member table).
+static MirSlot desc_address(TypeId t, uint32_t slot)
+{
+    MirSlot d = temp();
+    if (sema_capturing() || L.for_compiler)
+    {
+        MirInst *i = inst(MIR_DESC);
+        i->d = d;
+        i->imm = t;
+        if (slot)
+        {
+            bini(MB_ADD, MV_U64, d, d, 8ull * slot);
+        }
+        return d;
+    }
+    uint32_t base = desc_alloc(t);
+    if (!desc_init)
+    {
+        desc_init = symbol_new(&cx.units[0], SYM_METHOD, 0, 0, 0, 0);
+        desc_start = symbol_new(&cx.units[0], SYM_METHOD, 0, 0, 0, 0);
+    }
+    MirInst *a = inst(MIR_GADDR);
+    a->d = d;
+    a->imm = base + slot;
+    return d;
+}
+
+// A module-level slot = a constant (the constant made first: the store reads it).
+static void gstore_const(uint32_t slot, uint64_t value)
+{
+    MirSlot v = emit_const(value);
+    MirInst *g = inst(MIR_GSTORE);
+    g->a = v;
+    g->imm = slot;
+}
+
+// The routine that writes every descriptor (the entry runs it before main).
+static void lower_desc_init(void)
+{
+    for (int i = 0; i < ndescs; i++)
+    {
+        uint64_t d[4];
+        sema_type_desc(descs[i].t, d);
+        uint32_t base = descs[i].base;
+        for (int w = 0; w < 4; w++)
+        {
+            gstore_const(base + (uint32_t)w, d[w]);
+        }
+        if (descs[i].fields)
+        {
+            MirSlot members = temp();
+            MirInst *a = inst(MIR_GADDR);
+            a->d = members;
+            a->imm = base + 5;
+            MirInst *g = inst(MIR_GSTORE);
+            g->a = members;
+            g->imm = base + 4;
+        }
+        else
+        {
+            gstore_const(base + 4, 0);
+        }
+        TypeId t = descs[i].t;
+        if (type_kind(t) != T_STRUCT)
+        {
+            continue;
+        }
+        SymId st = type_ref(t);
+        Unit *home = &cx.units[SYM(st)->unit];
+        uint32_t k = 0;
+        for (NodeId m = NODE(home, SYM(st)->decl)->a; m; m = NEXT(home, m))
+        {
+            if (NODE(home, m)->kind != AST_FIELD_DECL)
+            {
+                continue;
+            }
+            gstore_const(base + 5 + 2 * k, layout_member_offset(st, m));
+            MirSlot of = temp();
+            MirInst *a = inst(MIR_GADDR);
+            a->d = of;
+            a->imm = desc_alloc(sema_type_of(home, NODE(home, m)->a, st));
+            MirInst *s2 = inst(MIR_GSTORE);
+            s2->a = of;
+            s2->imm = base + 6 + 2 * k;
+            k++;
+        }
+    }
+}
+
+SymId mir_entry_routine(void)
+{
+    return desc_start;
+}
+
+// The address of a type's descriptor (std's type: id, size, align, fields), read-only data
+// next to the code: a string's bytes, past its length word.
+static MirSlot type_descriptor(TypeId t)
+{
+    return desc_address(t, 0);
+}
+
+// typeof(a) of an *any: the address of its descriptor.
+static MirSlot any_descriptor(NodeId any)
+{
+    MirSlot p = lower_expr(any);
+    MirInst *ld = inst(MIR_LOAD);
+    ld->var = MV_U64;
+    ld->d = temp();
+    ld->a = p;
+    ld->imm = 8;
+    return ld->d;
+}
+
 static MirSlot lower_as(NodeId id, TypeId want)
 {
     Unit *u = L.u;
@@ -1264,6 +1536,20 @@ static MirSlot lower_as(NodeId id, TypeId want)
     if (type_kind(want) == T_PTR && type_kind(have) == T_STRUCT)
     {
         return lower_struct_addr(id);
+    }
+    if (sema_is_any_ref(want) && type_kind(have) == T_PTR && !sema_is_any_ref(have))
+    {
+        // a reference into an *any: the pair (address, type) in a block of this frame
+        MirSlot at = lower_expr(id);
+        uint32_t k = L.perm;
+        L.perm += 2;
+        into(at, SLOT_PERM | k);
+        into(type_descriptor(type_ref(have)), SLOT_PERM | (k + 1));
+        MirInst *a = inst(MIR_ADDR);
+        a->d = temp();
+        a->a = SLOT_PERM | k;
+        a->imm = 2;
+        return a->d;
     }
     int wv = int_variant(want), hv = c_variant(id);
     uint64_t k;
@@ -1598,7 +1884,55 @@ int mir_next_helper(MirFunc *out)
         finish_frame(out);
         return 1;
     }
+    if (desc_init && !desc_written) // the descriptors, now that every use has asked for its own
+    {
+        desc_written = 1;
+        region_end(REGION_MIR);
+        region_set_end(REGION_MIR, cx.regions[REGION_MIR].base);
+        L.u = &cx.units[0];
+        L.f = out;
+        L.errors = 0;
+        L.top = L.max_top = 0;
+        L.perm = 0;
+        L.nlocals = 0;
+        L.ret = T_VOID;
+        L.has_self = 0;
+        L.struct_abi = 1;
+        *out = (MirFunc){.u = L.u, .sym = desc_init, .label = "descriptors", .param_slots = 0};
+        lower_desc_init();
+        inst(MIR_RET);
+        finish_frame(out);
+        return 1;
+    }
+    SymId main_fn = desc_start ? scope_find(cx.units[0].scope, "main", 4) : 0;
+    if (desc_start && !start_written && main_fn && SYM(main_fn)->kind == SYM_METHOD)
+    {
+        // the program's entry: the descriptors, then main, whose result is this one's
+        start_written = 1;
+        region_end(REGION_MIR);
+        region_set_end(REGION_MIR, cx.regions[REGION_MIR].base);
+        L.u = &cx.units[0];
+        L.f = out;
+        L.errors = 0;
+        L.top = L.max_top = 0;
+        L.perm = 0;
+        L.nlocals = 0;
+        L.has_self = 0;
+        L.struct_abi = 1;
+        TypeId ret = sema_fn_ret(&cx.units[0], main_fn);
+        L.ret = ret;
+        *out = (MirFunc){.u = L.u, .sym = desc_start, .label = "start", .param_slots = 0,
+                         .returns = ret != T_VOID, .ret_slots = ret != T_VOID};
+        inst(MIR_CALL)->imm = desc_init;
+        inst(MIR_CALL)->imm = main_fn; // its result is in its slot 0, which is this one's
+        inst(MIR_RET);
+        finish_frame(out);
+        return 1;
+    }
     nsink_helpers = 0; // all handed over: the next program starts afresh
+    ndescs = 0;
+    desc_written = 0;
+    start_written = 0;
     return 0;
 }
 
@@ -1838,6 +2172,105 @@ static TypeId field_type(SymId field)
     return sema_value_type(&cx.units[SYM(field)->unit], field);
 }
 
+// The struct st at src + soff, copied to dst + doff (both addresses), one field at a time in its
+// width: a struct held in another sits at any offset its alignment allows, so it is not whole
+// slots. A field with no bytes is not copied; padding is not either.
+static void copy_fields(MirSlot dst, uint32_t doff, MirSlot src, uint32_t soff, SymId st)
+{
+    Unit *home = &cx.units[SYM(st)->unit];
+    for (NodeId m = NODE(home, SYM(st)->decl)->a; m; m = NEXT(home, m))
+    {
+        if (NODE(home, m)->kind != AST_FIELD_DECL || layout_member_gone(st, m))
+        {
+            continue;
+        }
+        TypeId ft = sema_type_of(home, NODE(home, m)->a, st);
+        uint32_t off = layout_member_offset(st, m);
+        if (is_struct(ft))
+        {
+            copy_fields(dst, doff + off, src, soff + off, type_ref(ft));
+            continue;
+        }
+        uint32_t n = is_array(ft) ? type_len(ft) : 1, w = is_array(ft) ? type_layout(type_ref(ft)).size : 0;
+        TypeId et = is_array(ft) ? type_ref(ft) : ft;
+        for (uint32_t e = 0; e < n; e++)
+        {
+            MirSlot v = temp();
+            MirInst *ld = inst(MIR_LOAD);
+            ld->var = (uint8_t)mem_variant(et);
+            ld->d = v;
+            ld->a = src;
+            ld->imm = soff + off + e * w;
+            MirInst *stv = inst(MIR_STORE);
+            stv->var = (uint8_t)mem_variant(et);
+            stv->a = dst;
+            stv->b = v;
+            stv->imm = doff + off + e * w;
+        }
+    }
+}
+
+// The leaves of a global struct (from `leaf`) to and from a struct at an address, in each field's
+// width: a struct variable of the module is read or written whole this way.
+static void global_fields(uint32_t leaf, MirSlot mem, uint32_t off, TypeId t, int store)
+{
+    if (type_kind(t) == T_ARRAY || type_kind(t) != T_STRUCT)
+    {
+        uint32_t n = type_kind(t) == T_ARRAY ? type_len(t) : 1;
+        TypeId et = type_kind(t) == T_ARRAY ? type_ref(t) : t;
+        uint32_t w = type_layout(et).size;
+        for (uint32_t e = 0; e < n; e++)
+        {
+            MirSlot v = temp();
+            if (store) // memory -> global
+            {
+                MirInst *ld = inst(MIR_LOAD);
+                ld->var = (uint8_t)mem_variant(et);
+                ld->d = v;
+                ld->a = mem;
+                ld->imm = off + e * w;
+                MirInst *g = inst(MIR_GSTORE);
+                g->a = v;
+                g->imm = leaf + e;
+            }
+            else
+            {
+                MirInst *g = inst(MIR_GLOAD);
+                g->d = v;
+                g->imm = leaf + e;
+                MirInst *st = inst(MIR_STORE);
+                st->var = (uint8_t)mem_variant(et);
+                st->a = mem;
+                st->b = v;
+                st->imm = off + e * w;
+            }
+        }
+        return;
+    }
+    SymId st = type_ref(t);
+    Unit *home = &cx.units[SYM(st)->unit];
+    for (NodeId m = NODE(home, SYM(st)->decl)->a; m; m = NEXT(home, m))
+    {
+        if (NODE(home, m)->kind != AST_FIELD_DECL || layout_member_gone(st, m))
+        {
+            continue;
+        }
+        TypeId ft = sema_type_of(home, NODE(home, m)->a, st);
+        global_fields(leaf, mem, off + layout_member_offset(st, m), ft, store);
+        leaf += global_leaves(ft);
+    }
+}
+
+static void global_store_fields(uint32_t leaf, MirSlot src, uint32_t off, TypeId t)
+{
+    global_fields(leaf, src, off, t, 1);
+}
+
+static void global_load_fields(uint32_t leaf, MirSlot dst, uint32_t off, TypeId t)
+{
+    global_fields(leaf, dst, off, t, 0);
+}
+
 // k slots from src to dst, in the order that is safe when the blocks overlap.
 static void copy_slots(MirSlot dst, MirSlot src, uint32_t k)
 {
@@ -1901,9 +2334,10 @@ static void struct_literal_at(NodeId id, MirSlot block)
         {
             continue; // the checker reported it
         }
-        if (is_struct(field_type(member)))
+        if (is_struct(field_type(member))) // a struct held in this one: its fields, at its offset
         {
-            unsupported(NODE(u, f)->tok, "a struct inside a struct");
+            MirSlot from = lower_struct_addr(NODE(u, f)->a);
+            copy_fields(addr, (uint32_t)field_offset(member), from, 0, type_ref(field_type(member)));
             continue;
         }
         MirSlot value = lower_as(NODE(u, f)->a, field_type(member));
@@ -1927,6 +2361,52 @@ static MirSlot struct_literal_block(NodeId id)
     return block;
 }
 
+// typeof(X) as a value into the k slots at dst: the descriptor's constants, or an *any's copied
+// from its descriptor. 0 if id is not a typeof.
+static int typeof_into(NodeId id, MirSlot dst, uint32_t k)
+{
+    Unit *u = L.u;
+    const AstNode *n = NODE(u, id);
+    uint64_t desc[4];
+    TypeId named = sema_named_type(u, id);
+    int a_type = named != T_NONE && sema_std_type() && u->types[id] == type_make(T_STRUCT, sema_std_type());
+    if (a_type)
+    {
+        sema_type_desc(named, desc); // `describe(point)`: the type's descriptor
+    }
+    if (a_type || sema_typeof_desc(u, id, desc))
+    {
+        for (uint32_t j = 0; j < k && j < 4; j++)
+        {
+            into(emit_const(desc[j]), dst + j);
+        }
+        if (k > 4) // members: the descriptor's table (0 for a type with no fields)
+        {
+            TypeId t = a_type ? named : u->types[n->b];
+            if (type_kind(t) == T_TYPE)
+            {
+                t = type_make(T_STRUCT, type_ref(t));
+            }
+            into(desc[3] ? desc_address(t, 5) : emit_const(0), dst + 4);
+        }
+        return 1;
+    }
+    if (n->kind != AST_CALL || sema_primitive(u, id) != PRIM_TYPEID || !n->b)
+    {
+        return 0;
+    }
+    MirSlot from = any_descriptor(n->b);
+    for (uint32_t j = k; j-- > 0;)
+    {
+        MirInst *i = inst(MIR_LOAD);
+        i->var = MV_U64;
+        i->d = dst + j;
+        i->a = from;
+        i->imm = 8 * j;
+    }
+    return 1;
+}
+
 static void lower_struct_into(NodeId id, MirSlot dst)
 {
     Unit *u = L.u;
@@ -1934,6 +2414,42 @@ static void lower_struct_into(NodeId id, MirSlot dst)
     TypeId t = u->types[id];
     uint32_t k = slots_of(t);
     MirSlot base;
+    if (typeof_into(id, dst, k))
+    {
+        return;
+    }
+    if (n->kind == AST_CALL && sema_primitive(u, id) == PRIM_LOAD && n->b) // load(S, p, offset): a struct
+    {
+        NodeId p = NEXT(u, n->b), off = NEXT(u, p);
+        MirSlot at = lower_expr(p);
+        uint64_t c;
+        uint32_t imm = 0;
+        if (const_value(off, &c) && c < 0x7fffffffull)
+        {
+            imm = (uint32_t)c;
+        }
+        else
+        {
+            MirSlot o = lower_as(off, T_U64);
+            MirSlot sum = temp();
+            MirInst *add = inst(MIR_BIN);
+            add->sub = MB_ADD;
+            add->var = MV_U64;
+            add->d = sum;
+            add->a = at;
+            add->b = o;
+            at = sum;
+        }
+        MirInst *z = inst(MIR_ZERO);
+        z->a = dst;
+        z->imm = k;
+        MirInst *a = inst(MIR_ADDR);
+        a->d = temp();
+        a->a = dst;
+        a->imm = k;
+        copy_fields(a->d, 0, at, imm, type_ref(t));
+        return;
+    }
     if (!type_layout(t).size)
     {
         unsupported(n->tok, "a struct with a field that has no layout yet");
@@ -1972,6 +2488,54 @@ static void lower_struct_into(NodeId id, MirSlot dst)
     if (n->kind == AST_CALL)
     {
         copy_slots(dst, lower_call(id), k); // the result is in the window: taken at once
+        return;
+    }
+    SymId gvar;
+    uint32_t leaf;
+    if ((n->kind == AST_IDENT || n->kind == AST_SELECTOR) && global_path(id, &gvar, &leaf))
+    {
+        // a module-level struct variable (or a struct in one): its slots, field by field
+        MirInst *z = inst(MIR_ZERO);
+        z->a = dst;
+        z->imm = k;
+        MirInst *a = inst(MIR_ADDR);
+        a->d = temp();
+        a->a = dst;
+        a->imm = k;
+        global_load_fields(global_index(gvar) + leaf, a->d, 0, t);
+        return;
+    }
+    if (n->kind == AST_UNARY_OP && TOK(u, n->tok)->kind == TOK_STAR) // `*p`: the struct p points to
+    {
+        MirSlot from = lower_expr(n->a);
+        for (uint32_t j = k; j-- > 0;) // last slot first, as for self (dst may hold p)
+        {
+            MirInst *i = inst(MIR_LOAD);
+            i->var = MV_U64;
+            i->sub = struct_is_registers(t) ? MIR_MEM_DEVICE : 0;
+            i->d = dst + j;
+            i->a = from;
+            i->imm = 8 * j;
+        }
+        return;
+    }
+    SymId held = n->kind == AST_SELECTOR ? u->refs[id] : 0;
+    if (held && SYM(held)->kind == SYM_FIELD) // `b.corner`: the struct held in b, copied out
+    {
+        int ok;
+        MirSlot outer = lower_field_base(n->a, n->tok, &ok);
+        if (!ok)
+        {
+            return;
+        }
+        MirInst *z = inst(MIR_ZERO);
+        z->a = dst;
+        z->imm = k;
+        MirInst *a = inst(MIR_ADDR);
+        a->d = temp();
+        a->a = dst;
+        a->imm = k;
+        copy_fields(a->d, 0, outer, (uint32_t)field_offset(held), type_ref(t));
         return;
     }
     const ComptimeAggregate *computed = (n->kind == AST_IDENT || n->kind == AST_SELECTOR) && u->refs[id]
@@ -2033,6 +2597,93 @@ static MirSlot lower_call(NodeId id)
     if (sema_sizeof(u, id, &size))
     {
         return emit_const(size); // a constant of the target's layout
+    }
+    if (sema_primitive(u, id) == PRIM_TYPEID) // a typeof the struct paths did not take: in a block
+    {
+        uint32_t k = slots_of(u->types[id]);
+        MirSlot block = temp_n(k);
+        typeof_into(id, block, k);
+        return block;
+    }
+    if (sema_primitive(u, id) == PRIM_LOAD && n->b) // load(T, p, offset): the T at p + offset
+    {
+        TypeId t = u->types[id];
+        NodeId p = NEXT(u, n->b), off = NEXT(u, p);
+        if (is_struct(t)) // a struct: into a block of its own, field by field
+        {
+            uint32_t k = slots_of(t);
+            MirSlot block = temp_n(k);
+            lower_struct_into(id, block);
+            return block;
+        }
+        MirSlot at = lower_expr(p);
+        uint64_t c;
+        uint64_t imm = 0;
+        if (const_value(off, &c) && c < 0x7fffffffull)
+        {
+            imm = c;
+        }
+        else
+        {
+            MirSlot o = lower_as(off, T_U64);
+            MirSlot sum = temp();
+            MirInst *add = inst(MIR_BIN);
+            add->sub = MB_ADD;
+            add->var = MV_U64;
+            add->d = sum;
+            add->a = at;
+            add->b = o;
+            at = sum;
+        }
+        MirInst *ld = inst(MIR_LOAD);
+        ld->var = (uint8_t)mem_variant(t);
+        ld->d = temp();
+        ld->a = at;
+        ld->imm = imm;
+        return ld->d;
+    }
+    if (sema_primitive(u, id) == PRIM_UNANY && n->b) // point(a): a's address, when a holds a point
+    {
+        MirSlot p = lower_expr(n->b);
+        MirInst *dl = inst(MIR_LOAD); // the descriptor's address, then its id
+        dl->var = MV_U64;
+        dl->d = temp();
+        dl->a = p;
+        dl->imm = 8;
+        MirSlot desc = dl->d;
+        MirSlot have = temp();
+        MirInst *ld = inst(MIR_LOAD);
+        ld->var = MV_U64;
+        ld->d = have;
+        ld->a = desc;
+        ld->imm = 0;
+        MirSlot want = emit_const(type_make(T_STRUCT, u->refs[id])); // before the compare reads it
+        MirSlot same = temp();
+        MirInst *eq = inst(MIR_BIN);
+        eq->sub = MB_EQ;
+        eq->var = MV_U64;
+        eq->d = same;
+        eq->a = have;
+        eq->b = want;
+        uint32_t ok = new_label();
+        MirInst *j = inst(MIR_JNZ);
+        j->a = same;
+        j->imm = ok;
+        int line, col;
+        source_pos(u->src, TSTART(TOK(u, n->tok)), &line, &col);
+        char place[540], shown[540], text[600];
+        int pl = snprintf(place, sizeof(place), "%s:%d:%d", u->path, line, col);
+        trap_place(place, pl < 0 ? 0 : (size_t)pl >= sizeof(place) ? sizeof(place) - 1 : (size_t)pl, shown,
+                   sizeof(shown));
+        int tl = snprintf(text, sizeof(text), "%s: the *any holds another type\n", shown); // no type names
+        inst(MIR_TRAP)->a = string_slot((const uint8_t *)text, (size_t)(tl < 0 ? 0 : tl));
+        place_label(ok);
+        MirInst *at = inst(MIR_LOAD);
+        at->var = MV_U64;
+        at->d = temp();
+        at->a = p;
+        at->imm = 0;
+        return at->d;
     }
     if (sema_primitive(u, id) == PRIM_CONVERT && n->b)
     {
@@ -2402,12 +3053,13 @@ static void guard_index(MirSlot i, uint64_t len, uint32_t tok)
     }
     else
     {
+        MirSlot n = emit_const(len); // before the compare that reads it
         MirInst *c = inst(MIR_BIN);
         c->sub = MB_LT;
         c->var = MV_U64;
         c->d = t;
         c->a = i;
-        c->b = emit_const(len);
+        c->b = n;
     }
     MirInst *j = inst(MIR_JNZ);
     j->a = t;
@@ -2657,6 +3309,24 @@ static MirSlot lower_field_base(NodeId base, uint32_t tok, int *ok)
     {
         return 0;
     }
+    const AstNode *b = NODE(u, base);
+    if (b->kind == AST_CALL && sema_primitive(u, base) == PRIM_TYPEID && b->b && sema_is_any_ref(u->types[b->b]))
+    {
+        return any_descriptor(b->b); // `typeof(a).id`: read in place
+    }
+    SymId inner = b->kind == AST_SELECTOR ? u->refs[base] : 0;
+    if (inner && SYM(inner)->kind == SYM_FIELD && is_struct(field_type(inner)))
+    {
+        // `b.corner.x`: corner's address is b's plus its offset, so a write reaches b itself
+        MirSlot outer = lower_field_base(b->a, tok, ok);
+        if (!*ok)
+        {
+            return outer;
+        }
+        MirSlot at = temp();
+        bini(MB_ADD, MV_U64, at, outer, field_offset(inner));
+        return at;
+    }
     if (type_kind(u->types[base]) == T_PTR)
     {
         return lower_expr(base);
@@ -2808,8 +3478,21 @@ static MirSlot lower_expr(NodeId id)
         {
             return emit_const(0);
         }
-        if (find_local(token_name(t), &slot))
+        int ref = 0;
+        if (find_local_ref(token_name(t), &slot, &ref))
         {
+            if (ref == LOCAL_BOXED)
+            {
+                MirInst *a = inst(MIR_ADDR);
+                a->d = temp();
+                a->a = slot;
+                a->imm = 1;
+                MirInst *ld = inst(MIR_LOAD);
+                ld->var = (uint8_t)mem_variant(type);
+                ld->d = temp();
+                ld->a = a->d;
+                return ld->d;
+            }
             return slot;
         }
         if (type_kind(type) == T_FUNC)
@@ -2839,6 +3522,46 @@ static MirSlot lower_expr(NodeId id)
         {
             return array_addr(n->a, n->tok);
         }
+        if (t->kind == TOK_AMP && NODE(u, n->a)->kind == AST_IDENT && !u->refs[n->a] &&
+            !is_struct(u->types[n->a]) && !is_array(u->types[n->a]) && !is_self_ident(n->a))
+        {
+            // &n of a number local: its slot, which is memory from now on (LOCAL_BOXED)
+            NameId name = token_name(TOK(u, NODE(u, n->a)->tok));
+            for (int i = L.nlocals - 1; i >= 0; i--)
+            {
+                if (L.locals[i].name == name)
+                {
+                    if (L.locals[i].ref == 0)
+                    {
+                        L.locals[i].ref = LOCAL_BOXED;
+                    }
+                    if (L.locals[i].ref != LOCAL_BOXED)
+                    {
+                        break;
+                    }
+                    MirInst *a = inst(MIR_ADDR);
+                    a->d = temp();
+                    a->a = L.locals[i].slot;
+                    a->imm = 1;
+                    return a->d;
+                }
+            }
+        }
+        SymId gref;
+        uint32_t gleaf;
+        if (t->kind == TOK_AMP && global_path(n->a, &gref, &gleaf))
+        {
+            unsupported(n->tok, "a reference to a module-level struct variable (its fields live in "
+                                "slots of their own)");
+            return temp();
+        }
+        if (t->kind == TOK_AMP && is_struct(u->types[n->a]) &&
+            ((NODE(u, n->a)->kind == AST_IDENT && !u->refs[n->a]) || NODE(u, n->a)->kind == AST_STRUCT_LIT))
+            // &p of a struct local: its own block, so writes through it reach p. &T{ ... }: a
+            // block of the frame (lower_struct_addr), which lives as long as the function
+        {
+            return lower_struct_addr(n->a);
+        }
         MirSlot a = lower_expr(n->a);
         int v = type == T_INT_LIT ? c_variant(id) : int_variant(type);
         MirInst *i;
@@ -2867,6 +3590,20 @@ static MirSlot lower_expr(NodeId id)
         SymId member = u->refs[id];
         int ok;
         NodeId sinit;
+        SymId gvar;
+        uint32_t leaf;
+        if (member && SYM(member)->kind == SYM_FIELD && !is_struct(field_type(member)) &&
+            global_path(id, &gvar, &leaf)) // `g.a.x` of a module-level struct variable: its slot
+        {
+            if (!field_stored(member))
+            {
+                return field_constant(member);
+            }
+            MirInst *i = inst(MIR_GLOAD);
+            i->d = temp();
+            i->imm = global_index(gvar) + leaf;
+            return i->d;
+        }
         MirSlot own = fields_local_slot(id);
         if (own != (MirSlot)-1)
         {
@@ -2967,6 +3704,27 @@ static MirSlot lower_expr(NodeId id)
             return into(lower_as(n->b, u->types[n->a]), slot);
         }
         NodeId tinit;
+        SymId gvar;
+        uint32_t leaf;
+        if ((target->kind == AST_IDENT || target->kind == AST_SELECTOR) && global_path(n->a, &gvar, &leaf))
+        {
+            TypeId tt = u->types[n->a];
+            if (is_struct(tt)) // `g = p`, `g.a = q`: every field of the value into its slot
+            {
+                MirSlot from = lower_struct_addr(n->b);
+                global_store_fields(global_index(gvar) + leaf, from, 0, tt);
+                return temp();
+            }
+            MirSlot value = lower_as(n->b, tt);
+            if (s && SYM(s)->kind == SYM_FIELD && !field_stored(s))
+            {
+                return value;
+            }
+            MirInst *g = inst(MIR_GSTORE);
+            g->a = value;
+            g->imm = global_index(gvar) + leaf;
+            return value;
+        }
         if ((target->kind == AST_IDENT || target->kind == AST_SELECTOR) && is_global(s, &tinit))
         {
             MirSlot value = lower_as(n->b, u->types[n->a]);
@@ -2988,9 +3746,15 @@ static MirSlot lower_expr(NodeId id)
             {
                 base = lower_field_base(target->a, target->tok, &ok);
             }
-            if (s && SYM(s)->kind == SYM_FIELD && is_struct(field_type(s)))
+            if (s && SYM(s)->kind == SYM_FIELD && is_struct(field_type(s))) // `b.corner = g`
             {
-                unsupported(target->tok, "a struct inside a struct");
+                if (!ok || target->kind != AST_SELECTOR)
+                {
+                    unsupported(target->tok, "assigning to this");
+                    return temp();
+                }
+                MirSlot from = lower_struct_addr(n->b);
+                copy_fields(base, (uint32_t)field_offset(s), from, 0, type_ref(field_type(s)));
                 return temp();
             }
             MirSlot value = lower_as(n->b, u->types[n->a]);
@@ -3065,21 +3829,23 @@ static void lower_return(NodeId value)
         for (NodeId f = NODE(u, lid)->a; f; f = NEXT(u, f))
         {
             SymId member = u->refs[f];
-            if (!member || SYM(member)->kind != SYM_FIELD || is_struct(field_type(member)) || nv == 64)
+            if (!member || SYM(member)->kind != SYM_FIELD || nv == 64)
             {
-                if (member && nv < 64 && is_struct(field_type(member)))
-                {
-                    unsupported(NODE(u, f)->tok, "a struct inside a struct");
-                }
                 continue;
             }
-            values[nv] = lower_as(NODE(u, f)->a, field_type(member)); // a store through self changes no local
-            members[nv++] = member;
+            values[nv] = is_struct(field_type(member)) ? lower_struct_addr(NODE(u, f)->a) // copied below
+                                                       : lower_as(NODE(u, f)->a, field_type(member));
+            members[nv++] = member; // a store through self changes no local
         }
         for (int i = 0; i < nv; i++)
         {
             if (!field_stored(members[i]))
             {
+                continue;
+            }
+            if (is_struct(field_type(members[i])))
+            {
+                copy_fields(0, (uint32_t)field_offset(members[i]), values[i], 0, type_ref(field_type(members[i])));
                 continue;
             }
             MirInst *st = inst(MIR_STORE);
@@ -3249,6 +4015,53 @@ int mir_lowerable(Unit *u, SymId fn, int report)
 
 static MirSlot emit_const(uint64_t v);
 
+// The leaves of a struct global from `leaf` on, from the bytes at off of the value the compiler
+// computed (0 without one: a struct variable with no initializer starts at zero).
+static uint32_t global_init_leaves(uint32_t leaf, const ComptimeAggregate *c, uint32_t off, TypeId t)
+{
+    if (type_kind(t) == T_STRUCT)
+    {
+        SymId st = type_ref(t);
+        Unit *home = &cx.units[SYM(st)->unit];
+        for (NodeId m = NODE(home, SYM(st)->decl)->a; m; m = NEXT(home, m))
+        {
+            if (NODE(home, m)->kind == AST_FIELD_DECL && !layout_member_gone(st, m))
+            {
+                leaf = global_init_leaves(leaf, c, off + layout_member_offset(st, m),
+                                          sema_type_of(home, NODE(home, m)->a, st));
+            }
+        }
+        return leaf;
+    }
+    uint32_t n = type_kind(t) == T_ARRAY ? type_len(t) : 1;
+    TypeId et = type_kind(t) == T_ARRAY ? type_ref(t) : t;
+    uint32_t w = type_layout(et).size;
+    for (uint32_t e = 0; e < n; e++, leaf++)
+    {
+        uint32_t at = off + e * w;
+        MirSlot k;
+        if (et == T_STR && c && at / 8 < c->n && c->str[at / 8])
+        {
+            k = string_slot(c->str[at / 8], c->len[at / 8]);
+        }
+        else
+        {
+            uint64_t v = 0;
+            if (c && at + w <= c->n * 8)
+            {
+                memcpy(&v, (const uint8_t *)c->slots + at, w > 8 ? 8 : w);
+            }
+            int var = int_variant(et);
+            k = emit_const(var >= 0 ? mir_normalize(v, var) : v);
+        }
+        MirInst *st = inst(MIR_GSTORE);
+        st->a = k;
+        st->imm = leaf;
+        L.top = k;
+    }
+    return leaf;
+}
+
 // main's prologue: every module-level variable of the program gets its initial value (a literal,
 // or 0). An initializer that is not a literal is reported where the variable is used.
 static void init_globals(void)
@@ -3264,6 +4077,12 @@ static void init_globals(void)
         uint64_t value = 0;
         uint64_t computed;
         const ComptimeAggregate *text = init ? sema_comptime_aggregate(s) : NULL;
+        TypeId gt = sema_value_type((Unit *)home, s);
+        if (is_struct(gt)) // a struct variable: each leaf from the value the compiler computed
+        {
+            global_init_leaves(global_index(s), text, 0, gt);
+            continue;
+        }
         if (text && text->n == 1 && text->str[0]) // a string the compiler computed
         {
             MirSlot k = string_slot(text->str[0], text->len[0]);
@@ -3634,12 +4453,17 @@ static MirSlot lower_match_as(NodeId id, TypeId want, int returned)
     uint32_t end = new_label(), top = L.top;
     uint32_t entry[TREE_MAX];
     static TreePlan plan;
-    int tree = match_tree(m, ns, types[0], end, entry, &plan);
+    NodeId only = sema_taken_arm(L.f->sym, id); // decided while compiling: that arm, untested
+    int tree = only ? 0 : match_tree(m, ns, types[0], end, entry, &plan);
     int index = 0;
     for (NodeId arm = m->b; arm; arm = NEXT(u, arm), index++)
     {
+        if (only && arm != only)
+        {
+            continue;
+        }
         const AstNode *a = NODE(u, arm);
-        int last = !NEXT(u, arm);
+        int last = !NEXT(u, arm) || only;
         int searched = tree && index > 0; // reached through the search: no test of its own
         uint32_t next = searched ? 0 : last ? end : new_label(); // (the last arm tests only when values are left)
         int locals = L.nlocals;
@@ -3648,7 +4472,7 @@ static MirSlot lower_match_as(NodeId id, TypeId want, int returned)
         {
             place_label(entry[index]);
         }
-        for (NodeId pat = a->a; pat && k < ns && !searched; pat = NEXT(u, pat), k++)
+        for (NodeId pat = a->a; pat && k < ns && !searched && !only; pat = NEXT(u, pat), k++)
         {
             Pattern pt; // (`_` is no test: sema_arm_pattern says 0)
             NodeId name;
@@ -3734,6 +4558,7 @@ int mir_lower(Unit *u, SymId fn, MirFunc *out)
     L.has_self = SYM(fn)->owner != 0;
     L.struct_abi = is_struct(L.ret);
     L.loops = (SYM(fn)->flags & SYM_F_LOOPS) != 0; // it calls itself (the checker saw it)
+    L.for_compiler = 0;
     *out = (MirFunc){.u = u, .sym = fn, .returns = L.ret != T_VOID,
                      .ret_slots = L.ret == T_VOID ? 0 : slots_of(L.ret)};
     if (!mir_lowerable(u, fn, 0))
@@ -3973,6 +4798,9 @@ void mir_reset(void)
     nsink_helpers = 0;
     nest_base = NULL;
     nheld = 0;
+    ndescs = 0;
+    desc_init = desc_start = 0;
+    desc_written = start_written = 0;
 }
 
 // A module-level initializer as a function of no parameters that returns it (in slot 0), for the
@@ -3989,6 +4817,7 @@ int mir_lower_expr(Unit *u, NodeId expr, TypeId type, SymId fn, MirFunc *out)
     L.has_self = 0;
     L.struct_abi = 1; // never kept for inlining
     L.loops = 0;
+    L.for_compiler = 1;
     *out = (MirFunc){.u = u, .sym = fn, .returns = 1, .ret_slots = slots_of(type), .label = "(compile time)"};
     if (type == T_VOID) // a statement (`assert(...)`, a call): run for what it checks
     {
@@ -4020,7 +4849,7 @@ void mir_print(const MirFunc *f, FILE *out)
     static const char *const ops[MIR__COUNT] = {
         "const", "copy", "addr", "zero", "load", "store", "bin", "bini", "neg",
         "not",   "norm", "label", "jz",  "jnz",  "call",  "ret", "str",  "write", "gload", "gstore",
-        "trap",  "jump",
+        "trap",  "jump", "gaddr", "desc",
     };
     static const char *const bins[MB__COUNT] = {"add", "sub", "mul", "div", "eq",
                                                 "ne",  "lt",  "le",  "gt",  "ge"};
