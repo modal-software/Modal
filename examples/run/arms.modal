@@ -54,9 +54,11 @@ nil countdown(u8 n) {
 }
 
 T loop(T: type, n: T) {
-    (_, 0..100000000): loop(u64, n + 1)
+    (_, 0..10): loop(u64, n + 1)
     _: return n
 }
+
+a := loop(u64, 1)
 
 main(): u8 {
     u8 c = 50
@@ -64,8 +66,7 @@ main(): u8 {
         48..57: "a digit",
         _: "not a digit"
     }
-    a := loop(u64, 1)
-    print(a())
+    print(a)
 
     -{
     print(word, kind(c), kind(32), kind(7), size(0), size(5), size(200))
@@ -82,3 +83,108 @@ main(): u8 {
     }-
     return 0
 }
+
+
+-{
+proposed new syntax for match operations using pipe ops considering that every arm are computed in pipe ops.
+we should add support to pipe operators, to pipelines, im suggesting you to deep review every thing below, the costs and syntax decisions and accepting a lot of suggestions to that.
+
+loop(T: type, n: T) {
+    -- attention to "function" this are not exactly a properly lambda, but are very similar syntax, check line 133 for how a common lambda and match inside a lambda are
+    -- i want you to review this syntax its are appropriated very cetical. 
+    f := (0..10) {
+        -- even loop being invoked here he's a children of (f) and loop will not be execute until f be invoked
+        loop(u64, n + 1)
+        print(n)
+    }
+    -- here usage decides that f should be invoked
+    n.(f).(_: print("finished"))
+}
+
+-- or
+
+
+
+f := () {
+    loop(u64, 1)
+    print(n)
+}
+
+loop(T: type, n: T) {
+    -- usage will analyse and decide if the pipe ops are sequentially (pipeline) or concurrent
+    n.(0..10: n + 1).(f()).(_: print("finished"))
+    -- sequentially: (check 0..10) -> increments n by 1 -> execute f that recursely executes loop, end of sequence.
+    -- concurrent: (catches all) -> prints "finished" 
+
+}
+
+-- with lambdas and pipe operations
+loop(T: type, n: T) {
+    n.(0..10: {
+        loop(u64, n+1);
+        print(n)
+    }
+    ).(_: print("finished"))
+}
+}-
+
+
+
+--
+
+-{
+-- arm inside of a lambda equal arm inside of a function
+loop(T: type, n: T) {
+    fn := () {
+        0..10: {
+            loop(u64, n+1);
+            print(n)
+        }
+        _: print("finished")
+    }
+
+
+}
+}-
+
+-- thinking by usage this function above will be executed loop -> fn -> lambda and will be optimized in MIR to something like and by usage optimization
+-{
+idk if this syntax are the ideal. but seems very good for me but imaginaging that in our language we parametes are literals too, and variables are treated as literals
+that receive a expression
+
+loop(u64 n = 0..10) {
+    loop(n + 1)
+    print(n)
+    _: print("finished")
+}
+
+--ex:
+"n": struct{
+    []u8 john,
+}
+-- a variable that init with no value but a data structure formation later he will be structured
+
+-- deep review that, operators in str normally you should consider internally as char_id to avoid operators collisions.
+"john_+" := "n"{
+    -- surely this may collide with literal patterns that're what im talking about, but this member can be considered literal pattern of a structure, you may deep review that, and check for rules for keeping all explicit
+    john: "my name is john"
+}
+
+print("john_+".john)
+-- this may increase the possibilities of what can be built with less code in this language. because we are perfomance_and_developer_speed_driven
+-- these suggestion above may answer you questions about context literals that are to same perfomance_and_developer_speed_drive
+
+}-
+
+
+
+
+
+
+
+
+
+
+
+
+--

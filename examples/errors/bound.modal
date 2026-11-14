@@ -1,0 +1,13 @@
+-- calls bound to a name: each line of main below its first is an error
+print := import("std").io.print
+u64 inc(u64 n) { return n + 1 }
+u8 first([4]u8 b) { return b[0] }
+main(): u8 {
+    a := inc(1)
+    print(a(), a(2))
+    x := a + 1
+    [4]u8 bs
+    f := first(bs)
+    f()
+    return 0
+}

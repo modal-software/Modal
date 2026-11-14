@@ -11,7 +11,7 @@ count(): u8 {
 u64 deep(u64 0): 0
 u64 deep(u64 n): deep(n - 1) + 1
 u8 half(u8 n): 10 / n
-a: u8 = log(3)
+a: u8 = log(3)       -- not an error: the build prints `n 3`, a is 3
 b: u8 = count()
 c: u64 = deep(5000)
 d: u8 = half(0)

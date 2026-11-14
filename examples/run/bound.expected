@@ -1,0 +1,10 @@
+1001
+function loop(type, u64): u64
+8 8 function sum(point, i32): i32
+7 10 11 9 function span.width(): i32 function span.grow(i32): i32
+6 6 42
+7 1 function make(i32): point
+show 3
+show 3
+function show(u8)
+42 function double(u64): u64

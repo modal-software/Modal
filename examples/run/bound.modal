@@ -1,0 +1,67 @@
+-- A call bound to a name: `a := f(x)` that the body later calls as `a()` holds the call
+-- itself, not its result. Use decides (std.md §13): without an `a()` it is the result, as
+-- always. The arguments are computed at the binding (copied), so each `a()` runs f with the
+-- values they had then; a receiver is a reference, so a method sees its struct as it is now.
+-- `print(a)` shows the function: its name and signature, as made.
+print := import("std").io.print
+type := import("std").type
+
+T loop(T: type, n: T) {
+    (_, 0..1000): loop(u64, n + 1)
+    _: return n
+}
+
+span: struct { i32 lo, i32 hi }
+width(self: span): i32 { return self.hi - self.lo }
+grow(self: span, i32 by): i32 {
+    self.hi = self.hi + by
+    return self.hi
+}
+
+point: struct { i32 x, i32 y }
+i32 sum(point p, i32 k) { return p.x + p.y + k }
+point make(i32 v) { return point{ x: v, y: 1 } }
+
+u64 inc(u64 n) {          -- writes its own parameter: the bound value is not changed
+    n = n + 1
+    return n
+}
+nil show(u8 n) { print("show", n) }
+u64 double(u64 n) { return n * 2 }
+
+u64 twice() {
+    t := inc(20)
+    return t() + t()
+}
+both := twice()           -- computed by the compiler, bound calls included
+
+main(): u8 {
+    a := loop(u64, 1)
+    print(a())
+    print(a)
+
+    i32 k = 5
+    p := point{ x: 1, y: 2 }
+    s := sum(p, k)        -- p and k as they are now
+    k = 100
+    print(s(), s(), s)
+
+    sp := span{ lo: 2, hi: 9 }
+    w := sp.width()
+    g := sp.grow(1)
+    print(w(), g(), g(), w(), w, g)
+
+    t := inc(5)
+    print(t(), t(), both)
+    m := make(7)
+    print(m().x, m().y, m)
+
+    v := show(3)          -- no result: bound, it is a call to make later
+    v()
+    v()
+    print(v)
+
+    f := double           -- a function named alone is that function
+    print(f(21), f)
+    return 0
+}
