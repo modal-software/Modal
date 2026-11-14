@@ -1,0 +1,37 @@
+-- gives its descriptor (id, size, align, fields); typeof(a) gives the same at run time.
+-- `v: T` (a parameter typed by another) waits for comptime parameters.
+print := import("std").io.print
+any := import("std").any
+type := import("std").type
+point: struct {
+    i32 x,
+    i32 y,
+}
+rgb: struct {
+    u8 r,
+    u8 g,
+    u8 b,
+}
+bytes(T: type, n: u64): u64 {
+    return T.size * n
+}
+same(A: type, B: type): bool {
+    return A.id == B.id
+}
+describe(T: type): u64 {
+    return T.size * 100 + T.align * 10 + T.fields
+}
+table := bytes(point, 4)          -- computed by the compiler: a module-level value
+show(a: *any) {
+    print(describe(typeof(a)))     -- a type known only at run time, through the same function
+}
+main(): u8 {
+    print(table, bytes(rgb, 10), bytes(u64, 3))
+    print(describe(point), describe(rgb), describe(u16), describe(typeof(point)))
+    print(same(point, point), same(point, rgb), same(u8, u8))
+    p := point{ x: 1, y: 2 }
+    c := rgb{ r: 1, g: 2, b: 3 }
+    show(&p)
+    show(&c)
+    return 0
+}

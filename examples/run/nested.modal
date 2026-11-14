@@ -1,0 +1,40 @@
+-- a struct held in another, by value (Phase D): built in a literal, read and written through
+-- a path (g.s.a.x = ...), assigned whole (q.a = q.b), passed and returned whole.
+print := import("std").io.print
+pt: struct {
+    u16 x,
+    u8 y,
+}
+seg: struct {
+    u8 tag,
+    pt a,
+    pt b,
+}
+frame: struct {
+    seg s,
+    u32 n,
+    u8 k,
+}
+new(self: frame, x: u16): *frame {
+    return &frame{ s: seg{ tag: 1, a: pt{ x, y: 2 }, b: pt{ x: 7, y: 8 } }, n: 9, k: 3 }
+}
+grow(f: frame, d: u16): frame {
+    frame g = f
+    g.s.a.x = g.s.a.x + d
+    g.s.b = pt{ x: 100, y: 101 }
+    return g
+}
+sum(f: frame): u32 {
+    return u32(f.s.a.x) + u32(f.s.a.y) + u32(f.s.b.x) + u32(f.s.b.y) + f.n + u32(f.k) + u32(f.s.tag)
+}
+main(): u8 {
+    f := frame.new(5)
+    print(f.s.tag, f.s.a.x, f.s.a.y, f.s.b.x, f.s.b.y, f.n, f.k)
+    g := grow(*f, 10)
+    print(g.s.a.x, g.s.b.x, g.s.b.y, sum(g), sum(*f))
+    seg q = seg{ tag: 4, a: pt{ x: 1, y: 1 }, b: g.s.a }
+    q.a = q.b
+    q.b.y = 77
+    print(q.a.x, q.a.y, q.b.x, q.b.y, q.tag, sizeof(frame))
+    return 0
+}

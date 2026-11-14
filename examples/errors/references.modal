@@ -1,0 +1,26 @@
+-- references are written: a value is never passed or returned as one by itself
+item: struct {
+    u32 hits,
+}
+bump(*item it): *item {
+    it.hits = it.hits + 1
+    return it
+}
+copy(it: *item): item {
+    return it
+}
+main(): u8 {
+    a := item{ hits: 1 }
+    b := bump(a)
+    return 0
+}
+
+-- a literal's reference lives in its function's frame: it is never returned
+leak(): *item {
+    a: *item = &item{ hits: 1 }
+    b := a
+    return b
+}
+leak2(): *item {
+    return &item{ hits: 2 }
+}

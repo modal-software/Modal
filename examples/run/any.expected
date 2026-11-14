@@ -1,0 +1,5 @@
+7 7 0
+30 2
+true false 9
+8 2 8 4
+./examples/run/any.modal:41:15: the *any holds another type
