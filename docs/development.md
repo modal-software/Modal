@@ -109,6 +109,7 @@ make test                             # the suite
 make fuzz N=200 SEED=7                # random programs on every backend; 0 must differ
 FUZZ_KIND=struct make fuzz            # also scalar, pressure, mix (default)
 MODAL_REGS=0 make fuzz                # every function without registers (2: all with)
+MODAL_TREE=0 make fuzz                # arms tested one by one, not by the search (std.md §8)
 make backends F=examples/run/x.modal  # one program on every backend, side by side
 make asan                             # ./modal-asan (ASan + UBSan)
 BIN=./modal-asan make test            # the suite under the sanitizers (and BIN= for fuzz.py)

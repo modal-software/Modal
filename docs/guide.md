@@ -63,11 +63,16 @@ i32 x(self: point): self.x                 -- an accessor, one-line body
 u64 fact(u64 0): 1                         -- pattern clauses, tried in order;
 u64 fact(u64 n): n * fact(n - 1)           -- the last one must take every value
 
-[]u8 size(u8 n) {                          -- arms: clauses without their head (std.md §8)
-    0: "none"                              -- a value, a range `1..9` / `10..`, a string,
-    1..9: "small"                          -- true / false, or a name (the rest, named)
-    10..255: "big"                         -- every value must be taken: the compiler checks
+[]u8 size(u8 n) {                          -- arms (std.md §8): `pattern: result`; a value,
+    0: "none"                              -- a range `1..9` / `10..`, a string, true / false,
+    1..9: "small"                          -- or `_`; arms take disjoint values, and every
+    _: "big"                               -- value must be taken: the compiler checks
 }
+u64 sum(u64 n, u64 acc) {                  -- several values: (0, _); `_` alone takes all
+    (0, _): acc
+    _: sum(n - 1, acc + n)
+}
+word := if c { 48..57: "digit", _: "other" }   -- a match as a value; `limit:` a name: equal to it
 nil show(u8 n) { print(n) }                -- nil: no result. Overloads are chosen by the
 nil show([]u8 s) { print(s) }              -- argument types (a literal: the first it fits)
 
@@ -86,8 +91,8 @@ main(): u8 {
   (`docs/guards.md`). `== != < <= > >=` compare (ordering is for numbers only), `and or !`
   combine bools.
 - **Statements:** a statement ends at a newline, `;` or `}`. The forms are `return`, blocks
-  `{ }`, declarations, assignment `=`, calls, and matches: `value { pattern: result ... }`
-  (`c > 40 { true: ... false: ... }` is if / else).
+  `{ }`, declarations, assignment `=`, calls, matches (`if c { 48..57: ...,  _: ... }`, also as a value: `word := if c { ... }`) and
+  `if cond branch else branch` (a branch is a block or one statement).
 
 ## 4. Imports and domains
 
@@ -151,13 +156,13 @@ assert(target.ptr_size == 8)
 
 ## 6. Known gaps (what to expect)
 
-- **Control flow:** pattern clauses, arms (`value { ... }`, a body of arms), recursion and
-  `and`/`or`. No `if` or loop statements: a match on a bool is the `if`, and a tail call the loop.
-  A match at module level is not supported yet (put it in a function).
+- **Control flow:** pattern clauses, arms (`if value { ... }`, a body of arms), `if` / `else`,
+  recursion and `and`/`or`. No loop statement: a tail call is the loop. A match works at module level
+  too (`family: []u8 = if target.arch { "arm64": "arm", _: "other" }`: the compiler picks).
   A loop is a clause that calls its function again as its last act (`u64 sum(u64 n, u64 acc):
   sum(n - 1, acc + n)`): that call is a jump, so it runs in constant stack on every backend, and
   in registers on native. A call that is not the last act (`n + sum(n - 1)`) takes a frame per turn.
-- **No arrays,** slice operations, casts, floats, `%`, bitwise operators or shifts, if we want support array we wan to have 
+- **Arrays:** fixed width `[N]T` only (std.md §9). **No** slice operations, casts, floats, `%`, bitwise operators or shifts, if we want support array we wan to have 
 several modalities to working with it. fixed-width arrays, 0 to k with T[..], grow-only, shrink-only, grow-n-shrink. in those modalities im accepting design suggestions to design. because our core philosophy its developer have control,safety but without taking hand-off perfomance.   
 - **Overloads** are chosen by argument count and types: the first definition, in the order
   written, that every argument fits (a literal also by its value: `show(300)` skips `u8`).

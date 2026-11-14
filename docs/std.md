@@ -134,6 +134,14 @@ A million numbers printed (`n * 7919`, one per line), best of 15, arm64 native:
 | Modal, digits by recursion (`digits(n / 10)` first, then `put`) | 44.3 ms | 28.1 ms |
 | Modal, tail calls only (a power of ten found, then a digit each turn) | (crashed: no tail calls) | 23.0 ms |
 | the compiler's, through C at `-O2` (reference) | 6.8 ms | |
+| Modal, a `[24]u8` buffer filled backwards (§35) | | 24.4 ms (21.6 with the indexes proven by arms) |
+
+With arrays (§35): the compiler's formatter 11.4 ms, the Modal one with a buffer 24.4 ms, tail calls
+only 23.8. Still 2.1x: what is left is per byte. Each digit goes through the `write.byte` stencil
+(its three register saves around the rare flush, guards.md / plan Phase E), and each number makes
+three calls (`write_uint`, `fill`, `emit`; a function with a local array keeps its frame, so it
+is not inlined). Bounds checks are 3 ms of it. The next steps are the inline byte sink in
+register mode and a write of a whole range of bytes; the gate is measured again then.
 
 The Modal formatter is 2.1× the compiler's: the gate is not met, and `print` stays the
 compiler's. What is left is the algorithm, not the optimizer:
@@ -210,90 +218,226 @@ first overload it fits. Still open: the names `args` and `any`.
 
 ## 8. Literal patterns and arms
 
-Built (context.md §29). One rule carries all of it: **a literal stands where a name would be**, and
-then it is a test.
-
-**The patterns:**
-
-| pattern | takes | example |
-|---|---|---|
-| a number, `-` a number | that value | `u64 fact(u64 0): 1` |
-| `lo..hi`, `lo..` | every value from lo to hi, both included; from lo up | `1..9`, `100..` |
-| a string | those bytes | `u8 command([]u8 "help"): 1` |
-| `true`, `false` | that bool | |
-| a name | any value, bound to that name (immutable) | `n: ...` |
-| a type, then a name | any value, a copy the arm may change (type first: mutable); the value's own type | `u64 m: ...` |
-| a name, then a literal | the literal's values, bound: inside the arm the name is known to be one of them | `d 1..9: 100 / d` |
-
-**Arms** are clauses without their head: `pattern: result`, tried in order.
+Built (context.md §29–§31), in the form the owner chose on 2026-11-13. The rules:
+- **A match is `if value { arms }`** (the owner's choice, 2026-11-13, over `value: { }`, which read
+  like a declaration). The block holds arms when its first line is one; no statement starts with a
+  pattern then `:`, so the two `if` forms never mix. Arms are separated by a comma or a newline,
+  and take no `else` (`_` is the rest). As a value, `word := if c { ... }`; an `if` with a
+  condition gives no value.
+- **`:` takes a value; only `=` assigns.** `pattern: result`, `name: T`.
+- **A pattern is a literal, `_` or an existing name:** a number (`-` included), a range (`1..9`,
+  `100..`, both ends included), a string, `true` / `false`, `_` (every value), or a name that is
+  already declared (`limit: ...`), which takes the value equal to it. A pattern never declares:
+  inside an arm the value keeps its own name. A constant's name (`limit: u8 = 50`, `space := 32`)
+  is checked like its literal (overlap, coverage, range fact) and costs the same; a local's or a
+  parameter's is compared when the program runs, in the arm's place, and the compiler counts
+  nothing from it. Naming the value being matched is an error (write `_`); a name on a `[]u8` and
+  a name in a range are not supported yet.
+- **Which block is arms:** one whose first line is a pattern then `:`. `name: T = v`, `name: u8`,
+  `name: []T`, `name: *T` and `name: struct` stay declarations, so `if ok { x: u8 = 3 ... }` is a
+  block. An arm holds one statement or a block: a second line under an arm is an error that says
+  to use braces (`50: { a()  b() }`). `if (c) { 50: ... }` matches c (the parentheses group); in
+  `if a if c { arms } else x` the `else` is the outer `if`'s.
+- **Parentheses group** (they structure or destructure, as for parameters): several values take
+  one pattern each, `(0, _): acc`. A lone `_` takes every value of all of them, so no `(_, _)`.
+- **`if cond branch else branch`** is the statement for conditions (a branch is a block or one
+  statement; `else if` chains). Arms are for values, `if` for conditions: neither repeats the other.
 
 ```
-u8 command([]u8 s) {      -- a body of arms matches the parameters (self and contexts aside)
+u8 c = 0
+if c {                        -- a match: `if`, the value, its arms
+    48..57: print("digit", c - 48)
+    32: print("space")
+    _: print("other")
+}
+
+u8 command([]u8 s) {          -- a body of arms matches the parameters (self and contexts aside)
     "help": 1
     "quit": 2
-    s: 0                  -- a name: the rest, named
+    _: 0
 }
-kind := c {               -- `value { arms }` matches a value; a match is a value or a statement
-    48..57: "digit"
-    c: "other"
+
+u64 sum(u64 n, u64 acc) {
+    (0, _): acc
+    _: sum(n - 1, acc + n)    -- a tail call: a loop in registers
 }
-c > 40 {                  -- on a bool: if / else, with no keyword
-    true: print("above")
-    false: {}
+
+word := if c {                -- a match is a value when every arm gives one
+    48..57: "digit",          -- arms: a comma or a newline between them
+    _: "other"
 }
-u64 sum(u64 n, u64 acc) { -- several parameters: one pattern each
-    0, acc: acc
-    n, acc: sum(n - 1, acc + n)   -- a tail call: a loop
+
+if c > 40 print("above") else {}
+```
+
+**Built for speed, through predictability** (the owner's direction). Every rule below is checked
+at compile time, so what the program does at run time is known before it runs:
+- **Arms take disjoint values.** An arm that shares values with one above is an error that names
+  them (`this arm overlaps an arm above on 5..9`); one that adds nothing never runs and is an
+  error too. So the order of the arms decides nothing but where `_` goes, and the compiler is free
+  to test them in any order: by length first for strings, a jump table for dense numbers, a
+  search for sparse ones. None of that changes what the program means.
+- **A match that gives a value takes every value, or it does not compile** (`no arm takes
+  10..255`); so does a body of arms that returns one. There is no fall-through and nothing to trap
+  at run time. When literals cover the whole type, `_` is not needed and the last arm has no test.
+- **A statement may leave values untaken** (the owner's rule): `if c { 50: print("fifty") }`, or a
+  `nil` body of arms, does nothing for the others. That is a warning, kept for `--warn` (later, the
+  build's setting); the last arm keeps its test.
+- **`return if n { 0: acc, _: s(n - 1, acc + n) }`** is lowered as arms that each return, so the
+  call is a tail call (a jump), as in a body of arms. (Before §33 it took a frame per turn and a
+  100M-turn loop overflowed the stack.)
+- **What an arm takes is a fact the compiler uses.** Inside `1..9: 100 / n`, n is known to be
+  1..9, so the division has no zero guard (native backends), unless the arm assigns to n. Array
+  bounds checks will use the same fact.
+- **The cost today:** a compare and a branch per literal, two per range (the type's own ends
+  skipped), a string's length then eight bytes at a time; no call. Arms on the parameters are one
+  function, so a loop written with them is a loop. Measured with `make bench`: no change in code
+  size or time against §28. A 100M-turn classify loop written with arms and with a hand-written
+  `if` chain: 179 ms both, the same MIR (§33).
+- **Dispatch by search** (built, §34): with one integer value and four or more arms the compiler
+  knows, the first arm keeps its own test, in place (the order written says which to try first:
+  a hot arm written first costs one compare and no jump), and the others are found by a binary
+  search over the sorted values, gaps going to `_`. 7 arms, 100M turns: 228 -> 213 ms scrambled,
+  209 -> 184 sequential; a hot first arm: the same code as before. `MODAL_TREE=0` turns it off,
+  to compare. A jump table and string arms by length are not built: the search already takes
+  log2 compares, and strings need arrays to be measured.
+- **Inlining into loops** (§34): a body of up to 32 instructions, several returns included (each
+  arm's becomes a jump to the end), is inlined into a function that calls itself; elsewhere the
+  limit stays 16 (32 everywhere grew structs from 3,016 to 7,228 B and big's emit by 19%). A
+  4-arm classify called in a 100M-turn loop: 178 -> 114 ms.
+- **Several values:** `if a, b { (0, _): ..., _: ... }`, one column each; a condition is a value
+  (`if n, n > limit { (_, true): ... }`).
+- **At module level:** `family: []u8 = if target.arch { "arm64": "arm", _: "other" }`: the
+  compiler takes one arm; the others are not in the program.
+- **Names at a range's ends:** `lo..hi`, `-limit..-1`, `0..limit`, `limit..`, for constants only
+  (a mutable module variable is an error there; as a single-value pattern it is compared when the
+  program runs).
+- **Clauses written as separate definitions** follow the arms' rules: two whose only pattern is in
+  the same parameter take disjoint values (`u8 f(u8 1..9)` and `u8 f(u8 5..20)` is an error); a
+  `nil` set may leave values to nobody (a warning; the call does nothing for them). Patterns in
+  several parameters (`pick(0, y)`, `pick(x, 0)`) still overlap, first one wins, as in arms.
+
+**Limits now:** `if` with a condition as a value; a name pattern on a `[]u8`.
+
+## 9. Arrays (fixed width: built, §35)
+
+- `[N]T`: N elements of T (a number or a bool), N known now: a literal or a module constant
+  (`[N]u16 b` with `N := 4`). `[24]u8 buf` is a mutable local, zeroed; `a[i]` reads, `a[i] = v`
+  writes, in the element's width.
+- **Bounds:** an index out of range stops the program with its place (`f.modal:42:12: index out of
+  range (0 to 3)`), on every backend; a constant index out of range is a compile error. No check
+  where the compiler knows the index is in range: a literal, or a local an arm took
+  (`return if i { 0..3: a[i], _: 0 }` is an add and a load).
+- **Parameters, as built** (it differs from the earlier draft, which made a type-first array
+  parameter a reference the caller saw written; for the owner to confirm):
+  - `a: [4]u8` (type-last): read in place, by its address; nothing is copied.
+  - `[4]u8 a` (type-first): the function's own copy, so writing it changes nothing of the
+    caller's (value semantics, as for every other type).
+  - `p: *[24]u8` with `&b` at the call: the caller's array, written in place. The `&` says at the
+    call that it will change. This is how a loop fills a buffer (`fill(&b, n, 23)`).
+- **Locals (the owner's rule, 2026-11-13):** without `&` it is a copy, with `&` a reference, and
+  the type is inferred: `c := a` (as `c: [4]u8 = a`, `[4]u8 c = a`) copies; `r := &a` is a
+  `*[4]u8`. `@` for references was proposed and rejected (counter-intuitive).
+- `s[i]` on a `[]u8` reads a byte (read only), bounded by its length.
+- **Later modalities** (the owner's list): `[..N]T` (a length from 0 to N, in place), and
+  grow-only, shrink-only and grow-and-shrink arrays, which need an allocator (the `arena`
+  context). Not yet: arrays of structs, an array as a result, array literals, slices.
+
+## 10. Struct literals and visibility by use (built, context.md §36, §37)
+
+The owner's decisions (2026-11-13): literals take their type, `point{ x, y }`; a member alone is
+`name: name`. A second decision the same day removed the face line: a struct is written once,
+everything is private by default, and **use decides what is public** — a member (field,
+method, module) that another domain uses is public, recorded while compiling. Nothing is
+written for it.
+
+```
+span: struct {
+    lo: i32,
+    hi: i32,
+    u32 reads,
+}
+
+new(self: span, lo: i32, hi: i32): *span {
+    return &span{ lo, hi, reads: 0 }   -- built in self's storage
 }
 ```
 
-**Explicit for the developer, and under the developer's control:** every decision the arms make is
-written on them, and the compiler says what is wrong in terms of values:
-- **Arms take disjoint values.** An arm that shares values with one above is an error that names
-  them: `this arm overlaps an arm above on 5..9`. So what an arm takes is exactly what it says, the
-  order of the arms decides nothing but where the catch-all goes, and the compiler may test them in
-  any order (a jump table, a search) without changing what the program means.
-- **What you state, the compiler uses.** `d 1..9` binds d and proves it is 1..9 inside the arm:
-  `100 / d` has no zero guard there (native backends; the guard of a mutable copy stays, since it
-  may change). Array bounds checks will use the same fact.
-- **Mutability by position, as everywhere:** `n` is the value, immutable; `u64 n` a copy of it
-  that the arm may change. Assigning to `n` says so: `'d' is bound by the arm's pattern, so it is
-  immutable. Write its type first, u8 d, for a copy the arm can change`. The type written must be
-  the value's own (`this binding is u64, but the value is u8`).
-- **Every value is taken, or the program does not compile.** For numbers and bools the compiler
-  joins the arms' ranges and names what is missing: `not every value is taken: no arm takes
-  10..255`. For strings, the last arm is a name.
-- **An arm that can never run is an error**, not dead code: `this arm never runs: the arms
-  above already take every value it takes`. That includes a catch-all after literals that
-  already cover the type.
-- **A catch-all has a name**, which binds the value (`s: 0`); there is no anonymous wildcard.
-  When literals cover the whole type, none is needed, and the last arm has no test at all.
-- **A match used as a value gives one type**; the error names the arm that differs.
-- **No fall-through at run time:** with every value taken, there is nothing to trap.
+- **Inside a domain** (a folder, as Go's package) every member is seen, and a literal is
+  written in any of its files.
+- **From another domain** every member can be used; the use makes it public. `--syms` says
+  `public` or `domain` per member, and `--sig` lists, per module, exactly what other domains use
+  (fields with their type, `(writable)` when type-first). Any module of a domain in reach can be
+  imported directly (`import("./geo/shapes")`); mod.modal bindings are names, no longer a
+  gate. A domain's mod.modal configuration and functions stay compile time only.
+- **Writing** follows position everywhere: a type-last field is never assigned.
+- **A method is called**, `s.width()`: `s.width` is an error that says so. The face aliases
+  (`len: width`) are gone with the face line.
+- **A lock** (a member kept private even when another domain tries to use it) is not decided:
+  it is studied apart and brought as one proposal.
+- **A literal** gives every field, each once, with values that fit. `&T{ ... }` is a local's
+  value, `p: *T = &T{ ... }` (the literal lives in the function's frame; returning p, or a local
+  that holds it, is an error), or a constructor's result, `return &T{ ... }` in a method with
+  `self: T`, built in self's storage. A value is never passed or returned as a reference by
+  itself: `&x` makes one.
+- **Across files** the backends generate structs of every file (`m_u<file>_<name>` in C) and
+  call `T.m()` through an import binding (`examples/run/domains/`). A struct held by value in
+  another struct runs on C; native does not support it yet (Phase D).
+- **Speed:** a literal local used only as `p.field` keeps each field in a slot of its own (a
+  register): no memory, so a loop that builds one stays a loop. Measured, 100M constructions:
+  53 ms against 607 ms for the constructor and its block (§36). Visibility by use costs nothing
+  at run time: it is one flag per symbol, set while checking.
+- **Fields by use** (context.md §41): fields are laid out largest alignment first; a field
+  nothing reads has no bytes; a field every write gives one constant is that constant. A
+  register block, and a struct `sizeof`/`alignof`/`offsetof`/`fieldsof` names, keep every field
+  as declared. `--audit` lists what was dropped or folded.
 
-**Cost:** the same tests as clauses (a compare and a branch per literal, two per range; a string
-is its length, then eight bytes at a time), and no call. Arms on the parameters are one function,
-so a loop written with them is a loop in registers.
+## 11. Reflection (built, context.md §40)
 
-**Limits now:** parameter clauses (`u8 f(u8 1..9)` as separate definitions) still allow overlap,
-first one wins; the disjoint rule reaches them when clauses are checked as one group. A match at
-module level (the scanner keeps a module-level `{` as a function body;
-put the match in a function and bind the call); guards (`n if n > 3`), which would need a keyword
-or a sigil and are left out while ranges cover the cases; tuple subjects (`(a, b) { ... }`)
-outside a function's parameters. Next for speed: string arms dispatched by length first, and dense
-number arms as a jump table.
+The owner's goal (2026-11-13): type introspection at compile time and at run time, for flexible
+functions, with no cost to speed and nothing that helps reverse engineering.
 
-## 9. Arrays (in progress)
+- **`type` is std's** (std/type.modal, the owner's choice 2026-11-13: reflection is a value
+  built in std, not a keyword): `type: struct { id: u64, size: u64, align: u64, fields: u64 }`,
+  read only. `typeof(X)` gives one: X a type or a value (constants, folded where used:
+  `typeof(point).size`, `pid := typeof(point).id`), or an `*any` (read from its descriptor at
+  run time: `typeof(a).id`, `t := typeof(a)`). A type `typeof` names keeps its declared layout.
+  **`T: type` parameters** (built, context.md §47): a parameter of std's type takes a type name
+  (`bytes(point, 4)`, `describe(u32)`) whose descriptor the compiler makes, or any `type` value
+  (`describe(typeof(a))`, known at run time). In the body T is a value: `T.size`, `T.id`.
+  `v: T` (a parameter typed by another, or the result) makes the function one per type given
+  to it: `first(point, p, q)` and `first(u32, 3, 4)` are two functions, each checked with T
+  bound (context.md §48). No marker: the use says T is known while compiling.
+- **Type queries**, predeclared names like `sizeof` (never keywords; a program's own name wins):
+  `sizeof(T)`, `alignof(T)`, `fieldsof(T)` (how many fields; 0: not a struct),
+  `offsetof(T.field)`, `typeof(T)`. Each takes a type or a value (its type). Each is an unsized
+  constant of the target's layout, folded where it is used: in module-level asserts (checked by
+  the compiler), in constants, in bodies. Nothing is left for run time.
+- **Dynamic resolution** through `typeof`: a number per type of the program, the same in every
+  backend of one build (not stable across builds: compare it with `typeof(T)`, never store it
+  outside the program). Named, it is an arm pattern, so dispatch over types is an `if` of arms
+  (and gets the arms' jump tables and searches):
+  ```
+  pid := typeof(point)
+  kind(u64 id): u8 { if id { pid: return 1, _: return 0 } }
+  ```
+- **No names in the binary:** no query gives a name, and native binaries carry no symbol table.
+  A binary written with `-o` carries no source either: a guard says `trap N: division by zero`
+  and `<out>.traps` (written next to it) gives N's place and call. `--run` shows the text.
+- **`*any`** (std/any.modal, `any := import("std").any`): a reference that carries the type of
+  what it points to, as a pair (address, typeof) in the frame that made it. Any reference goes
+  where `*any` is expected (`a: *any = &p`, an argument); `typeof(a)` is read at run time and
+  compares with `typeof(T)`, so an `if typeof(a) { pid: ..., _: ... }` dispatches over types;
+  `point(a)` gives the `*point` back and stops the program when a holds another type (the stop
+  names no type). The pair is (address, the type's descriptor): `any: struct { u64 at, *type of }`. An `*any` made in a function is not returned from it. Built: context.md §45.
+- **Code once per field** (context.md §49, §50): `field(T, &v, i)` (std, written in Modal over
+  `load`) reads field number i, i known while compiling. A parameter given to it is known while compiling (no marker), so the function is
+  made per value; arms on those values are decided while compiling, which ends a recursion:
+  `(_, _, fieldsof(T)): 0` then `_: u64(field(v, i)) + soma(T, v, i + 1)`.
 
-The design, following the position rule:
-- `[N]T`: N elements of T, N known at compile time (a literal or a constant). `[24]u8 buf` is a
-  mutable local, zeroed; `a[i]` reads, `a[i] = v` writes, with a bounds check that traps like a
-  division by zero (and is a compile error for a constant index).
-- **An array parameter is a reference**, mutable when written type-first (`[24]u8 buf`), read-only
-  type-last (`buf: [24]u8`). Loops are recursion, so a loop that fills an array is a function
-  that takes it: copying it on every turn is what this avoids.
-- `s[i]` on a `[]u8` reads a byte (read only), bounded by its length.
-- Later modalities (the owner's list): `[..N]T` (a length from 0 to N, in place), and grow-only,
-  shrink-only and grow-and-shrink arrays, which need an allocator (the `arena` context).
+## 12. `--audit` (built, context.md §39)
 
-Done: the type, parsing, checking of indexes and element assignment. Not yet: code generation.
+`modal --audit file`: the domains each one uses and what of them; the functions main does not
+reach, and those only the compiler runs; every guard left at run time with its place and reason;
+recursion that is not a tail call; the writes to the system. It is made of what the compiler
+knows anyway, and a normal compile does none of it.

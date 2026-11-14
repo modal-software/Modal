@@ -1686,7 +1686,7 @@ per literal, and every case made explicit to the developer.
   `examples/errors/patterns.modal`; it was restored from git and the checks moved to
   `errors/literals.modal`.
 
-## 30. More control in arms: disjoint values, bindings with a test, mutable copies
+## 30. More control in arms: disjoint values, bindings with a test, mutable copies (replaced by §31)
 
 The owner asked that arms show the developer more control. Three rules, each enforced:
 - **Disjoint arms:** `Cover` finds a partial overlap (`cover_overlap`) and reports the shared
@@ -1706,7 +1706,496 @@ The owner asked that arms show the developer more control. Three rules, each enf
   `errors/bindings.modal`). Fuzz: 0 differ (scalar 111, mix 100 programs).
 - **Not yet:** the disjoint rule for parameter clauses written as separate definitions.
 
+## 31. Arms in the owner's form: `value: { }`, `_`, parentheses, `if` / `else`
+
+The owner found names in patterns (`d 48..57`, `u64 m`, `c:` as a catch-all) unclear, and chose
+(2026-11-13): `:` always takes a value and only `=` assigns; `_` is the catch-all, alone for all
+values (no `(_, _)`); parentheses group several patterns; `if cond branch else branch` is a
+statement apart from arms; and arms are for speed through predictability, with nothing that costs
+speed. This replaces §30's bindings.
+- **Parser:** `value: { arms }` (`:` then `{` after a whole expression; `c: {` is no longer read
+  as a local declaration); `pattern_len` / `arm_at` for literal, range, string, bool, `_` and
+  `( ... ):`; a name as a pattern is an error that says to use the value's own name. `if` and
+  `else` are reserved words now (TOK_IF, TOK_ELSE): an exception to the no-keywords rule, the
+  owner's decision. AST_IF: a = condition, b = an AST_ARM holding then / else.
+- **Checker:** PAT_ANY for `_`; several values without parentheses is an error; the range fact moved
+  from a binding to the subject itself (the local named by the match, or the parameter), held while
+  the arm is checked unless the arm assigns to it (`assigns_to`). `if` needs a bool;
+  `always_returns` knows it.
+- **Lowering:** no bindings; `if` is JZ, the branch, MIR_JUMP over the other. C: `if` / `else`.
+- **Measured** (`make bench`, best of 10): code sizes and run times the same as §28 (secret 40 B,
+  output 1,336, structs 3,016, patterns 1,252; big emit 30.5 ms). The compiler's memory for big is
+  41.51 MB against 41.26 (+0.6%).
+- **Verified:** suite 259 passing; the arms example in the new form on five backends; ten error
+  checks (`errors/arms.modal`, `errors/arm_names.modal`). Fuzz (the generator writes `(0, _)` and
+  `_`): 0 differ in scalar 130, mix 102, scalar with MODAL_REGS=0 66.
+- **Removed:** `run/bindings.modal`, `errors/bindings.modal` (§30's design).
+
 ---
+
+## 32. A match is `if value { arms }`
+
+The owner found `word := c: {` hard to read (two colons; `c:` reads like a declaration), weighed
+`value is { }`, `(value) { }`, `value ? { }`, arms in function bodies only and context literals,
+and chose (2026-11-13) `if value { arms }`, accepting that `if` then has two forms. No new word or
+symbol.
+- **Parser** (`parse_if`, now shared by statements and the expression rule for TOK_IF): after the
+  value, a `{` whose first line is an arm (`arm_at`: a pattern then `:`) is a match, handed to
+  `parse_arm_block` with the value as subject; anything else is the condition form. `else` after
+  arms is an error (`_` is the rest); `if` as a value without arms is an error; at module level the
+  `{` is TOK_BODY, so the "not supported yet" error moved here. The old `value: {` is an error that
+  names the new form (`parse_expression`). Arms are separated by `,` or a newline.
+- **Checker, lowering, backends:** unchanged; the node is the same AST_MATCH.
+- **Measured** (`make bench`): code sizes and run times as §31 (secret 40 B, output 1,336, structs
+  3,016, patterns 1,252); big emit 31.6 ms against 30.5 (noise), memory 41.51 MB, the same.
+- **Verified:** suite 262 passing (three new checks, `errors/arm_forms.modal`); only the known
+  failures. The fuzzer now writes value matches `v := if n { 0: a, 1..k: e, _: e }`: 0 differ in
+  scalar 146, mix 89, MODAL_REGS=0 73.
+- **Not yet** (in the owner's list for this design): a missing `_` as a stored warning instead of
+  an error (needs a miss behaviour: nothing for a statement, a trap at the match for a value);
+  names as existing values in patterns; several values (`if a, b { ... }`); module-level matches;
+  closed sets, `nil` for pointers and the `fault` context.
+
+## 33. Edge cases of `if value { arms }`; names as patterns; `return if` as a loop
+
+Tested against a list of edge cases the owner sent, each now in `examples/run/arm_edges.modal`
+(output the same on C, native and native without registers) or `examples/errors/arm_forms.modal`.
+- **`if (c) { 50: ... }`** was read as a function literal `(c) { }`: the `(` that starts an
+  `if`'s value is now always a grouping (`Parser.cond_open`), so `if (c > 3) { ... }` works too.
+- **Several statements under an arm** gave "a pattern is ... not a name"; now "this line is not an
+  arm: an arm with several statements takes braces".
+- **A missing `_`** is a warning for a statement (`MATCH_STATEMENT`, set by `parse_if` when not a
+  value) and for a `nil` body of arms; an error for a value. `--warn` prints warnings
+  (`cx.warn`); otherwise `cx.warnings` counts them. The last arm then keeps its test, which now
+  goes to the match's end (it went to label 0).
+- **Dangling `else`:** `if a if c { arms } else x` gave the arms error; `Parser.if_then` lets the
+  `else` go to the outer `if` (reset inside braces).
+- **Names as patterns** (`PAT_NAME`, a = the AST_IDENT): checked by `name_pattern` (exists, fits,
+  is not the value matched). A constant (`name_pattern_value`: unsized via `sema_unsized_value`,
+  typed `limit: u8 = 50` via `exact_value` of its initializer, else the comptime value) is a
+  PATTERN_VALUE everywhere (`sema_arm_pattern`); a run-time one is `sema_arm_name`, lowered as
+  `ne` + `jnz` (`miss_unless_equal`) and emitted as `==` in C, in its place, counted in no cover.
+  `declaration_shape` keeps `name: T = v`, `name: u8`, `name: []T`, `name: *T`, `name: struct`
+  declarations.
+- **`return if n { ... }` was not a loop:** the value match made its arms' calls ordinary calls (a
+  frame per turn; a 100M-turn loop crashed, status 139). `lower_return` and C's AST_RETURN now
+  lower such a match with each arm returning (`lower_match_as` / `emit_match_as`, `returned`), so
+  `mark_tail_calls` and `M_TAIL` see tail calls. 100M turns: 46.4 ms, the same as arms on the
+  parameters.
+- **The owner's timing report** (arms slower at run time): measured, a 100M-turn classify loop is
+  179.2 ms with arms and 178.8 ms with an `if` chain (the same MIR); compile time 0.109 against
+  0.110 ms. The ~0.4 ms of `--run` on `arms.modal` is its native emit (0.3 ms for 125 lines,
+  proportional to its size). The one real slowdown was `return if` above. Not yet: `cls` in that
+  loop is called, not inlined.
+- **Measured** (`make bench`): code sizes and run times as §32; big's memory the same (41.51 MB).
+- **Verified:** suite 267 passing; only the known failures plus `arms.modal`, whose expected output
+  predates the owner's edit (main's body repeated). Fuzz: 0 differ in scalar 141, mix 88,
+  MODAL_REGS=0 81.
+
+## 34. Arms: several values, module level, dispatch by search, inlining into loops, clauses
+
+Phase A of the plan (the owner's order 3 -> 1 -> 4 -> 5 -> mod.modal).
+- **Several values** `if a, b { ... }`: `parse_if` reads a list into `AST_MATCH.a`; `match_subjects`,
+  `lower_match_as` and `emit_match_as` take one column per element. An unsized value (a module
+  constant, `target.ptr_size`) is matched as an i64.
+- **Module level:** the scanner tokenizes the `{` after a module-level `if`, and every brace inside
+  it (`if_pending` / `arms_depth` in `scan_into`), so the match is parsed with its declaration and
+  computed by `comptime_unit` like `fact(10)`. `examples/run/target/arch.modal` picks a family by
+  `target.arch` (checked on arm64 and x86-64).
+- **Search** (`match_tree`, `tree_emit` in lower.c): one integer column, at least `TREE_MIN` (4)
+  arms the compiler knows, no run-time names. The first arm keeps its test in place; the others
+  become sorted segments, gaps to `_` (or the end); a balanced search with `ge` compares, a branch
+  straight to a one-segment side. Measured (100M turns, M4): 7 arms 228 -> 213 ms scrambled, 209 ->
+  184 sequential; a first arm taking 251 of 256 values 168 vs 170 (the same instructions on its
+  path; noise). A search weighted by how many values each segment holds was tried and lost
+  (276 ms: a taken jump per hot arm); dropped. `MODAL_TREE=0` turns it off. The fuzzer writes 4-9
+  disjoint arms in random order (and found a C warning: a value match's result is now cast).
+- **Inlining:** `keep_if_small` keeps bodies up to `INLINE_LOOP_MAX` (32) and with returns before
+  the end (`splice` turns each into a jump to a new end label). A body over `INLINE_MAX` (16) is
+  inlined only into a function that calls itself (`SYM_F_LOOPS`, set by `check_call`). 4-arm
+  classify in a loop: 178 -> 114 ms. 32 everywhere was measured and rejected (structs 3,016 ->
+  7,228 B, big emit +19%). std's `assert` is now inlined, so a failing assert at module level is
+  reported in the function it was inlined into (`'checks' fails at ...: assert(...) is false`).
+- **Names at range ends** (`PAT_ENDS`: a = low, b = high or 0): `ends_pattern`, `const_value`
+  (literal, `-name`, constant). A mutable module variable was taken as a constant by name patterns
+  (its initial value): fixed, only immutable names are constants.
+- **Clauses:** `sema_params_overlap` (check.c) and the clause pass in `sema_declare` (resolve.c):
+  two clauses whose only pattern is in the same parameter must not share a value; a `nil` clause
+  set without a catch-all is a warning and its last clause's miss returns (MIR and C).
+- **Fixed on the way:** every declaration error was followed by "expected '{' to start a block" at
+  1:1 (`sema_syntax_only` also took the signature node, which carries `AST_F_LAZY`, for a function).
+- **Not done** (measured reasons above): a jump table; string arms by length. A1 (a bare-literal
+  value match bound with `:=` becomes `int`) was left as it is: `x := 3` does the same, so the rule
+  is one.
+- **Measured** (`make bench`): code sizes and run times as §33; big emit 32.3 ms (31.5 before:
+  noise), compiler memory 41.75 MB against 41.51 (+0.6%: more bodies kept for inlining).
+- **Verified:** suite 288 passing; new `run/arm_search`, `run/arm_consts`, `run/clauses_nil`,
+  `errors/clauses_disjoint`, more `errors/arm_forms` checks. Fuzz 0 differ: scalar 145, mix 89,
+  MODAL_REGS=0 69, MODAL_TREE=0 79, pressure and struct rounds.
+
+## 35. Arrays: code generation, bounds, pointers to arrays; tail calls through labels
+
+Phase B of the plan.
+- **Checker:** a length named by a constant (`[N]u16`, `N := 4`) is looked up in the module scope
+  in `resolve_type` (types are resolved before bodies, so `exact_value` saw no ref). Indexing
+  through `*[N]T` (`p[i]`, `p[i] = v`: the pointee is written; the pointer is not). The arm facts
+  gained `Local.below` (an arm on a local with values 0 .. hi: an index below hi + 1 is in range):
+  `AST_INDEX` gets `INDEX_SAFE` (ast.h) and no bounds check.
+- **Layout:** `T_ARRAY` is its elements packed (`type_layout`).
+- **MIR** (lower.c, "arrays"): an array local is a block of slots (`MIR_ZERO`), an array parameter
+  one slot with its address (`param_slots`, `Lower.locals[].ref`); a type-first array parameter
+  is copied into a block at entry. `element_addr`: ADDR (or the parameter's address), `i * size`,
+  `add`, then LOAD/STORE in the element's variant; a literal index folds into the offset;
+  `guard_index` traps with the place. `[]u8`: its length word is the bound, the bytes are at +8.
+  `&a` is the array's address. An array argument is its address.
+- **C:** `T v_a[N] = {0}`; parameters `const T *v_a` (a type-first one `v_a__in`, copied in);
+  `v_a[m_index(i, N, "place")]` (`m_index` in the prelude traps like `m_div_*`); `*[N]T` is `T *`.
+- **Tail calls through labels:** `mark_tail_calls` took only `call; ret`. A call in an arm that
+  returns is `call; L: ret` or `call; jump L ... L: ret` (`returns_at`): now a tail call, so a
+  loop written as a statement arm (`_: { put(p[i])  emit(p, i + 1) }`) is a loop.
+- **Formatter gate** (std.md §6): the Modal formatter with a `[24]u8` buffer prints the same million
+  numbers (same md5) in 24.4 ms (29.0 before the tail-call fix; 21.6 with the indexes proven by
+  arms) against the compiler's 11.4. Not met: the rest is the byte stencil and three calls per
+  number.
+- **Not yet:** arrays of structs, as results, literals; a write of a range of bytes; the decision
+  on type-first array parameters (built as copies; the earlier draft said references).
+- **Measured** (`make bench`): unchanged (structs 3,016 B, big emit 32.6 ms, 41.75 MB).
+- **Verified:** suite 295 passing (`run/arrays` with its trap on five backends, two place checks).
+  The fuzzer writes arrays (constant, proven and checked indexes): 0 differ in scalar 149, mix 109,
+  MODAL_REGS=0 79, pressure 55, struct 67 (and the compile-time interpreter runs them in `ct`).
+
+## 36. Struct literals, faces, computed members, fields in registers
+
+Phase D, first part (std.md §10).
+- **Scanner:** a module-level `{` right after a name (no space), when the name starts its line or
+  follows `:=` / `=`, is tokenized (`literal_brace`), not kept as a body.
+- **Parser:** `nud_ident` reads `name{` (the brace right after the name) as `AST_STRUCT_LIT` of
+  `AST_FIELD_INIT`s (`x` alone: an `AST_IDENT` of the same token; aux 1 for `x: v`). Not inside
+  an `if`'s values (`Parser.no_literal`): `if c {` is the value then its block. A face line at
+  module level goes through the same path (`parse_declaration_one`).
+- **Declare** (resolve.c): `declare_face` sets `SYM_F_EXPOSED` on each field named;
+  `check_face_methods` (after the methods are declared) checks `name: method` entries.
+- **Check:** `find_member` lets an exposed field through; `face_method` resolves `x.len` (a miss
+  among the members) to the entry's method, and `check_selector` types it as that call.
+  `check_struct_lit`: the type (through an import binding: `module_binding_target`, module.c),
+  where it may be built, each field once, all given, values fit (`check_bounds` for constants).
+  `&T{...}` only under `return` in a `self: T` method (`Check.returning_ref`).
+- **MIR:** `struct_literal_at` (zero only when the fields leave padding, then a store per field);
+  a new local built in place; `return &T{...}`: every value, then a store through self (slot 0)
+  per field. `lower_call` lowers a computed member (`AST_SELECTOR` naming a method) as a call with
+  the receiver alone. **Fields in registers:** `lower_fields_local` (LOCAL_FIELDS): when every
+  later use in the block is `p.field` (`fields_only`, which says no to any shape it does not
+  know), each field is a slot of its own; `fields_local_slot` reads and writes it.
+- **C:** a compound literal; `return &T{...}`: `*self = (m_T){...}; return self;`; a computed
+  member: `m_T_method(&x)`.
+- **Measured** (native, 10,000 × 10,000 constructions, a nested loop):
+  - `return &span{ lo, hi, reads: 0 }` against field stores and `return &self`: 686 against
+    685 ms (first build: 890, through a block and a copy; then every value before the stores).
+  - `p := point{ ... }` read as `p.x`, `p.y`: 53 ms, against 607 ms for `point.new(...)`: no
+    memory, so the inner recursion is a jump (with a block, the frame stays live: a call).
+  - `make bench` unchanged (structs 3016 B, big emit 32 ms, memory 41.75 MB).
+- **Also fixed:** `b: [4]u8 = a` did not parse (`type_starts_at`, `declaration_shape`); an array
+  local from another array (`c := a`, `[4]u8 d = a`) was zero on native and unsupported in C.
+- **Found, not fixed:** a function that builds a struct in a block and calls itself is not a tail
+  call on native (the address keeps the frame), so 100M turns overflow the stack (C is saved by
+  clang); and no backend generates a struct declared in an imported file.
+- Fuzz: struct programs gained a face line, literals in main (in registers, or passed whole) and
+  a `&st{...}` constructor; 0 differ in every mode.
+- Examples: run/faces (+ .expected), errors/faces, errors/face_entries.
+
+## 37. Visibility by use; structs of every file in the backends
+
+The owner's decisions (2026-11-13): the face line goes; everything is private by default and a
+member another domain uses is public, decided while compiling; a lock (private even when used)
+is studied later; structs are not turned into arm patterns. std.md §10.
+- **Backends, structs of every file (G0):** C names a struct `m_<name>` in the entry file and
+  `m_u<file>_<name>` elsewhere (`out_struct_name`, also for `self`, `T.m()`'s fresh value and
+  the layout checks); every file's structs are declared, then defined after the structs their
+  fields hold by value (`c_struct`, `emit_struct_after_fields`). An import binding names its
+  target as a type (`resolve_type`, `symbol_type` follow `module_binding_target`), so
+  `span.new(...)`, `gpoint corner` and `point{...}` work through `point := import(...).point`.
+- **Use (G1):** `SYM_F_EXPOSED` became `SYM_F_PUBLIC`, set by `note_use` (check.c:
+  `find_member`, each field of a literal) and `may_see` (module.c) when the user is in another
+  domain. `find_member` no longer refuses: `x.n1` is the field, `x.n1(...)` the accessor.
+  `may_import` lets any file of a domain in reach be imported (the internal-domain rule stays).
+  mod.modal's values and functions stay compile time only.
+- **Removed:** `declare_face`, `check_face_methods`, `face_method`, the "only its face builds it"
+  rule, the computed-member call in lower.c and emit.c. A face line is now an error that says to
+  remove it; `s.method` without a call is an error that says to call it.
+- **Reports:** `--syms` prints `public` / `domain` from use; `--sig` lists per module what other
+  domains use (types, fields with type and `(writable)`, methods with their kind).
+- Measured: `make bench` unchanged (structs 3016 B, big emit 31.7 ms, memory 41.7 MB). Fuzz: 0
+  differ (150 programs, and 80 with `MODAL_REGS=0`).
+- Tests: 307 ok. Old visibility checks became use checks (main example, errors/private,
+  errors/leak); new `run/fields` (was faces), `run/domains/` (geo + main, C and native),
+  `errors/struct_literals`, `errors/face_line`.
+- Not yet: native for a struct held by value in a struct; `import("../geo").shapes` still needs
+  geo/mod.modal to name `shapes` (a direct file import does not).
+
+## 38. Field order by alignment (G2)
+
+Layout no longer follows declaration order: `struct_layout_at` (layout.c) lays the fields out
+largest alignment first (an insertion sort, stable for equal alignments, up to 64 fields), so no
+padding sits between fields. A register block (any field with `@ offset`) stays as written. The
+C backend declares the fields in offset order (`emit_struct`), and its offsetof checks still
+hold. `sizeof` follows: `header {u8 kind, u32 len, u16 flags}` is 8 bytes, not 12
+(run/guards.modal updated).
+- Measured (100M turns of a 10k × 10k nested loop passing `rec {u8, i64, u8, i64, u8}` whole;
+  40 → 24 bytes): native 358 → 234 ms (−35%), C (`cc -O2`) 660 → 638 ms (−3%). `make bench`:
+  structs code 3016 → 2864 B; the rest unchanged.
+- Not done: dropping fields nobody reads, and a field that is the same constant everywhere.
+  Each function is lowered right after it is checked (streamed), so the uses of the whole program
+  are not known while code is made; layout is also asked during checking (sizeof, comptime).
+  Both need a whole-program step before generation, which the pipeline does not have.
+
+## 39. `--audit` (G3)
+
+`modal --audit file` checks the program, lowers every function in memory with the native backend
+(not run), and prints what it depends on and where it can stop (sema/audit.c). Nothing runs in a
+normal compile: each hook returns unless `cx.audit`.
+- **dependencies:** `domain -> domain: members`, from `note_use` / `may_see`.
+- **not reached from main:** a call graph from lowering (`audit_call` in `lower_call`, so inlined
+  calls count) followed from main; clauses go together. **Run only while compiling:** functions
+  the compiler ran (`audit_comptime`, in comptime.c `function`) that main does not reach.
+- **can stop at run time:** each MIR_TRAP left in a reached function's final MIR, with the text
+  its message carries (`path:line:col: division by zero`, `index out of range (0 to 3)`,
+  `assert(n < 4) is false`). Guards proven away (range facts, known divisors) are not there;
+  std's own bodies are left out (their callers' copies are listed); copies of one guard once.
+- **recursion that grows the stack:** a call to itself that is not a tail call in the final MIR.
+- **system interface:** the MIR_WRITEs per function.
+- Tests: 7 `audit:` checks in run.sh. `make bench` unchanged.
+- Correction to §36: "100M turns overflow the stack on native" was the C backend: `--run` builds
+  C with plain `cc` (no -O), which makes no tail calls; native turns that recursion into a jump.
+
+## 40. Type queries: alignof, offsetof, fieldsof, typeid (G4)
+
+`sema_sizeof` became the type query of every primitive of its kind (`is_type_query`), so the
+places that fold sizeof fold the new ones too: `exact_value` (check.c), `const_value` and
+`lower_expr` (lower.c), the C emitter. `check_type_query` replaces `check_sizeof`: a type or a
+value; for `offsetof`, a selector `T.field` whose field it records in refs. `typeid` is the
+interned TypeId. Errors: not a field, an unsized constant (no type yet), the argument count.
+- Example run/reflect (module-level asserts on layout, typeid constants as arm patterns),
+  errors/reflect; a test that a native binary using them holds no type or field name.
+- Measured: `make bench` unchanged; fuzz 0 differ.
+
+## 41. No source in a binary; fields by use
+
+**Trap codes.** A binary written with `-o` by a machine-code backend (`cx.trap_codes`) carries no
+source: each place a guard reports (`path:line:col`, and an assert's call as written from `site`)
+becomes `trap N` (`trap_place`, backend/registry.c; used by `guard_divisor`, `guard_index`, the
+string index guard, AST_SITE in lower.c). `<out>.traps` maps each N the generated code carries
+(`note_trap_codes`) to its text. `--run` keeps the text; the C backend writes source anyway.
+At compile time the table is in the compiler, so a module-level assert still reports its place
+(comptime.c turns `trap N` back). Tests: the ELF runs and the fuzzer read the map (`untrap`).
+
+**Fields by use** (layout.c `gather_facts`, `layout_field_use`). When the first struct is laid
+out, every file is scanned whole (`scan_whole`, into a buffer of its own: the token region's free
+end holds the body being lowered; `scan_quiet`), and per field name it records: read (`.x` not
+followed by `=` or `(`), the constants written (`.x = c`, `x: c` in a literal `T{`; anything else
+varies), `T.m(` (a T made at zero), and type queries on T. Then:
+- a field nobody reads has no bytes (FIELD_UNREAD): stores are dropped, values still computed;
+- a number or bool field every write gives one constant c, and c is 0 or no T is made at zero,
+  has no bytes either (FIELD_CONSTANT): reads are c (the base still runs if it calls).
+- not for a register block, a struct a type query names (`sizeof(T)`; a query on a value keeps
+  every struct), any domain with implicit self, or a file with a lexical error.
+Lowering (`field_stored`, `field_constant`), C (struct, literal with `(void)(v)` for the gone
+values, reads, assignments), comptime aggregates and `--audit` ("fields with no bytes") follow.
+- Measured: `rec {u8 a, i64 b, u8 c, i64 d, u8 e}` with a, c, e never read and d always 4 is one
+  i64: native 243 → 161 ms (−34%); C 636 → 1.8 ms (clang folds the whole loop). `make bench`
+  unchanged; fuzz 0 differ (465 programs, three modes).
+- Example run/field_use; 3 checks. Tests 328 ok.
+
+## 42. A value is never a reference by itself
+
+Found by the owner (run/field_use: `bump(*item it)` called as `bump(a)`): `fits` let a struct value
+go where `*T` is expected, a rule left from when `self` needed it. Nothing needs it now: `fits`
+says no, and `&x` makes the reference (`*p` reads one). Native lowers `&p` of a struct local to
+the local's own block (writes through it reach p); C did already.
+- Mismatch reports name the value and the fix: `` `a` should be *item, but it is item: pass a
+  reference to it, `&a` (argument 1 of 'bump', parameter 'it') ``; a return: `` `it` should be
+  item, as the function declares, but it is *item: it is a reference, and `*it` is the value it
+  points to ``. A value without a short text is "argument N of 'f'" / "the result".
+- errors/references; run/field_use passes `&a`. Tests 330 ok; fuzz 0 differ.
+- `p: *T = &T{ ... }` (and `p := &T{ ... }`): the owner asked for it. The checker allows `&T{...}`
+  as a local's initializer (`Check.local_ref`) and marks the local (`Local.frame`, also through
+  `b := p`); returning it is an error that says to return `*p` or use a constructor. Native puts
+  the literal in a frame block (`lower_struct_addr`); C takes the compound literal's address,
+  and a dropped field's value that calls something goes inside the first initializer so the
+  literal stays an lvalue.
+- Decided by the owner (§45): a type-last binding (`a: item`) only cannot be reassigned; its
+  type-first fields stay writable, directly and through `&a`.
+
+## 43. A struct inside a struct, on native
+
+Native refused a struct held by value in another (C had it). `copy_fields` (lower.c) copies a
+struct between two addresses one field at a time in its width (recursing into held structs,
+element by element for arrays; fields with no bytes and padding are skipped), since a held
+struct sits at any offset its alignment allows, not on slot boundaries. Used by: a literal's held
+field, `b.corner = g`, `return &T{ ... }` through self, and `b.corner` as a value
+(`lower_struct_into`). `lower_field_base` gives `b.corner.x` the address b's plus corner's
+offset, so writes reach b. Also new: `*p` as a struct value (word by word through p, as self).
+- Example run/nested: two levels, odd alignments (u16 + u8 inside u8), writes through paths,
+  whole assignment, passed and returned by value; the same on C, native, `MODAL_REGS=0` and
+  x86-64. Tests 337 ok; fuzz 0 differ; `make bench` unchanged.
+
+## 44. Struct variables at module level
+
+Struct constants at module level already worked (computed by the compiler: `origin := pt{...}`,
+nested, built from other constants). A struct variable (`seg cur = seg{ ... }`) was refused by
+comptime. Now comptime computes its first value, and on native it has a global slot per scalar
+leaf (`global_leaves`, nested structs and arrays flattened, fields with no bytes skipped), so no
+new instruction or stencil is needed: `cur.a.x` is one GLOAD/GSTORE (`global_path`), `cur`
+whole is copied field by field to or from a frame block (`global_fields`), and main's prologue
+writes each leaf from the computed value (`global_init_leaves`). C has a real global. `&cur`
+is refused on native (C allows it); it needs an address instruction later.
+- Example run/module_structs: written by functions, whole and by path, passed by value; the
+  same on C, native, `MODAL_REGS=0`, x86-64. Tests 342 ok; fuzz 0 differ; bench unchanged.
+
+## 45. typeof, and std's any
+
+The owner's decisions (2026-11-13): `typeid` is `typeof`; build `any`; and an immutable binding
+(`a: item = ...`) only cannot be reassigned, its fields stay as the struct declares them (§42's
+open point, closed: no change).
+- **std/any.modal:** `any: struct { u64 at, u64 id }`, bound in std/mod.modal. `sema_is_any`.
+- **Check:** `*T` fits `*any`; `typeof(a)` of an `*any` is a run-time u64 (`sema_sizeof` gives no
+  constant); `T(a)` with `a: *any` is PRIM_UNANY (refs[call] = T), type `*T`. An `*any` made in
+  a function (a return of `*T` as `*any`, or a local `a: *any = &p`) is not returned from it.
+- **MIR:** `lower_as` to `*any` fills a 2-slot frame block (address, `type_ref` of the pointer
+  type) and passes its address; `typeof(a)` loads +8; `T(a)` compares with typeof(T), traps with
+  "the *any holds another type" (a trap code in -o binaries), then loads +0. **C:** a compound
+  literal `(&(m_uN_any){ .at, .id })`, `->id`, and `m_unany` in the prelude.
+- **`&n` of a number local** on native: the slot becomes memory (LOCAL_BOXED) and later reads load
+  it in its width (a write through `*u32` stores 4 bytes).
+- **Fixed:** an instruction made with `emit_const` inside its operands came after the instruction
+  that read it (and could move the array under the pointer): `T(a)`'s compare, and the index
+  guard of arrays of 65,536 elements or more.
+- The fields-by-use scan leaves `any` alone (only the compiler reads its fields).
+- Example run/any (dispatch over types, writes through `point(a)`, a number in an `*any`, the
+  checked stop), errors/any (4). Same on C, native, `MODAL_REGS=0`, x86-64. Tests 351 ok; fuzz 0
+  differ; big emit 32.7 ms (31.4–32.5 before).
+
+## 46. `type` in std: typeof gives a value
+
+The owner (2026-11-13): `T: type` treats T as unknown (our nil, a value and type built in std);
+`type` should be our reflection, built in std; T is a compile-time value; no directive for
+comptime parameters yet (later). First step built: `type` in std.
+- std/type.modal `type { id, size, align, fields }` (u64, type-last); std/any.modal is now
+  `{ u64 at, *type of }`: the second word is the address of the type's descriptor.
+- `typeof(X)` returns std's type (`sema_std_type`; an error asks to bind it when std is not
+  loaded). Known X: `sema_typeof_desc`, folded field by field (`sema_typeof_field` in
+  exact_value, the lowering's const_value and the C selector), a value of constants in C and
+  MIR (`typeof_into`). An `*any`: its descriptor, read in place for `typeof(a).id`
+  (`lower_field_base`), copied for `t := typeof(a)`.
+- Descriptors are read-only data: 32 bytes, a string's bytes past its length word in MIR
+  (`type_descriptor`), a compound literal in C. No name in them.
+- The fields-by-use scan treats `typeof(...)` as a type query (the layout it reports is the
+  declared one) and leaves std's type alone.
+- run/any and run/reflect updated (`typeof(point).id` as arm patterns; size and fields read at
+  run time). Tests 352 ok; fuzz 0 differ; bench unchanged.
+
+## 47. `T: type`: types as values
+
+A parameter of std's type takes a type name: `sema_named_type` (a primitive name, a struct, an
+import binding to one) in `check_args` gives the argument std's type, and the lowering
+(`typeof_into`) and C (`emit_as`) make its descriptor. Any `type` value fits too
+(`describe(typeof(a))`). In the body T is a struct value of std's type, read field by field.
+Module level works through the compiler (`table := bytes(point, 4)`).
+- `v: T` after `T: type` is an error that says what it needs (a function made once per type,
+  comptime parameters). A value where a type is taken says `typeof(p)`.
+- Example run/types (sizes, ids compared, a module-level value, the same function on a type
+  known at run time); errors/type_params (2). Same on C, native, `MODAL_REGS=0`, x86-64.
+  Tests 359 ok; fuzz 0 differ; bench unchanged.
+
+## 48. Functions made once per type (comptime.md §3.2), with no marker
+
+The owner: no directive for comptime parameters. comptime.md §3.2 already says a parameter is
+compile time when it is used where only a compile-time value can be; here, a parameter of std's
+type that another parameter or the result takes as its type (`first(T: type, a: T, b: T): T`).
+- `type_params` finds them (the name `type` is read before resolving: most parameters are
+  not); `sema_is_generic`. A generic function is never checked or generated by itself (an
+  uncalled one is not checked at all, as a C++ template).
+- `specialize` (in `call_function`): the arguments at those positions must name types
+  (`sema_named_type`); the (function, types) pair finds or makes a specialization, a symbol of
+  its own (`symbol_new`, not in any scope) with its bound names, checked at once in its own
+  file (`check_spec`) for the backend, or for the compiler when the call is being captured.
+- Bound names: `resolve_type` reads `binding` (a TYPE_NAME bound in the specialization being
+  read); `bind_for(fn)` sets it in `fn_ret_type`, `sema_param_type`, `check_args`, and for the
+  whole `check_callable` of a specialization (the codegen streamed inside it sees it too).
+  `specs` has a fixed size (4096) so a binding stays valid while a nested one is made.
+- C: one function per specialization (`m_first__s1`); the generic one has no prototype.
+- The fields-by-use scan pins a struct named alone as an argument (a type given as a value):
+  its descriptor reports the declared layout.
+- Found and fixed while measuring: `sema_std_type` scanned every symbol per call (big check
+  20 → 1547 ms); it is now looked up once per set of loaded files. Big check 20.3–20.5 ms
+  (19.3–20.6 earlier in the session).
+- Example run/generic; errors/generic (3). Same on C, native, `MODAL_REGS=0`, x86-64. Tests
+  366 ok; fuzz 0 differ.
+- Next: a value parameter known while compiling (`field(v, i)` with i a compile-time index) for
+  code written once per field, the owner's `soma` form.
+
+## 49. Code once per field: field(v, i), values known while compiling, arms decided
+
+The owner's form, built (`examples/run/fields_each.modal`):
+```
+u64 soma(T: type, v: T, u32 i) {
+    (_, _, fieldsof(T)): 0
+    _: u64(field(v, i)) + soma(T, v, i + 1)
+}
+```
+- **`field(v, i)`** (PRIM_FIELD): v's field number i, i known while compiling (`known_value`:
+  literals, constants, bound values, + - * / wrapping). refs[call] = the field; lowering and C
+  read it as `v.name`. The fields-by-use scan treats it as a query.
+- **A number parameter given to field as its number is known while compiling** (comptime.md
+  §3.2, no marker): found from the body as written (`index_params`: its tokens when deferred,
+  its tree when parsed with the declaration), cached per function (`compile_params`). A call
+  passes it a value the caller knows (`soma(T, v, i + 1)` inside soma for i is soma for i + 1).
+- **Call patterns** (parser): `fieldsof(T): ...` and `(_, _, fieldsof(T))`, a PAT_NAME whose
+  expression is a call; `fieldsof(T)` reads the bound type.
+- **Arms decided while compiling** (`static_arm`): in a specialization whose matched values are
+  all known, the first arm that matches is the only one checked, lowered and emitted
+  (`sema_taken_arm`, by specialization and match node). That ends the recursion.
+- **Specializations wait for their turn** (`sema_drain_specs`, after each top-level function):
+  a body checked inside another would need token and node room for both. The C backend declares
+  each one when it is made (`declare` hook: a prototype between functions). A specialization
+  sets its own binding in `check_callable` (the comptime path asks for one on demand).
+  A copy checked while another copy of the same function is parsed in the declaration parses
+  its own (`generic_body_token`), and gives the declaration back.
+- More than 256 specializations of one function is an error (arms that never end the recursion).
+- Tests 374 ok (errors/field_index 3, run/fields_each); fuzz 0 differ; bench: check unchanged.
+
+## 50. field in std: data that holds addresses, load, types written as values
+
+The owner chose to build what `field` needs instead of keeping it a primitive. Now
+`std/type.modal` holds, in Modal:
+```
+type: struct { id, size, align, fields: u64, members: *member }
+member: struct { offset: u64, of: *type }
+at(self: type, u32 i): member { assert(u64(i) < self.fields)  return load(member, self.members, ...) }
+field(T: type, v: *T, u32 i): T.at(i).of { return load(T.at(i).of, v, T.at(i).offset) }
+```
+- **Data that holds addresses (step 1).** Machine code had no data with an address in it at
+  load time. Descriptors now live in module-level slots: `MIR_GADDR` (the address of one; both
+  native modes, both architectures, stencils `gaddr`/`gaddr_r` regenerated), written by a
+  routine the compiler makes once it knows every descriptor (`lower_desc_init`), which a second
+  one, the program's entry when there are descriptors, runs before main (`mir_entry_routine`;
+  hello stays 56 B: no descriptors, no routine). For the compiler to run, `MIR_DESC` gives the
+  interpreter's own copies with real addresses (comptime.c `ct_desc_index`, readable memory).
+  C writes them as static data (`emit_descriptors`), which its compiler relocates.
+- **load(T, p, offset) (step 2),** the one primitive under std's reflection: the T at p + offset.
+  An offset known while compiling (also one that calls std code, as `T.at(i).offset`, run by
+  the interpreter: `sema_known`) is folded into the load.
+- **A type written as a value (step 3):** a path with a call in a type position is
+  AST_TYPE_EXPR; each specialization computes it (`spec_type_exprs`, `comptime_type_value`:
+  the interpreter runs it with the specialization's T and i) and `resolve_type` reads that.
+- **Known while compiling, generalized:** a parameter passed where a called generic function
+  takes a value known while compiling (`passes_compile_time`), or named in a type written as a
+  value, is one; bodies are scanned only when they name a generic function.
+- `field` is no longer a primitive: `field := import("std").field`. Each specialization is one
+  load at a constant offset (`load d=s0 a=s5 imm=12 .u8`).
+- Fixed on the way: stores emitted before the constant they read (the descriptor routine);
+  specializations whose types fail are not checked further; any's, type's and member's fields
+  are never dropped by the fields-by-use step.
+- Tests 375 ok; fuzz 0 differ; big emit 33.4 ms (31.4–33.0 earlier in the session).
 
 ## Appendix A. The owner's original specification inputs
 
