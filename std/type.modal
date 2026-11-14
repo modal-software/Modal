@@ -1,0 +1,34 @@
+-- type: what a type is, as a value (docs/std.md §11). `typeof(X)` gives one: X is a type or a
+-- value (its type), or an *any (the type of what it points to, read at run time).
+--   typeof(point).size    -- a constant: folded where it is used
+--   typeof(a).id          -- an *any's: from the descriptor its pair points to
+--   T.at(i).offset        -- field i: where it is, and `.of`, its type (a descriptor too)
+-- The fields are type-last: read only. No name is part of it, so none reaches a binary.
+assert := import("std").assert
+
+type: struct {
+    id,      -- one number per type of the program (compare ids, never store them)
+    size,
+    align,
+    fields: u64,    -- bytes, in the target's layout
+    -- how many fields (0: not a struct)
+    members: *member, -- the fields, in declaration order (fields of them)
+}
+
+-- one field of a struct
+member: struct {
+    offset: u64,  -- bytes from the start of the struct
+    of: *type,    -- its type
+}
+
+-- field i of a struct (from 0, in declaration order)
+at(self: type, u32 i): member {
+    assert(u64(i) < self.fields)   -- a field of it: the place says which call asked for which
+    return load(member, self.members, u64(i) * sizeof(member))
+}
+
+-- v's field number i, as its own type. T and i are known while compiling (T types v, i is in
+-- the result's type), so field is made once per type and number, and is one load.
+field(T: type, v: *T, u32 i): T.at(i).of {
+    return load(T.at(i).of, v, T.at(i).offset)
+}

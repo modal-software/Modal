@@ -1,0 +1,11 @@
+-- any: a reference that carries the type of what it points to (docs/std.md §11).
+--   a: *any = &p          -- any reference goes where *any is expected
+--   typeof(a)             -- the type of what a points to (std's type), known at run time
+--   point(a)              -- a's *point back; the program stops if a holds no point
+-- The compiler fills both fields: the address, and the descriptor of its type (no name in it).
+type := import("./type").type
+
+any: struct {
+    u64 at,
+    *type of,
+}
