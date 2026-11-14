@@ -5,7 +5,7 @@ point: struct {
 main(): u8 {
     a := offsetof(point)
     b := offsetof(point.z)
-    c := typeid(3)
+    c := typeof(3)
     d := sizeof(point, point)
     return 0
 }

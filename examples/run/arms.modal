@@ -4,6 +4,7 @@
 -- An arm binds no name: the value keeps its own, and inside an arm it is known to be one of the
 -- arm's values. Arms take disjoint values, and every value must be taken: the compiler checks.
 print := import("std").io.print
+type := import("std").type
 
 u8 command([]u8 s) {          -- a body of arms matches the parameters
     "help": 1
@@ -52,12 +53,21 @@ nil countdown(u8 n) {
     1..: "positive"
 }
 
+T loop(T: type, n: T) {
+    (_, 0..100000000): loop(u64, n + 1)
+    _: return n
+}
+
 main(): u8 {
     u8 c = 50
     word := if c {
         48..57: "a digit",
         _: "not a digit"
     }
+    a := loop(u64, 1)
+    print(a())
+
+    -{
     print(word, kind(c), kind(32), kind(7), size(0), size(5), size(200))
     print(command("help"), command("quit"), command(""), command("x"), sum(10000000, 0))
     if c {
@@ -69,61 +79,6 @@ main(): u8 {
         40..: print("above 40"),
         _: print("40 or less")
     }
-    if c > 60 {
-        print("big")
-    } else if c > 45 {
-        print("middle")
-    } else print("small")
-    i32 k = 0
-    print(sign(k - 7), sign(k), sign(k + 7))
-    u64 x = 0
-    print(share(x), share(x + 4), share(x + 70))
-    countdown(3)
-    print(word, kind(c), kind(32), kind(7), size(0), size(5), size(200))
-    print(command("help"), command("quit"), command(""), command("x"), sum(10000000, 0))
-    if c {
-        48..57: print("digit", c - 48)
-        _: print("not a digit")
-    }
-    if c > 40 print("above 40") else print("40 or less")
-    if c > 60 {
-        print("big")
-    } else if c > 45 {
-        print("middle")
-    } else print("small")
-    print(sign(k - 7), sign(k), sign(k + 7))
-    print(share(x), share(x + 4), share(x + 70))
-    countdown(3)
-
-    print(word, kind(c), kind(32), kind(7), size(0), size(5), size(200))
-    print(command("help"), command("quit"), command(""), command("x"), sum(10000000, 0))
-    if c {
-        48..57: print("digit", c - 48)
-        _: print("not a digit")
-    }
-    if c > 40 print("above 40") else print("40 or less")
-    if c > 60 {
-        print("big")
-    } else if c > 45 {
-        print("middle")
-    } else print("small")
-    print(sign(k - 7), sign(k), sign(k + 7))
-    print(share(x), share(x + 4), share(x + 70))
-    countdown(3)
-    print(word, kind(c), kind(32), kind(7), size(0), size(5), size(200))
-    print(command("help"), command("quit"), command(""), command("x"), sum(10000000, 0))
-    if c {
-        48..57: print("digit", c - 48)
-        _: print("not a digit")
-    }
-    if c > 40 print("above 40") else print("40 or less")
-    if c > 60 {
-        print("big")
-    } else if c > 45 {
-        print("middle")
-    } else print("small")
-    print(sign(k - 7), sign(k), sign(k + 7))
-    print(share(x), share(x + 4), share(x + 70))
-    countdown(3)
+    }-
     return 0
 }
