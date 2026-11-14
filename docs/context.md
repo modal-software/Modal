@@ -2197,6 +2197,79 @@ field(T: type, v: *T, u32 i): T.at(i).of { return load(T.at(i).of, v, T.at(i).of
   are never dropped by the fields-by-use step.
 - Tests 375 ok; fuzz 0 differ; big emit 33.4 ms (31.4–33.0 earlier in the session).
 
+## 51. A call bound to a name: `a := f(x)`, then `a()`
+
+The owner (2026-11-14), before Phase D's context literals: `a := loop(u64, 1)` then `print(a())`
+must work, and `print(a)` shows the function. Decided: use decides, arguments at the binding,
+descriptor with the name (std.md §13).
+- **Check** (check.c): `AST_DEFINE` of a call is bound when `called_bare_later` finds `a ( )` (not
+  after a `.`) before the end of the block, and `bindable_call` agrees (a Modal function, no
+  primitive, no `T.m()`, no array parameter: an error). The local's type is `T_FUNC` of the
+  callee (the specialization for a generic one) and `Local.call` keeps the call. `a()`:
+  `PRIM_BOUND` in the call's aux, refs[call] = f, type f's result; `a(x)` is an error that says
+  to call it with none. Other uses are type errors (`'+' cannot be applied to function inc`).
+- **MIR** (lower.c): `lower_bound_args` computes the receiver and each argument into a frame
+  block laid out as f's window (`bound_args`: struct parameters take their slots), pushed as a's
+  local; `lower_bound_call` passes them, through `finish_call` (the tail of `lower_call`, split
+  out), copied first when the body is inlined (it may write its parameters).
+  `f := double` lowers to nothing (calls name double, as for function literals).
+- **C:** `v_a__b0 ...` locals at the binding (the receiver a pointer), `m_f(v_a__b0, ...)` at the
+  call.
+- **print:** `sema_fn_text` (`function loop(type, u64): u64`), folded into the printed text by
+  `constant_text` (MIR) and as an `M_STR` in C.
+- Measured: `make bench` unchanged (structs 2864 B, big emit 33.4 ms, memory 41.7 MB). Fuzz 0
+  differ.
+- Example run/bound (+ .expected: generic, struct argument, methods, a parameter the body
+  writes, a struct result, no result, computed by the compiler, `f := double`), errors/bound (3
+  checks). Same on C, native, `MODAL_REGS=0`, x86-64. Tests 383 ok.
+- Found, not fixed: the C backend makes no tail call when a parameter is a struct (`T: type` is
+  one: `tail_call` takes numbers and bools only), so `loop(u64, 1)` with 100M turns (the owner's
+  arms.modal) overflows C's stack under `--run` (no -O); native is a loop. With -O2 it runs.
+- **`--sig` for generic functions** (the owner's report: `T loop(T: type, n: T)` listed twice,
+  once with no kind): the generic says `generic: made once per type, below`, each
+  specialization is listed with its own types (`loop(type, u64): u64  both`). Under it, what the
+  optimizer's folds of its calls came to (`comptime_fold_notes`, comptime.c): computed while
+  compiling, left to run time because it takes more than `FOLD_STEPS` (20,000) steps, or left
+  because it does what only the program can. `loop(u64, 1)` takes 100M turns: left to run time,
+  and now `--sig` says so. `print(f)` of a generic named alone shows its declared signature.
+- **`--sig` also says when a function ran for a value while compiling** (`FOLD_NOTE_VALUE`, set
+  in comptime.c `function` while `evaluate` runs: a module-level binding, a type written as a
+  value). The owner's arms.modal with `a := loop(u64, 1)` at module level: the binary is the
+  same size as with `a := 11` (516 B of code), `--audit` lists loop as "run only while
+  compiling", and `--sig` now says `ran while compiling, for a value the program uses`.
+  Example run/compiled_value (3 checks).
+- **The C backend writes only what main reaches** (the owner: `-o ./a` of run/compiled_value
+  still held loop). Machine code already linked only reached functions; C wrote every function
+  it was handed, including a specialization only the compiler ran. Now the C file is kept in
+  memory (`mem_append`), each prototype, function and type descriptor is a piece named by its C
+  name (`piece_begin_fn`, `piece_end`), and `keep_reached` keeps the pieces named in kept text,
+  starting from the text outside any piece (prelude, types, module values, the entry point).
+  compiled_value's C is `g_a = 11` and main: no loop, assert, type.at or descriptor. Struct
+  definitions stay (no code, no data). Memory 41.84 MB against 41.75 (the C text in memory);
+  big emit 33.0 ms (unchanged). One check in run.sh.
+- **`print(a)` without an `a()`** prints the result (the owner's arms.modal): that is the rule
+  decided (use decides; a binding no one calls is its value).
+
+## 52. Printing while compiling
+
+The owner (2026-11-14), on run/compiled_value: `loop(T: type, n: T)` ending in `_: print(n)`,
+bound at module level (`a := loop(u64, 1)`), "should print at compile time and nothing exist
+at run time". comptime.md §2.2 said compile time cannot print; the owner's request replaces
+that (comptime.md updated).
+- **The interpreter writes** (comptime.c `ct_write`, at MIR_WRITE): strings, numbers in the
+  program's format, bools, bytes, to the compiler's stdout, only while `evaluate` runs (a
+  module-level value or statement). A fold (`comptime_fold_call`) clears `evaluating`, so a
+  call that prints in a body stays in the program and prints there.
+- **A literal is made once per evaluation** (`blocks[].from`): a loop that prints a string
+  reused a block per turn and stopped at 64.
+- **`a := f(x)` with no result at module level** is run for what it does (`statement`): its
+  type is nothing (`value_type`), C writes no global, using `a` is "has no value".
+  `loop(u64, 1)` as a module-level statement does the same.
+- run/compiled_value: the build prints `11`; C holds only main; arm64 code 36 B, as an empty
+  main. errors/comptime's `a: u8 = log(3)` is no longer an error (the build prints `n 3`).
+- Not yet: `--cache` skips checking an unchanged file, and so its compile-time output.
+- Tests 389 ok; fuzz 0 differ.
+
 ## Appendix A. The owner's original specification inputs
 
 These are the inputs the design started from, as the owner wrote them. Where the

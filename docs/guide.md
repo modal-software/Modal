@@ -127,6 +127,19 @@ uart0: uart @ 0x0900_0000                          -- a device at an address
 The compiler fills one context itself: a parameter `site: site` receives the place of each call,
 `file:line:col: <the call as written>`. A function that has its own `site` passes it on.
 
+## 5a. A call bound to a name
+
+`a := f(x)` is f's result, unless the body later calls `a()`: then `a` holds the call itself, and
+each `a()` runs it. Use decides; nothing is written for it. The arguments are computed at the
+binding (copied), a method's receiver is a reference. `print(a)` shows the function.
+
+```
+a := loop(u64, 1)
+print(a())          -- runs loop(u64, 1)
+print(a)            -- function loop(type, u64): u64
+f := double         -- a function named alone: f(21)
+```
+
 ## 5b. Primitives and std
 
 The language has a few predeclared names. They are not keywords, so a declaration of your own
@@ -175,8 +188,8 @@ several modalities to working with it. fixed-width arrays, 0 to k with T[..], gr
   - A module-level `assert(...)` is checked by the compiler.
   - Calls whose arguments are all constant are computed while optimizing (native backends).
 - **Not supported in code generation yet,** though the checker accepts them, so the error
-  comes late: function values (`f := double` then `f(1)`), closures, `==` on strings, pointers
-  and structs, and structs inside structs.
+  comes late: function values passed or returned (`f := double`, `f(1)` and `a := f(x)`, `a()`
+  work: std.md §13), closures, `==` on strings, pointers and structs.
 - **`T_EXTERN`:** an indexing expression, a dotted type path (`pkg.T`) and unknown `std`
   members are typed as "anything", so mistakes there are found only by the backend.
 - **Diagnostics:** a syntax error in a deferred body can repeat as "expected '{'" at another

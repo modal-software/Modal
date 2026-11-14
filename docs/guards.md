@@ -44,6 +44,9 @@ How a trap is built:
 
 ## 2. Design: faults go to a `fault`, the way output goes to an `out`
 
+*Superseded by §5 (the owner, 2026-11-14): errors are values, bugs are panics, and the boundary
+is a call bound with `, e`. Kept for the history of the decision.*
+
 Modal already routes output by a context parameter: every byte printed goes to the `out` in
 scope, or to the target's output if there is none. Faults get the same rule, with no keyword:
 
@@ -130,9 +133,81 @@ and a failure is a compile error. In a body it is a run-time check that traps wi
    module level a failure is a compile error. Left: `--stats` listing the fault points, and the
    `fault` context (step 3) receiving it with kind `assert`.
 
-## 4. Open question for the owner
+## 4. Open question for the owner (answered in §5)
 
 What a boundary function returns after a fault: its declared return type with a value the
 `fault` chose (simple and explicit; the `trap` method returns it), or a result type that
 says "this call failed" (more checking for the caller). The first fits Modal today; the
 second needs sum types, which Modal does not have.
+
+## 5. Errors and panics (decided by the owner, 2026-11-14)
+
+Go's form, Zig's inference, Erlang's supervision; no keyword, no operator, no garbage collector.
+
+```
+print := import("std").io.print
+error := import("std").error
+panic := import("std").panic
+
+bad_input: error                       -- an error of the program: a name, one word at run time
+
+parse([]u8 s): u64, error {            -- it can fail: `, error` in the result (type last)
+    "": return bad_input
+    _: return digits(s)
+}
+
+double(u64 n): u64 { return n * 2 }
+
+serve([]u8 s): u64, error {
+    n := parse(s)                      -- not handled: an error goes up (serve says `, error`)
+    return 100 / n                     -- n may be 0: panic.division can happen here
+}
+
+main(): u8 {
+    n, e := serve("42")                -- the boundary: a panic below comes back here
+    if e {                             -- `if` is exhaustive
+        nil: print(n)
+        bad_input: print("empty")
+        panic.division: print("zero")
+    }
+    m := parse("").(u64: double, error: 0)   -- a pipe stage is partial: by the type
+    print(m)
+    return 0
+}
+```
+
+- **`error`** (std): one word, the error's number and the place it was made; `nil` (0) is ok.
+  A program's errors are module-level `name: error`; their numbers are the compiler's.
+- **Saying it can fail:** a function that returns an error, or lets one go up, has `, error` in
+  its result (`f(...): T, error`, or `f(...): error` with no value), always type last. Which
+  errors is inferred (Zig's inferred sets); `--sig` lists them.
+- **Panics** are bugs: `panic("why")` (was `trap`), and the std's `panic.division`,
+  `panic.index`, `panic.assert`, `panic.anytype`, `panic.unhandled`, `panic.raised`, later
+  `panic.stack`. They need no declaration. A call's set holds a panic only when the compiler
+  could not prove it away (what `--audit` lists as "can stop at run time").
+- **The caller:**
+  - `n := f()`: not handled; an error goes up (the function needs `, error`), a panic too.
+  - `n, e := f()`: the boundary. On an error or a panic below, the frames under it are
+    dropped, execution recovers here, `n` is its type's zero and `e` the error. An `e` that is
+    never handled is itself `panic.unhandled` when an error reaches it.
+  - `if e { ... }` is exhaustive against the set; a pipe stage `f().(...)` is partial (what no
+    arm takes passes through; an error no arm takes goes up).
+  - **Type patterns:** on a call's result, `u64:` tests the value, `error:` any error, a name
+    (`bad_input:`, `panic.index:`) one error. A function named in an arm receives the value
+    (`u64: double`).
+- **Hybrid `fault`:** a program may declare `fault` with `trap(self: fault, error e)`, run on
+  each error before it reaches its handler (count, log); otherwise nothing runs.
+- **Arena:** no rollback is written. The usage-analysis pass decides it: on an error, an arena
+  goes back to its mark at the call when nothing allocated in the call escaped; `--audit`
+  says which, and why not.
+- **Cost:** a second register and a compare per call only for functions with `, error`; at a
+  boundary a few stores in, one out; nothing at panic sites; a boundary whose call cannot
+  fail is removed (a warning says `e` is always nil).
+- **Build order** (pipe ops first: the error forms are written with them):
+  1. pipe ops (plan Phase D1): `x.(f)`, `x.(arms)`, chains, rule 1 (a), partial stages;
+  2. names on the left (`a, b :=`);
+  3. errors returned and propagated (`, error`, `return bad_input`);
+  4. type patterns (`u64:`, `error:`) and error names in arms;
+  5. the boundary on native and C, `panic` replacing `trap`, `panic.unhandled`;
+  6. the inferred sets in `--sig`;
+  7. the arena decision by the usage-analysis pass.

@@ -96,8 +96,11 @@ the machine that has what it needs**. Each function's needs are inferred over th
   from a module-level position; a call from a body, or from another domain, is an error; they
   are never generated.
 - **Compile-time capabilities are deterministic inputs only:** the source files, the target
-  description and the configuration. Compile time cannot print, read the clock, or reach the
-  network. So results can be cached by the hash of their inputs, and a rebuild with the same
+  description and the configuration. Compile time cannot read the clock or reach the network.
+  **It can print** (the owner, 2026-11-14): output from a compile-time position (a module-level
+  value or statement) goes to the compiler's output, the build's log, and none of it is in
+  the program. It depends on the inputs alone, so a build stays reproducible. An optimizer
+  fold never prints: a call in a body that prints stays in the program. So results can be cached by the hash of their inputs, and a rebuild with the same
   inputs gives the same bytes.
 - **No `@inComptime` / `#compile_time`.** A "both" function gives the same result at both
   times, and the differential test (§5) proves it on every backend.

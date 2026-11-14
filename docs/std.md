@@ -441,3 +441,30 @@ functions, with no cost to speed and nothing that helps reverse engineering.
 reach, and those only the compiler runs; every guard left at run time with its place and reason;
 recursion that is not a tail call; the writes to the system. It is made of what the compiler
 knows anyway, and a normal compile does none of it.
+
+## 13. A call bound to a name (built, context.md §51)
+
+The owner's decisions (2026-11-14): `a := loop(u64, 1)` then `a()` holds the call; **use
+decides**, the arguments are computed **at the binding**, and `print(a)` shows the function's
+**descriptor with its name**.
+
+- **Use decides:** `a := f(x)` is a bound call when the block that binds it calls `a()` after it
+  (read from the tokens, as the fields-by-use scan reads uses). Without an `a()`, `a` is the
+  result, as before: no existing program changes. No word or symbol is added.
+- **Arguments at the binding,** copied into the frame (as Go's `defer` arguments): `s := sum(p,
+  k)`, then `k = 100`, then `s()` sums with the old k. A method's receiver is a reference (self
+  always is), so `w := sp.width()` sees later writes to sp. An array argument is refused (it is
+  passed by its address, which is not its value at the binding).
+- **No cost:** `a` is immutable, so the function is known while compiling. `a()` is a direct call
+  (or the body inlined) with the bound values: no function pointer, no closure object. `return
+  a()` is a tail call like any other.
+- **A call with no result** can be bound (`v := show(3)`, `v()`): the binding has no value of its
+  own, so the "no value" error does not apply.
+- **`print(a)`** gives `function name(param types): result` (`function span.grow(i32): i32`), the
+  specialization's types for a generic function. The name is in the binary only because the
+  program printed it; a program that prints none carries none (§11's rule).
+- **`f := double`** (a function named alone) is that function: `f(21)` calls double, and
+  `print(f)` shows it the same way.
+- **Not yet:** a function value passed to or returned from a function (a table of handlers),
+  which needs addresses at run time (comptime.md: run time only); `a(more)` adding arguments; a
+  std `function` struct read field by field (as `type`).
