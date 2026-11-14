@@ -353,6 +353,88 @@ static NodeId led_index(Parser *p, NodeId left)
     return node_new(p->unit, AST_INDEX, tok_idx(p, open), left, index);
 }
 
+// A stage without a pattern, applied to `value`: a name alone is a function given the value
+// (`x.(f)` is `f(x)`); anything else runs after it, and its value goes on (`x.(f())`). The
+// sequence is a match whose only arm is `_`.
+static NodeId stage_continue(Parser *p, NodeId value, NodeId e)
+{
+    Unit *u = p->unit;
+    if (NODE(u, e)->kind == AST_IDENT)
+    {
+        NODE(u, value)->flags |= AST_F_LAST; // the one argument
+        return node_new(u, AST_CALL, NODE(u, e)->tok, e, value);
+    }
+    NodeId any = node_new(u, AST_PATTERN, NODE(u, e)->tok, 0, 0);
+    NODE(u, any)->aux = PAT_ANY;
+    NodeId arm = node_new(u, AST_ARM, NODE(u, e)->tok, any, e);
+    return node_new(u, AST_MATCH, NODE(u, e)->tok, value, arm);
+}
+
+// value.( ... ): a pipe stage (std.md §14). Arms are tried on the chain's head: every pattern stage
+// of a chain is an arm of one match, so `n.(0..10: a).(_: b)` is `if n { 0..10: a, _: b }`, and a
+// stage is partial (what no arm takes goes on). A stage without a pattern continues the arm opened
+// last, or, before any arm, the value itself.
+static NodeId led_stage(Parser *p, NodeId left)
+{
+    Unit *u = p->unit;
+    const Token *open = p->current;
+    parser_advance(p); // '('
+    p->paren_depth++;
+    if (arm_at(p->current))
+    {
+        int count = 0;
+        NodeId arms = parse_stage_arms(p, &count);
+        p->paren_depth--;
+        if (!arms || !parser_consume(p, TOK_RPAREN, "expected ')' after the stage's arms"))
+        {
+            return 0;
+        }
+        AstNode *m = NODE(u, left);
+        if (m->kind == AST_MATCH && (m->aux & MATCH_STAGE)) // the chain's head again: more arms of it
+        {
+            NodeId old = m->b;
+            NodeList all = list_begin();
+            for (NodeId a = old; a; a = NEXT(u, a))
+            {
+                node_list_push(u, &all, a);
+            }
+            for (NodeId a = arms; a; a = NEXT(u, a))
+            {
+                node_list_push(u, &all, a);
+            }
+            NODE(u, left)->b = list_finish(u, &all);
+            NODE(u, left)->aux = (uint16_t)((NODE(u, left)->aux & 0xff) | ((count & 0xff) << 8));
+            return left;
+        }
+        NodeId match = node_new(u, AST_MATCH, tok_idx(p, open), left, arms);
+        NODE(u, match)->aux = (uint16_t)(MATCH_STAGE | MATCH_PARTIAL | ((count & 0xff) << 8));
+        return match;
+    }
+    NodeId e = parse_precedence(p, PREC_NONE);
+    p->paren_depth--;
+    if (!e || !parser_consume(p, TOK_RPAREN, "expected ')' after the stage"))
+    {
+        return 0;
+    }
+    AstNode *m = NODE(u, left);
+    if (m->kind == AST_MATCH && (m->aux & MATCH_STAGE) && MATCH_OPEN(m->aux))
+    {
+        if (MATCH_OPEN(m->aux) != 1)
+        {
+            parser_error_at(p, open, "this stage would continue several arms: put it inside the arm it is for");
+            return 0;
+        }
+        NodeId last = m->b;
+        while (NEXT(u, last))
+        {
+            last = NEXT(u, last);
+        }
+        NODE(u, last)->b = stage_continue(p, NODE(u, last)->b, e);
+        return left;
+    }
+    return stage_continue(p, left, e);
+}
+
 // left.name   and, on an import chain only:   left.*   left.(a, b as c)
 static NodeId led_dot(Parser *p, NodeId left)
 {
@@ -373,6 +455,10 @@ static NodeId led_dot(Parser *p, NodeId left)
         return node_new(u, AST_SELECTOR, tok_idx(p, t), left, 0);
     }
 
+    if (t->kind == TOK_LPAREN && !ast_import_root(u, left))
+    {
+        return led_stage(p, left);
+    }
     if (t->kind == TOK_STAR || t->kind == TOK_LPAREN)
     {
         if (!ast_import_root(u, left))

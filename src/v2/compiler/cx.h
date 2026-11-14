@@ -431,7 +431,20 @@ enum
     PRIM_TYPEID,   // typeof(T or value): a number per type of the program, no name
     PRIM_UNANY,    // T(a) with a: *any: a's *T back, checked at run time (refs[call] = T)
     PRIM_LOAD,     // load(T, p, offset): the T at p + offset bytes (the call's type is T)
+    PRIM_BOUND,    // a(), with `a := f(x)`: f with the arguments computed at the binding (refs[call] = f)
 };
+// The text print gives a function value: `function name(param types): result`. Its length.
+size_t sema_fn_text(Unit *u, SymId fn, char *buf, size_t cap);
+// What the optimizer's folds (calls with every argument known, run while compiling) came to for
+// fn: FOLD_NOTE_* bits; *budget is the steps one fold may take.
+enum
+{
+    FOLD_NOTE_DONE = 1,    // a call was computed while compiling
+    FOLD_NOTE_BUDGET = 2,  // a call took more steps than a fold may: left to run time
+    FOLD_NOTE_REFUSED = 4, // a call did what the compiler does not run (output, a trap, ...)
+    FOLD_NOTE_VALUE = 8,   // it ran to compute a value while compiling (`a := loop(u64, 1)`)
+};
+int comptime_fold_notes(SymId fn, uint32_t *budget);
 // std's `any` (std/any.modal): a reference that carries the type of what it points to.
 int sema_is_any(SymId strct);
 int sema_is_generic(SymId fn);   // made once per type (docs/comptime.md §3.2): never generated itself
@@ -523,6 +536,15 @@ NodeId sema_arm_name(Unit *u, NodeId pat, TypeId type); // a run-time name patte
 // MATCH_STATEMENT: written as a statement (`if c { ... }` on its own line): it may leave values
 // untaken, and then does nothing for them (a warning with --warn). A value match takes them all.
 #define MATCH_STATEMENT 2
+// Pipe stages (std.md §14): MATCH_STAGE: made by `value.(arms)`, so a later arms stage of the
+// same chain adds its arms here (every pattern stage tests the chain's head); bits 8..15 hold how
+// many arms the last stage opened (a stage without a pattern continues that arm). MATCH_PARTIAL: a
+// stage need not take every value. MATCH_PASS (the checker): a value stage whose untaken values go
+// on as the match's value.
+#define MATCH_STAGE 4
+#define MATCH_PARTIAL 8
+#define MATCH_PASS 16
+#define MATCH_OPEN(aux) (((aux) >> 8) & 0xff)
 // A string literal's bytes, escapes decoded; returns the length (at most cap are written).
 size_t sema_pattern_text(const Unit *u, uint32_t tok, uint8_t *out, size_t cap);
 SymId sema_next_clause(Unit *u, SymId fn); // tried when fn's patterns do not match; 0: none

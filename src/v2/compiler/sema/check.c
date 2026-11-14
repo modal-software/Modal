@@ -55,6 +55,7 @@ typedef struct
     uint8_t nonzero; // inside an arm whose values exclude 0: as a divisor it needs no guard
     uint64_t below;  // inside an arm whose values are 0 .. below - 1 (0: not known): an index in range
     uint8_t frame;   // holds a reference into this function's frame (`a: *T = &T{ ... }`)
+    NodeId call;     // `a := f(x)` called later as `a()`: the call, its arguments bound (0: none)
 } Local;
 
 typedef struct
@@ -66,6 +67,7 @@ typedef struct
     int in_callable;
     int pretyped; // check_args: the arguments were typed already (an overload chosen by them)
     int found_nonzero; // find_name: the local found is an arm binding that excludes 0
+    NodeId found_call; // find_name: the local found holds a bound call (`a := f(x)`, then `a()`)
     TypeId ret; // declared return type of the callable being checked
     int nlocals;
     int block_base; // first local of the innermost block
@@ -1087,6 +1089,10 @@ static TypeId value_type(Unit *u, SymId s)
             {
                 return T_INT_LIT; // `k := n * 3 + 1`: still unsized
             }
+            if (got == T_VOID && v->kind == AST_CALL)
+            {
+                return T_VOID; // `a := show(1)`: a call run while compiling for what it does, no value
+            }
             if (got && got != T_NONE && got != T_EXTERN && got != T_MODULE &&
                 (type_is_int(got) || got == T_BOOL || got == T_STR || type_kind(got) == T_STRUCT))
             {
@@ -1117,7 +1123,69 @@ static void push_local(Check *c, uint32_t tok, TypeId type, int mut)
         diag_at(c->u, tok, "error", "too many locals in one function (limit is %d)", MAX_LOCALS);
         return;
     }
-    c->locals[c->nlocals++] = (Local){tok, type, name, (uint8_t)mut, 0, 0, 0, 0, 0, 0};
+    c->locals[c->nlocals++] = (Local){tok, type, name, (uint8_t)mut, 0, 0, 0, 0, 0, 0, 0};
+}
+
+// `a := f(x)` holds the call itself, its arguments bound, when the body calls `a()` after it:
+// use decides, as for visibility (std.md §13). Read from the tokens, since the uses come after.
+static int called_bare_later(const Unit *u, uint32_t name_tok)
+{
+    const Token *name = TOK(u, name_tok);
+    int depth = 0;
+    for (size_t i = name_tok + 1; i + 2 < u->tokens.size; i++)
+    {
+        const Token *t = TOK(u, i);
+        if (t->kind == TOK_EOF)
+        {
+            return 0;
+        }
+        if (t->kind == TOK_LBRACE)
+        {
+            depth++;
+        }
+        else if (t->kind == TOK_RBRACE && --depth < 0)
+        {
+            return 0; // the end of the block the binding is in
+        }
+        else if (t->kind == TOK_IDENTIFIER && t->len == name->len && memcmp(TSTART(t), TSTART(name), t->len) == 0 &&
+                 TOK(u, i - 1)->kind != TOK_DOT && TOK(u, i + 1)->kind == TOK_LPAREN &&
+                 TOK(u, i + 2)->kind == TOK_RPAREN)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// The call `a := f(x)` can be bound: a Modal function, no primitive, and no array argument
+// (an array is passed by its address, which would not be the value it had at the binding).
+// 1: it can; 0: not a call to bind; -1: it cannot, reported.
+static int bindable_call(Check *c, NodeId call)
+{
+    Unit *u = c->u;
+    SymId fn = u->refs[call];
+    if (NODE(u, call)->kind != AST_CALL || NODE(u, call)->aux != PRIM_NONE || !fn || SYM(fn)->kind != SYM_METHOD ||
+        (NODE(u, call)->flags & AST_F_SINK))
+    {
+        return 0;
+    }
+    if (NODE(u, NODE(u, call)->a)->kind == AST_SELECTOR &&
+        type_kind(u->types[NODE(u, NODE(u, call)->a)->a]) == T_TYPE)
+    {
+        return 0; // `T.m()`: a fresh value per call, not one bound
+    }
+    Unit *home = &cx.units[SYM(fn)->unit];
+    for (NodeId p = sema_fn_params(home, fn); p; p = NEXT(home, p))
+    {
+        if (type_kind(sema_param_type(home, fn, p)) == T_ARRAY)
+        {
+            diag_at(u, NODE(u, call)->tok, "error",
+                    "this call is bound to a name and called later, but an array is passed by its address, "
+                    "not by its value at the binding: call it where it is used");
+            return -1;
+        }
+    }
+    return 1;
 }
 
 static Scope *self_scope(const Check *c)
@@ -1134,6 +1202,7 @@ static NameKind find_name(Check *c, const Token *t, SymId *sym, TypeId *type)
 {
     *sym = 0;
     *type = T_EXTERN;
+    c->found_call = 0;
     if (is_self_token(TSTART(t), (int)t->len))
     {
         *type = self_type(c);
@@ -1150,6 +1219,7 @@ static NameKind find_name(Check *c, const Token *t, SymId *sym, TypeId *type)
             }
             *type = c->locals[i].type;
             c->found_nonzero = c->locals[i].nonzero;
+            c->found_call = c->locals[i].call;
             return NAME_LOCAL;
         }
     }
@@ -2949,6 +3019,22 @@ static TypeId check_call(Check *c, NodeId id)
                 return call_function(c, id, cn->tok, bound);
             }
         }
+        else if (kind == NAME_LOCAL && type_kind(type) == T_FUNC && c->found_call)
+        {
+            SymId fn = type_ref(type); // `a := loop(u64, 1)`; `a()`: that call, with those arguments
+            if (args)
+            {
+                diag_at(u, cn->tok, "error",
+                        "'%.*s' holds a call with its arguments already given: call it with none, `%.*s()`",
+                        t->len, TSTART(t), t->len, TSTART(t));
+                check_args(c, args, 0);
+            }
+            set_type(c, callee, type);
+            u->refs[id] = fn;
+            NODE(u, id)->aux = PRIM_BOUND;
+            note_call(c, fn);
+            return fn_ret_type(u, fn);
+        }
         else if (kind == NAME_LOCAL && type_kind(type) == T_FUNC)
         {
             return call_function(c, id, cn->tok, type_ref(type)); // f := double; f(1)
@@ -4036,7 +4122,22 @@ static TypeId check_match(Check *c, NodeId id)
     // A statement may leave values untaken (it does nothing for them): a warning. A value, or a
     // body that returns one, takes them all.
     const char *level = (m->aux & MATCH_STATEMENT) || (on_params && c->ret == T_VOID) ? "warning" : "error";
-    if (!full)
+    if (!full && (m->aux & MATCH_PARTIAL)) // a pipe stage: what no arm takes goes on (std.md §14)
+    {
+        if (value_arms && result != T_NONE && !(m->aux & MATCH_STATEMENT))
+        {
+            char x[64], y[64];
+            if (ns != 1 || !(fits(types[0], result) || (types[0] == T_INT_LIT && fits(T_INT_LIT, result))))
+            {
+                diag_at(u, m->tok, "error",
+                        "the values no arm takes go on as the stage's value, but they are %s and the arms give "
+                        "%s: end with `_: ...`",
+                        type_str(types[0], x, sizeof(x)), type_str(result, y, sizeof(y)));
+            }
+            m->aux |= MATCH_PASS;
+        }
+    }
+    else if (!full)
     {
         char gaps[160] = "";
         if (ns == 1 && types[0] != T_STR && type_is_int(types[0]) | (types[0] == T_BOOL))
@@ -4764,6 +4865,19 @@ static TypeId check_expr(Check *c, NodeId id)
         c->local_ref = frame == 1;
         type = check_expr(c, n->a);
         c->local_ref = 0;
+        NodeId bound_call = 0;
+        int bindable = type != T_NONE && NODE(u, n->a)->kind == AST_CALL && called_bare_later(u, n->tok)
+                           ? bindable_call(c, n->a)
+                           : 0;
+        if (bindable == 1)
+        {
+            bound_call = n->a; // `a := loop(u64, 1)`, then `a()`: the call, its arguments computed now
+            type = type_make(T_FUNC, u->refs[n->a]);
+        }
+        else if (bindable < 0)
+        {
+            type = T_NONE;
+        }
         if (type == T_VOID || type == T_NIL)
         {
             diag_at(u, n->tok, "error", "'%.*s' cannot be bound: the expression has no value",
@@ -4778,6 +4892,7 @@ static TypeId check_expr(Check *c, NodeId id)
         push_local(c, n->tok, type, 0); // immutable, as at module level; visible after its value
         c->locals[c->nlocals - 1].bound = 1;
         c->locals[c->nlocals - 1].frame = (uint8_t)(frame != 0);
+        c->locals[c->nlocals - 1].call = bound_call;
         break;
     }
     case AST_FIELD_DECL: // a local with its type: `name: T = v`, `T name [= v]` (parse_local)
@@ -5864,4 +5979,57 @@ const char *sema_fn_kind(SymId fn, char *buf, size_t size)
                  line);
     }
     return buf;
+}
+
+// What print shows for a function value (std.md §13): its name and its signature as made,
+// `function loop(type, u64): u64`. The name is in the binary only because the program printed it.
+size_t sema_fn_text(Unit *u, SymId fn, char *buf, size_t cap)
+{
+    (void)u;
+    Unit *home = &cx.units[SYM(fn)->unit];
+    int len;
+    const char *name = symbol_name(fn, &len);
+    size_t n = 0;
+#define ADD(...)                                                                                   \
+    do                                                                                             \
+    {                                                                                              \
+        int k_ = snprintf(buf + n, n < cap ? cap - n : 0, __VA_ARGS__);                            \
+        n += k_ > 0 ? (size_t)k_ : 0;                                                              \
+    } while (0)
+    char t[128];
+    ADD("function ");
+    if (sema_is_generic(fn)) // not made yet: as declared, `T loop(T: type, n: T)`
+    {
+        char sig[256];
+        ADD("%s", ast.sig_str(home, SYM(fn)->decl, sig, sizeof(sig)));
+#undef ADD
+        return n < cap ? n : cap ? cap - 1 : 0;
+    }
+#define ADD(...)                                                                                   \
+    do                                                                                             \
+    {                                                                                              \
+        int k_ = snprintf(buf + n, n < cap ? cap - n : 0, __VA_ARGS__);                            \
+        n += k_ > 0 ? (size_t)k_ : 0;                                                              \
+    } while (0)
+    if (SYM(fn)->owner)
+    {
+        int ol;
+        const char *on = symbol_name(SYM(fn)->owner, &ol);
+        ADD("%.*s.", ol, on);
+    }
+    ADD("%.*s(", len, name);
+    int first = 1;
+    for (NodeId p = sema_fn_params(home, fn); p; p = NEXT(home, p))
+    {
+        ADD("%s%s", first ? "" : ", ", type_str(sema_param_type(home, fn, p), t, sizeof(t)));
+        first = 0;
+    }
+    ADD(")");
+    TypeId ret = sema_fn_ret(home, fn);
+    if (ret != T_VOID)
+    {
+        ADD(": %s", type_str(ret, t, sizeof(t)));
+    }
+#undef ADD
+    return n < cap ? n : cap ? cap - 1 : 0;
 }

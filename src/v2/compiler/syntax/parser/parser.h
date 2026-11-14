@@ -94,6 +94,7 @@ NodeId parse_statement(Parser *p);
 NodeId parse_block(Parser *p);
 int arm_at(const Token *t);                   // a literal pattern then `:` / `,` / `..` starts an arm
 NodeId parse_arm_block(Parser *p, NodeId subject); // `{ arms }`, matching subject (0: the parameters)
+NodeId parse_stage_arms(Parser *p, int *count);  // a pipe stage's arms, up to its ')'
 NodeId parse_if(Parser *p, int value);             // `if cond branch [else branch]`, `if value { arms }`
 
 // parse_expr.c

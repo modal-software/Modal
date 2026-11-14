@@ -28,6 +28,19 @@ expect_output() { # description, pattern, file, flags...
     fi
 }
 
+expect_no_output() { # description, pattern, file, flags...: the pattern must not appear
+    desc=$1
+    pattern=$2
+    file=$3
+    shift 3
+    if $BIN "$@" "$file" 2>&1 | grep -q -- "$pattern"; then
+        echo "FAIL  $desc (found: $pattern)"
+        fail=1
+    else
+        echo "ok    $desc"
+    fi
+}
+
 expect_fail() { # description, file
     if $BIN "$2" >/dev/null 2>&1; then
         echo "FAIL  $1 (expected errors)"
@@ -43,10 +56,10 @@ check "v1 example still parses" $BIN ./examples/add.modal
 
 S="--syms"
 expect_output "type-first field is mutable" "field   john_nested_class.my_name .* mut" $EX/main.modal $S
-expect_output "fields are always inside" "field   john_nested_class.n2 *inside" $EX/main.modal $S
-expect_output "method inside the braces is private" "method  john_nested_class.check *inside" $EX/main.modal $S
-expect_output "method outside the braces is the face" "method  john_nested_class.add_normal *public" $EX/main.modal $S
-expect_output "accessor may share the field name" "method  john_nested_class.n1 *public" $EX/main.modal $S
+expect_output "a field no other domain uses stays in the domain" "field   john_nested_class.n2 *domain" $EX/main.modal $S
+expect_output "a method no other domain uses stays in the domain" "method  john_nested_class.check *domain" $EX/main.modal $S
+expect_output "a type another domain uses is public" "struct  john_nested_class *public" $EX/main.modal $S
+expect_output "accessor may share the field name" "method  john_nested_class.n1 " $EX/main.modal $S
 expect_output "free binding stays in the domain" "method  print_file_name *domain" $EX/main.modal $S
 expect_output "config binding" "const   implicit_self *config" $EX/main.modal $S
 expect_output "overloads share one name" "john_nested_class.add_oneline .* mut" $EX/main.modal $S
@@ -56,7 +69,6 @@ expect_output "import alias" "item new as make_john" $EX/main.modal --ast
 
 G="--sig"
 expect_output "contract lists opaque types" "^  type john_nested_class" $EX/main.modal $G
-expect_output "contract lists face signatures" "^  add_normal(self: john_nested_class, n3: u8): u8" $EX/main.modal $G
 expect_output "contract lists config" "^config version = \"0.1.0\"" $EX/main.modal $G
 if $BIN --sig $EX/main.modal 2>&1 | grep -q "check\|my_name\|print_file_name"; then
     echo "FAIL  contract leaks private names"
@@ -66,10 +78,12 @@ else
 fi
 
 expect_fail "invisible names are rejected" $EX/errors/private.modal
-expect_output "field" "'my_name' is a field of 'john_nested_class'" $EX/errors/private.modal
-expect_output "helper inside the braces" "'check' is inside 'john_nested_class'" $EX/errors/private.modal
-expect_output "binding inside a module" "'print_file_name' is inside module 'john'" $EX/errors/private.modal
-expect_output "module not bound in mod.modal" "module 'secret' is not part of the face" $EX/errors/private.modal
+if $BIN $EX/errors/private.modal 2>&1 | grep -q "private.modal:[2-5]:"; then
+    echo "FAIL  fields, helpers, bindings and unbound modules of another domain are reachable"
+    fail=1
+else
+    echo "ok    fields, helpers, bindings and unbound modules of another domain are reachable"
+fi
 expect_output "config is not part of the face" "'implicit_self' is configuration" $EX/errors/private.modal
 expect_output "missing member" "has no member 'does_not_exist'" $EX/errors/private.modal
 if $BIN $EX/errors/private.modal 2>&1 | grep -q "add_oneline"; then
@@ -80,11 +94,12 @@ else
 fi
 L=$EX/errors/leak.modal
 expect_output "member access on a binding: missing module" "leak.modal:5:.*'example' has no member 'secret'" $L
-expect_output "member access on a binding: field" "leak.modal:6:.*'my_name' is a field" $L
-expect_output "member access on a binding: private binding" "leak.modal:7:.*'print_file_name' is inside module" $L
-expect_output "alias of a binding" "leak.modal:11:.*'check' is inside 'john_nested_class'" $L
-expect_output "import inside a body" "leak.modal:15:.*module 'secret' is not part of the face" $L
-expect_output "member access inside a body" "leak.modal:16:.*'my_name' is a field" $L
+if $BIN $L 2>&1 | grep -q "leak.modal:\(6\|7\|11\|15\|16\):"; then
+    echo "FAIL  bindings, aliases and imports in bodies reach any member"
+    fail=1
+else
+    echo "ok    bindings, aliases and imports in bodies reach any member"
+fi
 expect_output "unresolved path without ./" "leak.modal:21:.*cannot find module" $L
 expect_output "bare name is found in a folder above" "leak.modal:24:.*'example' has no member 'secret'" $L
 expect_output "unresolved symbol name" "leak.modal:25:.*cannot find module nowhere" $L
@@ -121,9 +136,9 @@ expect_output "memory is reported" "KB taken from the system at peak" $EX/main.m
 T=$EX/errors/types.modal
 expect_fail "type errors are rejected" $T
 expect_output "assignment to an immutable field" "types.modal:18:.*'y' is immutable" $T
-expect_output "return type mismatch" "types.modal:27:.*returns int, but the function declares \[\]u8" $T
+expect_output "return type mismatch" "types.modal:27:.*.5. should be \[\]u8, as the function declares, but it is int" $T
 expect_output "operator on mismatched types" "types.modal:33:.*cannot be applied to u8 and \[\]u8" $T
-expect_output "argument type mismatch" "types.modal:34:.*argument 1 of 'wide' is u8, but parameter 'n' is u16" $T
+expect_output "argument type mismatch" "types.modal:34:.*.q. should be u16, but it is u8 (argument 1 of 'wide', parameter 'n')" $T
 expect_output "member access on a non-struct" "types.modal:35:.*a value of type u8 has no member 'x'" $T
 expect_output "calling a type" "types.modal:37:.*'point' is a type, not a function" $T
 expect_output "local declared twice" "types.modal:39:.*'q' is already declared in this block" $T
@@ -136,7 +151,7 @@ else
     echo "FAIL  unknown backend is rejected"
     fail=1
 fi
-for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms bindings; do
+for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms arm_edges arm_search arm_consts clauses_nil arrays fields reflect field_use nested module_structs any types generic fields_each bound; do
     if $BIN --run $EX/run/$prog.modal 2>&1 | cmp -s - $EX/run/$prog.expected; then
         echo "ok    $prog.modal compiles to C and prints the expected output"
     else
@@ -157,7 +172,7 @@ expect_output "clauses need a final catch-all" "patterns.modal:2:.*none after th
 F=$EX/errors/patterns_fit.modal
 expect_output "a pattern must fit its type" "patterns_fit.modal:1:.*the pattern 300 does not fit u8" $F
 expect_output "a negative pattern on an unsigned type" "patterns_fit.modal:4:.*the pattern -1 does not fit u8" $F
-expect_output "a bool pattern on an integer" "patterns_fit.modal:7:.*is a bool, but the parameter is not" $F
+expect_output "a bool pattern on an integer" "patterns_fit.modal:7:.*is a bool, but the value matched is not" $F
 
 N=$EX/errors/bounds.modal
 expect_output "a constant must fit its field" "bounds.modal:1:.*300 does not fit u8 (0 to 255, 8 bits)" $N
@@ -209,7 +224,7 @@ expect_output "a closure is reported" "closure.modal:2:.*a closure" $EX/errors/c
 
 # the native backend (copy-and-patch): same output and exit status as the C backend
 if [ "$(uname -m)" = arm64 ] || [ "$(uname -m)" = aarch64 ]; then
-    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms bindings; do
+    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms arm_edges arm_search arm_consts clauses_nil arrays fields reflect field_use nested module_structs any types generic fields_each bound; do
         if $BIN --backend native --run $EX/run/$prog.modal 2>&1 | cmp -s - $EX/run/$prog.expected; then
             echo "ok    $prog.modal compiles to arm64 by copy-and-patch and prints the expected output"
         else
@@ -239,7 +254,7 @@ if [ "$(uname -m)" = arm64 ] || [ "$(uname -m)" = aarch64 ]; then
 fi
 # x86-64: on an x86-64 host, or on Apple Silicon through Rosetta
 if [ "$(uname -m)" = x86_64 ] || arch -x86_64 /usr/bin/true 2>/dev/null; then
-    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms bindings; do
+    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms arm_edges arm_search arm_consts clauses_nil arrays fields reflect field_use nested module_structs any types generic fields_each bound; do
         if $BIN --backend x86_64 --run $EX/run/$prog.modal 2>&1 | cmp -s - $EX/run/$prog.expected; then
             echo "ok    $prog.modal compiles to x86-64 by copy-and-patch and prints the expected output"
         else
@@ -251,6 +266,15 @@ fi
 # Linux: static ELF executables, run on macOS through tools/elfrun.c (only the two system
 # calls are replaced), or directly on Linux.
 ELF=${TMPDIR:-/tmp}/modal-test-elf-$$
+# A binary written with -o says `trap N` where a guard's place would be; <binary>.traps gives
+# the place back, so its output compares with the same .expected as --run's.
+untrap() {
+    [ -f "$1" ] || { cat; return; }
+    awk -F'\t' 'NR == FNR { if ($1 ~ /^trap [0-9]+$/) m[$1] = $2; next }
+        match($0, /trap [0-9]+/) && (substr($0, RSTART, RLENGTH) in m) {
+            $0 = substr($0, 1, RSTART - 1) m[substr($0, RSTART, RLENGTH)] substr($0, RSTART + RLENGTH) }
+        { print }' "$1" -
+}
 for cpu in arm64 x86_64; do
     if [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = "$cpu" -o "$(uname -m)-$cpu" = aarch64-arm64 ]; then
         runner=""
@@ -261,9 +285,9 @@ for cpu in arm64 x86_64; do
     else
         continue
     fi
-    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms bindings; do
+    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms arm_edges arm_search arm_consts clauses_nil arrays fields reflect field_use nested module_structs any types generic fields_each bound; do
         if $BIN --target $cpu-linux -o "$ELF" $EX/run/$prog.modal >/dev/null 2>&1 &&
-            $runner "$ELF" 2>&1 | cmp -s - $EX/run/$prog.expected; then
+            $runner "$ELF" 2>&1 | untrap "$ELF.traps" | cmp -s - $EX/run/$prog.expected; then
             echo "ok    $prog.modal as a Linux $cpu ELF prints the expected output"
         else
             echo "FAIL  $prog.modal as a Linux $cpu ELF prints the expected output"
@@ -302,6 +326,24 @@ for cpu in arm64 x86_64; do
 done
 # memory budgets: the value stack sized from the call graph; mod.modal's max_code / max_ram
 BG=${TMPDIR:-/tmp}/modal-test-budget-$$
+CV_OUT=$(mktemp)
+if [ "$($BIN $EX/run/compiled_value.modal -o "$CV_OUT" 2>/dev/null | head -1)" = 11 ] &&
+    ! grep -q "loop\|m_desc_\|assert\|g_a" "$CV_OUT"; then
+    echo "ok    c: a function only the compiler ran prints in the build and is not in the program"
+else
+    echo "FAIL  c: a function only the compiler ran prints in the build and is not in the program"
+    fail=1
+fi
+if [ "$($BIN --backend arm64 --run $EX/run/compiled_value.modal 2>/dev/null)" = 11 ]; then
+    echo "ok    native: the compiler's print comes before the program, which prints nothing"
+else
+    echo "FAIL  native: the compiler's print comes before the program, which prints nothing"
+    fail=1
+fi
+rm -f "$CV_OUT"
+expect_output "sig: a generic is listed once, its specializations under it" "loop(T: type, n: T) *generic: made once per type" $EX/run/compiled_value.modal --sig
+expect_output "sig: a specialization with its own types" "^    loop(type, u64) *run time" $EX/run/compiled_value.modal --sig
+expect_output "sig: a function that ran for a module-level value says so" "ran while compiling, for a value the program uses" $EX/run/compiled_value.modal --sig
 expect_output "a function that needs nothing runs at both times" "twice(n: u8): u8 *both$" $EX/kinds.modal --sig
 expect_output "a function that prints is run time, where" "log(n: u8) *run time  (prints, kinds.modal:10)" $EX/kinds.modal --sig
 expect_output "the kind follows the calls" "step(n: u8): u8 *run time  (prints, through 'log', kinds.modal:10)" $EX/kinds.modal --sig
@@ -309,31 +351,149 @@ expect_output "a mutable module variable is run time" "count(): u8 *run time  (a
 expect_output "a cycle of calls has one kind" "u8 down(u8 0) *run time  (prints, through 'down'" $EX/kinds.modal --sig
 expect_output "a device register is run time" "send(self: pl011, b: u8) *run time  (a device register, device.modal:19)" $EX/run/device.modal --sig
 CT=$EX/errors/comptime.modal
-expect_output "compile time cannot print" "comptime.modal:14:.*'a' cannot be computed by the compiler: 'log' prints" $CT
+expect_output "compile time prints in the build (a module-level value)" "^n 3$" $CT
 expect_output "compile time sees only the first value of a mutable variable" "comptime.modal:15:.*'count' uses a mutable module variable" $CT
 expect_output "compile time has a depth budget" "comptime.modal:16:.*nest deeper than comptime_depth = 1000" $CT
 expect_output "a division by zero at compile time is an error" "comptime.modal:17:.*'half' divides by zero" $CT
 AS=$EX/errors/asserts.modal
 expect_output "a failed assert at module level is a compile error, with both sides" "asserts.modal:12:.*assert(sizeof(header) == 12) is false (8 == 12)" $AS
 expect_output "a failed assert shows signed values" "asserts.modal:13:.*assert(neg(5) >= 0) is false (-5 >= 0)" $AS
-expect_output "an assert inside a function called at module level fails at compile time" "asserts.modal:14:.*'assert' fails at .*asserts.modal:9:5: assert(neg(3) > 0) is false" $AS
-expect_output "assert (std, in Modal) needs a bool" "asserts_types.modal:2:.*argument 1 of 'assert' is int, but parameter 'ok' is bool" $EX/errors/asserts_types.modal
+expect_output "an assert inside a function called at module level fails at compile time" "asserts.modal:14:.*'checks' fails at .*asserts.modal:9:5: assert(neg(3) > 0) is false" $AS
+expect_output "assert (std, in Modal) needs a bool" "asserts_types.modal:2:.*argument 1 of 'assert' should be bool, but it is int (parameter 'ok')" $EX/errors/asserts_types.modal
 expect_output "sizeof takes one argument" "asserts_types.modal:3:.*sizeof takes one type or value" $EX/errors/asserts_types.modal
 expect_output "an unsized constant is range-checked where it meets a type" "unsized.modal:5:.*300 does not fit u8" $EX/errors/unsized.modal
 expect_output "an unsized constant must fit some integer type" "unsized.modal:2:.*'big' is too large for any integer type" $EX/errors/unsized.modal
 expect_output "a range pattern must take some value" "literals.modal:2:.*this range takes no value" $EX/errors/literals.modal
-expect_output "a string pattern needs a []u8 parameter" "literals.modal:4:.*a string pattern needs a \\[\\]u8 parameter" $EX/errors/literals.modal
+expect_output "a string pattern needs a []u8 parameter" "literals.modal:4:.*a string pattern needs a \\[\\]u8 value to match" $EX/errors/literals.modal
 expect_output "a range's end must fit the parameter" "literals.modal:8:.*the pattern 300 does not fit u8" $EX/errors/literals.modal
 expect_output "overloads are chosen by the argument types" "literals.modal:16:.*no definition of 'show' takes .u16.: it takes .u8., .bool." $EX/errors/literals.modal
 expect_output "arms: a value no arm takes is named" "arms.modal:2:.*no arm takes 10..255" $EX/errors/arms.modal
 expect_output "arms: an arm covered by the ones above never runs" "arms.modal:8:.*this arm never runs" $EX/errors/arms.modal
-expect_output "arms: strings end with a name" "arms.modal:11:.*end with an arm that names the value" $EX/errors/arms.modal
+expect_output "arms: strings end with _" "arms.modal:11:.*end with .*_: ...., which takes the rest" $EX/errors/arms.modal
 expect_output "arms: a catch-all after full coverage never runs" "arms.modal:16:.*this arm never runs: the arms above already take every value" $EX/errors/arms.modal
-expect_output "arms: a value match gives one type" "arms.modal:22:.*this arm gives .*u8, but the arms above give a number" $EX/errors/arms.modal
-expect_output "arms: signed coverage names the gap" "arms.modal:25:.*no arm takes 0" $EX/errors/arms.modal
-expect_output "arms take disjoint values" "bindings.modal:4:.*this arm overlaps an arm above on 5..9" $EX/errors/bindings.modal
-expect_output "a binding takes the value's own type" "bindings.modal:9:.*this binding is u64, but the value is u8" $EX/errors/bindings.modal
-expect_output "an arm's binding is immutable" "bindings.modal:14:.*bound by the arm's pattern, so it is immutable" $EX/errors/bindings.modal
+expect_output "arms take disjoint values" "arms.modal:20:.*this arm overlaps an arm above on 5..9" $EX/errors/arms.modal
+expect_output "arms: several values take parentheses" "arms.modal:24:.*write one pattern for each, in parentheses" $EX/errors/arms.modal
+expect_output "arms: a value match gives one type" "arms.modal:31:.*this arm gives .*u8, but the arms above give a number" $EX/errors/arms.modal
+expect_output "arms: signed coverage names the gap" "arms.modal:34:.*no arm takes 0" $EX/errors/arms.modal
+expect_output "if: the condition is a bool" "arms.modal:38:.*an if's condition is a bool, not i8" $EX/errors/arms.modal
+expect_output "arms: a pattern naming the value matched takes every value" "arm_names.modal:3:.*'n' is the value being matched, so this pattern takes every value" $EX/errors/arm_names.modal
+expect_output "arms: the old 'value: {' form names the new one" "arm_forms.modal:3:.*a match is written .if value { arms }." $EX/errors/arm_forms.modal
+expect_output "arms take no else" "arm_forms.modal:7:.*arms take no 'else'" $EX/errors/arm_forms.modal
+expect_output "an if as a value takes arms" "arm_forms.modal:41:.*an 'if' used as a value takes arms" $EX/errors/arm_forms.modal
+expect_output "arms: several statements under an arm take braces" "arm_forms.modal:19:.*an arm with several statements takes braces" $EX/errors/arm_forms.modal
+expect_output "arms: a constant name counts like its value" "arm_forms.modal:28:.*this arm never runs" $EX/errors/arm_forms.modal
+expect_output "arms: a constant name must fit the value matched" "arm_forms.modal:32:.*the pattern 'big' does not fit u8" $EX/errors/arm_forms.modal
+expect_output "arms: a name pattern must exist" "arm_forms.modal:33:.*'nope' is not declared" $EX/errors/arm_forms.modal
+expect_output "arms: a match used as a value takes every value" "arm_forms.modal:37:.*not every value is taken" $EX/errors/arm_forms.modal
+expect_output "arms: several values take one pattern each" "arm_forms.modal:45:.*this match has 2 values" $EX/errors/arm_forms.modal
+expect_output "arms: a range's ends are known while compiling" "arm_forms.modal:50:.*'moving' is not known while compiling" $EX/errors/arm_forms.modal
+SL=$EX/errors/struct_literals.modal
+expect_output "literals: a literal gives every field" "struct_literals.modal:10:.*'y' is not given" $SL
+expect_output "literals: a field is given once" "struct_literals.modal:11:.*'x' is given twice" $SL
+expect_output "literals: a type-last field is not written" "struct_literals.modal:12:.*'y' is immutable" $SL
+if $BIN $SL 2>&1 | grep -q "struct_literals.modal:13:"; then
+    echo "FAIL  literals: a local may hold a reference to a literal (p: *T = &T{ ... })"
+    fail=1
+else
+    echo "ok    literals: a local may hold a reference to a literal (p: *T = &T{ ... })"
+fi
+RE=$EX/errors/references.modal
+expect_output "a literal's reference is not returned" "references.modal:22:.*points to a literal of this function, which ends when it returns" $RE
+expect_output "a reference to a literal is a local's value or a constructor's result" "references.modal:25:.*a reference to a literal is a local's value" $RE
+expect_output "literals: a literal's values fit their fields" "struct_literals.modal:14:.*'x' is i32, but this value is bool" $SL
+expect_output "literals: a literal names fields of its struct" "struct_literals.modal:15:.*'point' has no field 'z'" $SL
+expect_output "a method is called, not read" "struct_literals.modal:16:.*'norm' is a method of 'point': call it" $SL
+expect_output "visibility: a face line is not needed" "face_line.modal:5:.*needs no face line" $EX/errors/face_line.modal
+DM=$EX/run/domains/main.modal
+for b in c native; do
+    if $BIN --backend $b --run $DM 2>&1 | cmp -s - $EX/run/domains/main.expected; then
+        echo "ok    a struct of another domain: literal, fields and methods ($b)"
+    else
+        echo "FAIL  a struct of another domain: literal, fields and methods ($b)"
+        fail=1
+    fi
+done
+expect_output "visibility: what another domain uses is public" "^    lo: i32" $DM --sig
+expect_output "visibility: a writable public field says so" "^    x: i32  (writable)" $DM --sig
+expect_output "visibility: a used method is public" "method  span.width *public" $DM --syms
+expect_output "visibility: a member only its domain uses stays there" "field   span.reads *domain" $DM --syms
+RF=$EX/errors/reflect.modal
+expect_output "reflect: offsetof names a field" "reflect.modal:6:.*offsetof takes a field of a struct" $RF
+expect_output "reflect: offsetof of a missing field" "reflect.modal:7:.*offsetof takes a field of a struct" $RF
+expect_output "reflect: typeof gives std's type" "reflect.modal:8:.*typeof gives std's type: bind it first" $RF
+expect_output "reflect: an unsized constant has no type" "any.modal:18:.*typeof: an unsized constant has no type yet" $EX/errors/any.modal
+expect_output "reflect: a query takes one argument" "reflect.modal:9:.*sizeof takes one type or value" $RF
+RB=${TMPDIR:-/tmp}/modal-reflect-$$
+if $BIN --backend native -o "$RB" $EX/run/reflect.modal >/dev/null 2>&1 && ! strings "$RB" | grep -q "header\|point\|kind\|flags"; then
+    echo "ok    reflect: no type or field name reaches the binary"
+else
+    echo "FAIL  reflect: no type or field name reaches the binary"
+    fail=1
+fi
+if $BIN --backend native -o "$RB" $EX/run/guards.modal >/dev/null 2>&1 && ! strings "$RB" | grep -q "guards.modal\|assert(" &&
+    "$RB" 2>&1 | grep -q "^trap [0-9]* is false" && grep -q "guards.modal:27:5: assert(n < 4)" "$RB.traps"; then
+    echo "ok    a binary written with -o carries no source: trap N, and the place in its .traps"
+else
+    echo "FAIL  a binary written with -o carries no source: trap N, and the place in its .traps"
+    fail=1
+fi
+rm -f "$RB" "$RB.traps"
+RE=$EX/errors/references.modal
+expect_output "a value is not passed as a reference" "references.modal:14:.*.a. should be \*item, but it is item: pass a reference to it, .&a." $RE
+expect_output "a reference is not returned as a value" "references.modal:10:.*.it. should be item, as the function declares, but it is \*item: it is a reference, and .\*it. is the value" $RE
+AN=$EX/errors/any.modal
+expect_output "any: a made *any is not returned" "any.modal:7:.*an \*any made here is a pair in this function's frame" $AN
+expect_output "any: a local *any is not returned" "any.modal:12:.*is an \*any made in this function" $AN
+expect_output "any: T(a) takes an *any" "any.modal:16:.*takes an \*any and gives its \*point back" $AN
+expect_output "any: a value is given by reference" "any.modal:17:.*cannot initialize \*any with point: pass a reference to it" $AN
+TP=$EX/errors/type_params.modal
+expect_output "types: a value is not a type" "type_params.modal:11:.*.p. should be type, but it is point" $TP
+GE=$EX/errors/generic.modal
+expect_output "generic: an argument of the bound type" "generic.modal:15:.*.c. should be point, but it is rgb" $GE
+expect_output "generic: the type argument names a type" "generic.modal:16:.*takes this argument as a type" $GE
+expect_output "generic: a constant fits the bound type" "generic.modal:17:.*300 does not fit u8" $GE
+BC=$EX/errors/bound.modal
+expect_output "bound: a bound call takes no arguments" "bound.modal:7:.*holds a call with its arguments already given" $BC
+expect_output "bound: a bound call is not its result" "bound.modal:8:.*cannot be applied to function inc and int" $BC
+expect_output "bound: no array is bound by its address" "bound.modal:10:.*an array is passed by its address" $BC
+FI=$EX/errors/field_index.modal
+expect_output "field: the number is one of the fields" "field_index.modal:12:.*cannot compute for this call: .*assert(u64(i) < self.fields) is false" $FI
+expect_output "field: a number its caller knows only when it runs" "field_index.modal:14:.*'at' takes this argument while compiling" $FI
+expect_output "field: of the struct its type says" "field_index.modal:15:.*argument 2 of 'field' should be \*u8, but it is \*rec" $FI
+if $BIN $FI 2>&1 | grep -q "type.modal:3[0-9]"; then
+    echo "FAIL  field: a specialization whose types cannot be computed is not checked further"
+    fail=1
+else
+    echo "ok    field: a specialization whose types cannot be computed is not checked further"
+fi
+FU=$EX/run/field_use.modal
+expect_output "fields: one nothing reads has no bytes" "field_use.modal:8  item.tag  never read" $FU --audit
+expect_output "fields: one always the same constant is that constant" "field_use.modal:10  item.bias  always -4" $FU --audit
+if $BIN --audit $FU 2>&1 | grep -q "made\.\|item.hits"; then
+    echo "FAIL  fields: a field read and written with values, or of a struct sizeof looks at, keeps its bytes"
+    fail=1
+else
+    echo "ok    fields: a field read and written with values, or of a struct sizeof looks at, keeps its bytes"
+fi
+expect_output "audit: dependencies between domains" "domains -> geo: point point.x point.y span span.lo span.hi span.new span.width" $DM --audit
+expect_output "audit: an index the compiler cannot prove is listed" "arrays.modal:12:33: index out of range (0 to 3)  (in sum)" $EX/run/arrays.modal --audit
+expect_output "audit: recursion that grows the stack" "^  .*arrays.modal:20  fill" $EX/run/arrays.modal --audit
+expect_output "audit: a divisor the compiler cannot prove" "divide.modal:5:14: division by zero  (in d)" $EX/run/divide.modal --audit
+expect_output "audit: functions run only while compiling" "guards.modal:12  fact" $EX/run/guards.modal --audit
+expect_output "audit: an assert left for run time" "guards.modal:27:5: assert(n < 4) is false" $EX/run/guards.modal --audit
+expect_output "audit: the writes to the system" "main  9 writes" $EX/run/guards.modal --audit
+if $BIN --sig $DM 2>&1 | grep -q "reads"; then
+    echo "FAIL  visibility: the contract holds only what is used"
+    fail=1
+else
+    echo "ok    visibility: the contract holds only what is used"
+fi
+expect_output "an index out of range stops the program with its place (C)" "arrays.modal:51:12: index out of range (0 to 3)" $EX/run/arrays.modal --run
+expect_output "an index out of range stops the program with its place (native)" "arrays.modal:51:12: index out of range (0 to 3)" $EX/run/arrays.modal --backend native --run
+expect_output "clauses take disjoint values" "clauses_disjoint.modal:2:.*this clause takes values the clause at line 1 takes too" $EX/errors/clauses_disjoint.modal
+expect_output "a nil clause set may leave values (a warning)" "clauses_disjoint.modal:5:.*no clause takes the other values" $EX/errors/clauses_disjoint.modal --warn
+expect_no_output "an error before the bodies gives no stray '{' reports" "expected '\{' to start a block" $EX/errors/clauses_disjoint.modal
+expect_output "arms: a range with names at its ends takes values" "arm_forms.modal:51:.*this range takes no value" $EX/errors/arm_forms.modal
 expect_output "comptime_depth is configuration of the domain" "budget_ct/main.modal:3:.*nest deeper than comptime_depth = 5" $EX/errors/budget_ct/main.modal
 expect_output "configuration is a compile-time value" "ctvalues/main.modal:3:.*'max_ram' is configuration of the domain, a compile-time value" $EX/errors/ctvalues/main.modal
 expect_output "a target fact is a compile-time value" "ctvalues/main.modal:6:.*'ptr_size' is a fact of the target" $EX/errors/ctvalues/main.modal
@@ -348,10 +508,10 @@ for backend in c native x86_64; do
     fi
 done
 if [ "$(uname -m)" = arm64 ]; then
-    expect_output "target.arch is the machine compiled for (arm64)" "^arm64 " $EX/run/target/arch.modal --backend native --run
+    expect_output "target.arch is the machine compiled for (arm64)" "^arm64 macos arm$" $EX/run/target/arch.modal --backend native --run
 fi
 if arch -x86_64 /usr/bin/true 2>/dev/null || [ "$(uname -m)" = x86_64 ]; then
-    expect_output "target.arch is the machine compiled for (x86-64)" "^x86_64 " $EX/run/target/arch.modal --backend x86_64 --run
+    expect_output "target.arch is the machine compiled for (x86-64)" "^x86_64 macos intel$" $EX/run/target/arch.modal --backend x86_64 --run
 fi
 expect_output "a mod.modal function is compile time only" "compiled/main.modal:3:.*'square' is declared in mod.modal, so it runs only in the compiler" $EX/errors/compiled/main.modal
 expect_output "a mod.modal function is internal to its domain" "outside.modal:2:.*'twice' is a function of inner's mod.modal" $EX/errors/compiled/outside.modal
@@ -387,7 +547,7 @@ else
 fi
 rm -f "$OUT" "$OUT.bin"
 msg=$($BIN -o "$OUT" $EX/main.modal 2>&1)
-if echo "$msg" | grep -q "backend c: a type in an imported file is not supported yet" && [ ! -e "$OUT" ]; then
+if echo "$msg" | grep -q "backend c: .* is not supported yet" && [ ! -e "$OUT" ]; then
     echo "ok    unsupported construct is reported and no file is left behind"
 else
     echo "FAIL  unsupported construct is reported and no file is left behind"

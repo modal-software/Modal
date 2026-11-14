@@ -1992,6 +1992,13 @@ static int constant_text(NodeId a)
     const AstNode *n = NODE(u, a);
     const Token *t = TOK(u, n->tok);
     TypeId type = u->types[a];
+    if (type_kind(type) == T_FUNC) // a function value: its name and signature (std.md §13)
+    {
+        char text[512];
+        size_t len = sema_fn_text(u, type_ref(type), text, sizeof(text));
+        add_pending(text, len);
+        return 1;
+    }
     if (n->kind == AST_STRING_LIT)
     {
         for (uint32_t i = 1; i + 1 < t->len; i++)
@@ -2580,6 +2587,164 @@ static MirSlot lower_struct_addr(NodeId id)
 }
 
 
+// The end of a call whose arguments are computed: inlined, or copied into the window and called.
+static MirSlot finish_call(SymId fn, const Inlinable *inline_body, MirSlot *args, const uint32_t *argk,
+                           const uint32_t *argw, int nargs)
+{
+    Unit *u = L.u;
+    if (inline_body)
+    {
+        MirSlot result = splice(inline_body, args, nargs);
+        if (sema_fn_ret(u, fn) == T_VOID)
+        {
+            return temp();
+        }
+        if (is_temp(result))
+        {
+            return result;
+        }
+        MirInst *r = inst(MIR_COPY);
+        r->d = temp();
+        r->a = result;
+        return r->d;
+    }
+    for (int i = 0; i < nargs; i++)
+    {
+        if (argk[i] == 1)
+        {
+            into(args[i], SLOT_WIN | argw[i]);
+        }
+        else
+        {
+            copy_slots(SLOT_WIN | argw[i], args[i], argk[i]);
+        }
+    }
+    inst(MIR_CALL)->imm = fn;
+    if (sema_fn_ret(u, fn) == T_VOID)
+    {
+        return temp();
+    }
+    if (is_struct(sema_fn_ret(u, fn)))
+    {
+        return SLOT_WIN | 0; // a struct result: the caller copies its slots before any call
+    }
+    // The result is in the callee's slot 0. It is copied out at once: the next call reuses the
+    // window. When this copy is the last instruction, its user can take the value straight.
+    MirInst *r = inst(MIR_COPY);
+    r->d = temp();
+    r->a = SLOT_WIN | 0;
+    return r->d;
+}
+
+// A bound call's arguments (`a := f(x)`, then `a()`), as f's window takes them: the receiver,
+// then each parameter (a struct: its slots). Returns the slots they take in all.
+static uint32_t bound_args(SymId fn, uint32_t *argk, uint32_t *argw, int *nargs)
+{
+    Unit *u = L.u;
+    uint32_t win = 0;
+    int n = 0;
+    if (SYM(fn)->owner)
+    {
+        argk[n] = 1;
+        argw[n++] = win++;
+    }
+    const Unit *home = &cx.units[SYM(fn)->unit];
+    for (NodeId p = sema_fn_params(u, fn); p && n < 256; p = NEXT(home, p))
+    {
+        TypeId pt = sema_param_type(u, fn, p);
+        uint32_t k = is_struct(pt) ? slots_of(pt) : 1;
+        argk[n] = k;
+        argw[n++] = win;
+        win += k;
+    }
+    *nargs = n;
+    return win;
+}
+
+// `a := f(x)` that the body calls as `a()`: the arguments now, in a block of the frame; no call.
+static void lower_bound_args(NodeId define, uint32_t top)
+{
+    Unit *u = L.u;
+    const AstNode *n = NODE(u, define);
+    const AstNode *call = NODE(u, n->a);
+    const AstNode *callee = NODE(u, call->a);
+    SymId fn = u->refs[n->a];
+    uint32_t argk[257], argw[257];
+    int na;
+    uint32_t k = bound_args(fn, argk, argw, &na);
+    MirSlot block = temp_n(k ? k : 1);
+    int i = 0;
+    if (SYM(fn)->owner)
+    {
+        MirSlot r = callee->kind == AST_SELECTOR
+                        ? lower_as(callee->a, type_make(T_PTR, type_make(T_STRUCT, SYM(fn)->owner)))
+                        : 0; // a bare member name, through implicit self
+        into(r, block);
+        i = 1;
+    }
+    const Unit *home = &cx.units[SYM(fn)->unit];
+    NodeId param = sema_fn_params(u, fn);
+    for (NodeId a = call->b; a && param && i < na; a = NEXT(u, a), param = NEXT(home, param), i++)
+    {
+        TypeId pt = sema_param_type(u, fn, param);
+        if (is_struct(pt))
+        {
+            lower_struct_into(a, block + argw[i]);
+        }
+        else
+        {
+            into(lower_as(a, pt), block + argw[i]);
+        }
+    }
+    push_local_n(token_name(TOK(u, n->tok)), block, k ? k : 1);
+    L.top = top + (k ? k : 1);
+}
+
+// `a()`: f with the arguments its binding computed (copied: an inlined body may write them).
+static MirSlot lower_bound_call(NodeId id)
+{
+    Unit *u = L.u;
+    const AstNode *n = NODE(u, id);
+    SymId fn = u->refs[id];
+    MirSlot block;
+    if (!find_local(token_name(TOK(u, NODE(u, n->a)->tok)), &block))
+    {
+        unsupported(n->tok, "this bound call");
+        return temp();
+    }
+    if (cx.audit)
+    {
+        audit_call(L.f->sym, fn);
+    }
+    const Inlinable *inline_body = inlinable_for(fn);
+    if (inline_body && inline_body->n > INLINE_MAX && !L.loops)
+    {
+        inline_body = NULL;
+    }
+    MirSlot args[257];
+    uint32_t argk[257], argw[257];
+    int na;
+    bound_args(fn, argk, argw, &na);
+    for (int i = 0; i < na; i++)
+    {
+        args[i] = block + argw[i];
+        if (inline_body)
+        {
+            MirSlot c = argk[i] == 1 ? temp() : temp_n(argk[i]);
+            if (argk[i] == 1)
+            {
+                into(args[i], c);
+            }
+            else
+            {
+                copy_slots(c, args[i], argk[i]);
+            }
+            args[i] = c;
+        }
+    }
+    return finish_call(fn, inline_body, args, argk, argw, na);
+}
+
 static MirSlot lower_call(NodeId id)
 {
     Unit *u = L.u;
@@ -2732,6 +2897,10 @@ static MirSlot lower_call(NodeId id)
         w->a = byte;
         return temp();
     }
+    if (sema_primitive(u, id) == PRIM_BOUND)
+    {
+        return lower_bound_call(id);
+    }
     if (!fn || SYM(fn)->kind != SYM_METHOD)
     {
         unsupported(callee->tok, "calling something that is not a Modal function");
@@ -2825,48 +2994,7 @@ static MirSlot lower_call(NodeId id)
         win++;
         nargs++;
     }
-    if (inline_body)
-    {
-        MirSlot result = splice(inline_body, args, nargs);
-        if (sema_fn_ret(u, fn) == T_VOID)
-        {
-            return temp();
-        }
-        if (is_temp(result))
-        {
-            return result;
-        }
-        MirInst *r = inst(MIR_COPY);
-        r->d = temp();
-        r->a = result;
-        return r->d;
-    }
-    for (int i = 0; i < nargs; i++)
-    {
-        if (argk[i] == 1)
-        {
-            into(args[i], SLOT_WIN | argw[i]);
-        }
-        else
-        {
-            copy_slots(SLOT_WIN | argw[i], args[i], argk[i]);
-        }
-    }
-    inst(MIR_CALL)->imm = fn;
-    if (sema_fn_ret(u, fn) == T_VOID)
-    {
-        return temp();
-    }
-    if (is_struct(sema_fn_ret(u, fn)))
-    {
-        return SLOT_WIN | 0; // a struct result: the caller copies its slots before any call
-    }
-    // The result is in the callee's slot 0. It is copied out at once: the next call reuses the
-    // window. When this copy is the last instruction, its user can take the value straight.
-    MirInst *r = inst(MIR_COPY);
-    r->d = temp();
-    r->a = SLOT_WIN | 0;
-    return r->d;
+    return finish_call(fn, inline_body, args, argk, argw, nargs);
 }
 
 static void guard_divisor(MirSlot b, uint32_t tok);
@@ -3897,6 +4025,14 @@ static void lower_stmt(NodeId id)
         {
             return; // generated as a function of its own; calls to the local name it directly
         }
+        if (type_kind(u->types[id]) == T_FUNC) // `f := double`: calls name it; `a := f(x)`: bound
+        {
+            if (NODE(u, n->a)->kind == AST_CALL)
+            {
+                lower_bound_args(id, top);
+            }
+            return;
+        }
         if (is_array(u->types[id])) // `c := a`: a copy of a's elements
         {
             uint32_t k = slots_of(u->types[id]);
@@ -4454,7 +4590,10 @@ static MirSlot lower_match_as(NodeId id, TypeId want, int returned)
     uint32_t entry[TREE_MAX];
     static TreePlan plan;
     NodeId only = sema_taken_arm(L.f->sym, id); // decided while compiling: that arm, untested
-    int tree = only ? 0 : match_tree(m, ns, types[0], end, entry, &plan);
+    // a value stage that takes some values only: the others go on as its value (std.md §14)
+    int pass = value && (m->aux & MATCH_PASS) && !only;
+    uint32_t miss = pass ? new_label() : end;
+    int tree = only ? 0 : match_tree(m, ns, types[0], miss, entry, &plan);
     int index = 0;
     for (NodeId arm = m->b; arm; arm = NEXT(u, arm), index++)
     {
@@ -4465,7 +4604,7 @@ static MirSlot lower_match_as(NodeId id, TypeId want, int returned)
         const AstNode *a = NODE(u, arm);
         int last = !NEXT(u, arm) || only;
         int searched = tree && index > 0; // reached through the search: no test of its own
-        uint32_t next = searched ? 0 : last ? end : new_label(); // (the last arm tests only when values are left)
+        uint32_t next = searched ? 0 : last ? miss : new_label(); // (the last arm tests only when values are left)
         int locals = L.nlocals;
         int k = 0;
         if (searched)
@@ -4533,6 +4672,12 @@ static MirSlot lower_match_as(NodeId id, TypeId want, int returned)
                 tree_emit(plan.seg, 0, plan.n, plan.variant, subj[0]);
             }
         }
+    }
+    if (pass)
+    {
+        inst(MIR_JUMP)->imm = end;
+        place_label(miss);
+        into(subj[0], r);
     }
     place_label(end);
     if (returned)

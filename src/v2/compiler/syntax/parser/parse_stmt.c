@@ -9,6 +9,16 @@ static int at_statement_end(const Parser *p)
 }
 
 
+// A chain of pipe stages on its own line is a statement: its arms may give nothing (print).
+static NodeId stage_statement(Parser *p, NodeId e)
+{
+    if (e && NODE(p->unit, e)->kind == AST_MATCH && (NODE(p->unit, e)->aux & MATCH_STAGE))
+    {
+        NODE(p->unit, e)->aux |= MATCH_STATEMENT;
+    }
+    return e;
+}
+
 NodeId parse_statement(Parser *p)
 {
     const Token *t = p->current;
@@ -41,9 +51,9 @@ NodeId parse_statement(Parser *p)
         {
             return parse_define(p);
         }
-        return parse_expression(p);
+        return stage_statement(p, parse_expression(p));
     default:
-        return parse_expression(p);
+        return stage_statement(p, parse_expression(p));
     }
 }
 
@@ -341,6 +351,33 @@ static NodeId parse_arm(Parser *p)
     NodeId arm = node_new(u, AST_ARM, tok_idx(p, first), head, result);
     NODE(u, arm)->aux = (uint16_t)grouped;
     return arm;
+}
+
+// The arms of a pipe stage, `value.(p: a, q: b)`: after the '(', up to the ')' (not consumed).
+// Returns the first; *count says how many.
+NodeId parse_stage_arms(Parser *p, int *count)
+{
+    Unit *u = p->unit;
+    NodeList arms = list_begin();
+    *count = 0;
+    while (p->current->kind != TOK_RPAREN && p->current->kind != TOK_EOF)
+    {
+        NodeId arm = parse_arm(p);
+        if (!arm)
+        {
+            list_abort(&arms);
+            return 0;
+        }
+        node_list_push(u, &arms, arm);
+        (*count)++;
+        if (!parser_match(p, TOK_COMMA) && p->current->kind != TOK_RPAREN)
+        {
+            list_abort(&arms);
+            parser_error_at(p, p->current, "expected a ',' between the arms of a stage, or ')'");
+            return 0;
+        }
+    }
+    return list_finish(u, &arms);
 }
 
 // `{ arms }`, matching `subject` (0: the parameters of the function whose body it is).

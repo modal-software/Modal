@@ -16,7 +16,7 @@
 # Programs the checker rejects (a constant that does not fit) are skipped.
 # MODAL_REGS=2 in the environment generates every function with registers, MODAL_REGS=0 none.
 # A program that differs is kept in the work folder and printed; the others are removed.
-import os, random, subprocess, sys, tempfile
+import os, random, re, subprocess, sys, tempfile
 
 BIN = os.environ.get("BIN", "./modal")
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 100
@@ -76,11 +76,49 @@ def program():
                 out.append("%s %s(%s n, %s acc): %s" % (t, name, t, t, step))
             else:  # as arms on the parameters, sometimes with a range first
                 lo = random.randint(1, 9)
-                out += ["%s %s(%s n, %s acc) {" % (t, name, t, t), "    0, acc: acc"]
+                out += ["%s %s(%s n, %s acc) {" % (t, name, t, t), "    (0, _): acc"]
                 if random.random() < 0.5:
-                    out.append("    1..%d, acc: acc + %d" % (lo, lo))
-                out += ["    n, acc: %s" % step, "}"]
+                    out.append("    (1..%d, _): acc + %d" % (lo, lo))
+                out += ["    _: %s" % step, "}"]
             fns.append((name, 2, "tail"))
+        elif roll < 0.19:  # an array: written at constant and checked indexes, read back
+            k = random.randint(2, 9)
+            lines = ["%s(n: %s): %s {" % (name, t, t), "    [%d]%s a" % (k, t)]
+            for j in range(random.randint(1, 4)):
+                lines.append("    a[%d] = %s" % (random.randint(0, k - 1), expr(["n"], 2, div)))
+            lines.append("    u64 i = u64(n)")
+            lines.append("    if i { 0..%d: a[i] = %s, _: {} }" % (k - 1, expr(["n"], 1, div)))  # proven: no check
+            lines.append("    u64 j = %d" % random.randint(0, k - 1))
+            lines.append("    a[j] = a[j] + %s" % expr(["n"], 1, div))                        # checked
+            lines.append("    return a[%d] + a[j]" % random.randint(0, k - 1))
+            out += lines + ["}"]
+            fns.append((name, 1, False))
+        elif roll < 0.21:  # many disjoint arms, written in any order: dispatched by a search
+            signed = t.startswith("i")
+            cuts = sorted(random.sample(range(-60 if signed else 0, 120), random.randint(4, 9)))
+            arms = []
+            for a, b in zip(cuts, cuts[1:]):
+                hi = b - 1
+                if random.random() < 0.4 or a == hi:
+                    arms.append("%d: %s" % (a, expr(["n"], 1, div)))
+                else:
+                    arms.append("%d..%d: %s" % (a, hi, expr(["n"], 1, div)))
+            random.shuffle(arms)
+            if random.random() < 0.3:
+                arms.append("%d..: %s" % (cuts[-1], expr(["n"], 1, div)))
+                if not signed and cuts[0] == 0:
+                    arms.append("_: 0") if False else None
+            arms.append("_: %s" % expr(["n"], 2, div))
+            out += ["%s(n: %s): %s {" % (name, t, t), "    v := if n { %s }" % ", ".join(arms),
+                    "    return v", "}"]
+            fns.append((name, 1, False))
+        elif roll < 0.25:  # a match as a value, `if n { ... }`, its arms separated by commas
+            lo = random.randint(1, 9)
+            out += ["%s(n: %s): %s {" % (name, t, t),
+                    "    v := if n { 0: %d, 1..%d: %s, _: %s }" % (random.randint(0, 9), lo,
+                                                                  expr(["n"], 2, div), expr(["n"], 2, div)),
+                    "    return v", "}"]
+            fns.append((name, 1, False))
         elif roll < 0.4:
             out.append("%s %s(%s 0): %s" % (t, name, t, random.randint(0, 9)))
             out.append("%s %s(%s n): %s + %s(n - 1)" % (t, name, t, expr(["n"], 2, False), name))
@@ -152,8 +190,30 @@ def struct_program():
         out += ["    return self", "}", ""]
     for i in range(nf):
         out += ["g%d(self: st): %s {" % (i, ftype[i]), "    return self.f%d" % i, "}", ""]
+    # A literal: built in place by a constructor (`return &st{ ... }`), and in main (every member
+    # is seen in its domain): read field by field (its fields are locals of their own) or passed whole.
+    def lit(extra):
+        return "st{ %s }" % ", ".join("f%d: %s" % (i, expr(extra, 1, False) if ftype[i] == ta and extra
+                                                   else str(random.randint(0, 50))) for i in range(nf))
+    out += ["mk(self: st, x: %s): *st {" % ta, "    return &%s" % lit(["x"]), "}", ""]
+    locals_ = random.random() < 0.6
     out += ["r(x: u8): u8 {", "    return x + 1", "}", "", "main(): u8 {"]
     out.append("    a := st.init(%d)" % random.randint(0, 100))
+    out.append("    m := st.mk(%d)" % random.randint(0, 100))
+    out.append('    print("m", %s)' % ", ".join("m.g%d()" % i for i in range(nf)))
+    if locals_:
+        for k in range(random.randint(1, 3)):
+            name = "l%d" % k
+            if random.random() < 0.4:
+                out.append("    st %s = %s" % (name, lit([])))
+                i = random.randrange(nf)
+                out.append("    %s.f%d = %s" % (name, i, str(random.randint(0, 50))))
+            else:
+                out.append("    %s := %s" % (name, lit([])))
+            reads = ["%s.f%d" % (name, random.randrange(nf)) for _ in range(random.randint(1, 3))]
+            if random.random() < 0.4:  # passed whole: a block in memory
+                reads.append("%s.g%d()" % (name, random.randrange(nf)))
+            out.append('    print("l", %s)' % ", ".join(reads))
     names = ["a"]
     for k in range(random.randint(1, 4)):
         j = random.randrange(nm)
@@ -206,6 +266,20 @@ def run(cmd):
     return p.stdout, 1 if s < 0 or s > 128 else s
 
 
+def untrap(result, binary):
+    # A binary written with -o says `trap N` where a guard's place goes; <binary>.traps has it.
+    out, status = result
+    try:
+        with open(binary + ".traps", "rb") as f:
+            for line in f:
+                if line.startswith(b"trap ") and b"\t" in line:
+                    code, text = line.rstrip(b"\n").split(b"\t", 1)
+                    out = re.sub(re.escape(code) + rb"(?![0-9])", text.replace(b"\\", b"\\\\"), out)
+    except OSError:
+        pass
+    return out, status
+
+
 tested = differ = traps = 0
 for i in range(N):
     path = os.path.join(WORK, "f%d.modal" % i)
@@ -221,7 +295,7 @@ for i in range(N):
     subprocess.run([BIN, "--backend", "native", "-o", arm, path], stdout=subprocess.DEVNULL)
     subprocess.run([BIN, "--target", "x86_64-macos", "-o", x86, path], stdout=subprocess.DEVNULL)
     results = [run([BIN, "--run", path]), run([BIN, "--backend", "native", "--run", path]),
-               run([arm]), run([x86])]
+               untrap(run([arm]), arm), untrap(run([x86]), x86)]
     tested += 1
     traps += b"division by zero" in results[0][0]
     if b"ct false" in results[0][0]:  # the compiler and the program computed different values
@@ -234,8 +308,9 @@ for i in range(N):
         for name, r in zip(["C", "in memory", "exec", "x86-64"], results):
             print("  %-9s" % name, r)
     else:
-        for f in (path, arm, x86):
-            os.remove(f)
+        for f in (path, arm, x86, arm + ".traps", x86 + ".traps"):
+            if os.path.exists(f):
+                os.remove(f)
 print("tested %d programs (of %d generated, %d of them trap), %d differ" % (tested, N, traps, differ))
 if not differ:
     os.rmdir(WORK)

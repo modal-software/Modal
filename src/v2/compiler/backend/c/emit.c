@@ -32,7 +32,25 @@ typedef struct
     SymId fn;   // the function being written
     size_t len; // bytes waiting in buf
     char buf[1 << 16];
+    // The whole program, in memory until the end: only the pieces main reaches are written
+    // (keep_reached). A piece is a prototype, a function or a type descriptor, by its C name.
+    char *mem;
+    size_t mem_len, mem_cap;
+    int piece_open; // a piece is being written: started at piece_at
+    size_t piece_at;
+    char piece_name[96];
 } Emit;
+
+typedef struct
+{
+    size_t from, to; // bytes of Emit.mem
+    uint32_t name;   // offset of its name in piece_names
+    uint8_t kept;
+} Piece;
+static Piece *pieces;
+static size_t npieces, pieces_cap;
+static char *piece_names;
+static size_t piece_names_len, piece_names_cap;
 
 static void emit_expr(Emit *e, NodeId id);
 static void emit_match(Emit *e, NodeId id);
@@ -44,9 +62,30 @@ static void emit_match_as(Emit *e, NodeId id, int returned);
 // Output goes through one 64 KB buffer and is written in large pieces. Almost everything
 // emitted is a fixed string or a slice of the source, so it is copied straight in: nothing
 // on this path goes through printf.
+static void mem_append(Emit *e, const char *text, size_t n)
+{
+    if (e->mem_len + n > e->mem_cap)
+    {
+        size_t cap = e->mem_cap ? e->mem_cap : (1u << 20);
+        while (cap < e->mem_len + n)
+        {
+            cap *= 2;
+        }
+        e->mem = realloc(e->mem, cap);
+        if (!e->mem)
+        {
+            fprintf(stderr, "fatal: out of memory\n");
+            exit(2);
+        }
+        e->mem_cap = cap;
+    }
+    memcpy(e->mem + e->mem_len, text, n);
+    e->mem_len += n;
+}
+
 static void flush(Emit *e)
 {
-    fwrite(e->buf, 1, e->len, e->out);
+    mem_append(e, e->buf, e->len);
     e->len = 0;
 }
 
@@ -57,7 +96,7 @@ static inline void put_n(Emit *e, const char *text, size_t n)
         flush(e);
         if (n > sizeof(e->buf))
         {
-            fwrite(text, 1, n, e->out);
+            mem_append(e, text, n);
             return;
         }
     }
@@ -186,6 +225,188 @@ static void out_fn_name(Emit *e, SymId fn)
             }
         }
     }
+}
+
+// ---- pieces: what main does not reach is not written -------------------------------------------
+
+static void piece_begin(Emit *e, const char *name, size_t n)
+{
+    flush(e);
+    e->piece_open = 1;
+    e->piece_at = e->mem_len;
+    if (n >= sizeof(e->piece_name))
+    {
+        n = sizeof(e->piece_name) - 1;
+    }
+    memcpy(e->piece_name, name, n);
+    e->piece_name[n] = 0;
+}
+
+// A function's piece, by its C name.
+static void piece_begin_fn(Emit *e, SymId fn)
+{
+    flush(e);
+    out_fn_name(e, fn);
+    char name[96];
+    size_t n = e->len < sizeof(name) ? e->len : sizeof(name) - 1;
+    memcpy(name, e->buf, n);
+    e->len = 0;
+    piece_begin(e, name, n);
+}
+
+static void piece_end(Emit *e)
+{
+    if (!e->piece_open)
+    {
+        return;
+    }
+    flush(e);
+    e->piece_open = 0;
+    size_t n = strlen(e->piece_name) + 1;
+    if (piece_names_len + n > piece_names_cap)
+    {
+        piece_names_cap = piece_names_cap ? piece_names_cap * 2 : 4096;
+        while (piece_names_cap < piece_names_len + n)
+        {
+            piece_names_cap *= 2;
+        }
+        piece_names = realloc(piece_names, piece_names_cap);
+    }
+    if (npieces == pieces_cap)
+    {
+        pieces_cap = pieces_cap ? pieces_cap * 2 : 256;
+        pieces = realloc(pieces, pieces_cap * sizeof(Piece));
+    }
+    if (!piece_names || !pieces)
+    {
+        fprintf(stderr, "fatal: out of memory\n");
+        exit(2);
+    }
+    memcpy(piece_names + piece_names_len, e->piece_name, n);
+    pieces[npieces++] = (Piece){e->piece_at, e->mem_len, (uint32_t)piece_names_len, 0};
+    piece_names_len += n;
+}
+
+static int is_name_byte(char c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+// Keeps every piece named in kept text, from the text outside any piece (the prelude, the
+// types, the module values, the entry point that calls main) on, then writes what is kept.
+// A function only the compiler ran (a module-level value's), or that nothing calls, is not in
+// the program: the same as the machine-code backends, which link only what main reaches.
+static void keep_reached(Emit *e)
+{
+    // pieces are in output order and do not overlap; names go into a small open hash
+    size_t cap = 16;
+    while (cap < npieces * 2 + 2)
+    {
+        cap *= 2;
+    }
+    int32_t *table = malloc(cap * sizeof(int32_t)); // first piece of each name, -1: empty
+    int32_t *next = malloc((npieces + 1) * sizeof(int32_t)); // the next piece of the same name
+    if (!table || !next)
+    {
+        fprintf(stderr, "fatal: out of memory\n");
+        exit(2);
+    }
+    for (size_t k = 0; k < cap; k++)
+    {
+        table[k] = -1;
+    }
+#define NAME_HASH(p, n) (hash_bytes((p), (n), 0) & (cap - 1))
+    for (size_t k = npieces; k-- > 0;)
+    {
+        const char *nm = piece_names + pieces[k].name;
+        size_t h = NAME_HASH(nm, strlen(nm));
+        while (table[h] >= 0 && strcmp(piece_names + pieces[table[h]].name, nm) != 0)
+        {
+            h = (h + 1) & (cap - 1);
+        }
+        next[k] = table[h];
+        table[h] = (int32_t)k;
+    }
+    // (the gaps between pieces, and what follows the last one)
+    size_t *gaps = malloc((npieces + 1) * 2 * sizeof(size_t));
+    size_t ngaps = 0;
+    size_t at = 0;
+    for (size_t k = 0; k < npieces; k++)
+    {
+        gaps[ngaps++] = at;
+        gaps[ngaps++] = pieces[k].from;
+        at = pieces[k].to;
+    }
+    gaps[ngaps++] = at;
+    gaps[ngaps++] = e->mem_len;
+    // a worklist of ranges: the gaps first, then each piece as it is kept
+    size_t *work = malloc(((npieces + 1) * 2 + ngaps) * sizeof(size_t));
+    size_t nwork = 0;
+    for (size_t k = 0; k < ngaps; k++)
+    {
+        work[nwork++] = gaps[k];
+    }
+    while (nwork)
+    {
+        size_t to = work[--nwork], from = work[--nwork];
+        for (size_t i = from; i < to;)
+        {
+            if (!is_name_byte(e->mem[i]) || (i > from && is_name_byte(e->mem[i - 1])))
+            {
+                i++;
+                continue;
+            }
+            size_t j = i;
+            while (j < to && is_name_byte(e->mem[j]))
+            {
+                j++;
+            }
+            if (e->mem[i] == 'm' && j - i > 2 && e->mem[i + 1] == '_') // every piece is named m_...
+            {
+                size_t h = NAME_HASH(e->mem + i, j - i);
+                while (table[h] >= 0)
+                {
+                    const char *nm = piece_names + pieces[table[h]].name;
+                    if (strlen(nm) == j - i && memcmp(nm, e->mem + i, j - i) == 0)
+                    {
+                        for (int32_t k = table[h]; k >= 0; k = next[k])
+                        {
+                            if (!pieces[k].kept)
+                            {
+                                pieces[k].kept = 1;
+                                work[nwork++] = pieces[k].from;
+                                work[nwork++] = pieces[k].to;
+                            }
+                        }
+                        break;
+                    }
+                    h = (h + 1) & (cap - 1);
+                }
+            }
+            i = j;
+        }
+    }
+#undef NAME_HASH
+    at = 0;
+    for (size_t k = 0; k < npieces; k++)
+    {
+        fwrite(e->mem + at, 1, pieces[k].from - at, e->out);
+        if (pieces[k].kept)
+        {
+            fwrite(e->mem + pieces[k].from, 1, pieces[k].to - pieces[k].from, e->out);
+        }
+        at = pieces[k].to;
+    }
+    fwrite(e->mem + at, 1, e->mem_len - at, e->out);
+    free(table);
+    free(next);
+    free(gaps);
+    free(work);
+    free(e->mem);
+    e->mem = NULL;
+    e->mem_len = e->mem_cap = 0;
+    npieces = 0;
+    piece_names_len = 0;
 }
 
 // A struct's C name: m_<name>, or m_u<file>_<name> for one declared in another file.
@@ -374,10 +595,13 @@ static void emit_descriptors(Emit *e)
     {
         if (c_desc[t])
         {
+            snprintf(line, sizeof(line), "m_desc_%u", (unsigned)t);
+            piece_begin(e, line, strlen(line));
             PUT(e, "static __attribute__((unused)) ");
             out_struct_name(e, st);
             snprintf(line, sizeof(line), " m_desc_%u;\n", (unsigned)t);
             put(e, line);
+            piece_end(e);
         }
     }
     for (TypeId t = 0; t < c_desc_cap; t++)
@@ -388,6 +612,8 @@ static void emit_descriptors(Emit *e)
         }
         uint64_t d[4];
         sema_type_desc(t, d);
+        snprintf(line, sizeof(line), "m_desc_%u", (unsigned)t);
+        piece_begin(e, line, strlen(line)); // its member table and itself
         if (d[3] && member && type_kind(t) == T_STRUCT)
         {
             SymId s = type_ref(t);
@@ -424,6 +650,7 @@ static void emit_descriptors(Emit *e)
             snprintf(line, sizeof(line), "0 };\n");
         }
         put(e, line);
+        piece_end(e);
     }
     PUT(e, "\n");
 }
@@ -515,6 +742,7 @@ static void out_sink_name(Emit *e, SymId method)
 // write(a, b) / print(a, b): one runtime call per argument, chosen by its type. write emits
 // its arguments as they are; print puts a space between them and a newline after. With a
 // `put` (AST_F_SINK), the first argument is the `out` every byte goes to.
+static void put_c_bytes(Emit *e, const uint8_t *b, size_t n);
 static void emit_output(Emit *e, NodeId args, int newline, SymId sink)
 {
     NodeId out = 0;
@@ -547,6 +775,16 @@ static void emit_output(Emit *e, NodeId args, int newline, SymId sink)
         {
             OPEN("str"); // print separates its arguments
             PUT(e, "M_STR(\" \")), ");
+        }
+        if (type_kind(t) == T_FUNC) // a function value: its name and signature (std.md §13)
+        {
+            char text[512];
+            size_t len = sema_fn_text(e->u, type_ref(t), text, sizeof(text));
+            OPEN("str");
+            PUT(e, "M_STR(");
+            put_c_bytes(e, (const uint8_t *)text, len);
+            PUT(e, ")), ");
+            continue;
         }
         if (t == T_STR)
         {
@@ -740,6 +978,28 @@ static void emit_call(Emit *e, NodeId id)
         PUT(e, "0");
         return;
     }
+    if (sema_primitive(u, id) == PRIM_BOUND) // a(): f with the arguments its binding computed
+    {
+        out_fn_name(e, fn);
+        PUT(e, "(");
+        Unit *home = &cx.units[SYM(fn)->unit];
+        int k = SYM(fn)->owner ? 1 : 0;
+        for (NodeId p = sema_fn_params(home, fn); p; p = NEXT(home, p))
+        {
+            k++;
+        }
+        for (int i = 0; i < k; i++)
+        {
+            char num[24];
+            put(e, i ? ", " : "");
+            PUT(e, "v_");
+            out_tok(e, callee->tok);
+            snprintf(num, sizeof(num), "__b%d", i);
+            put(e, num);
+        }
+        PUT(e, ")");
+        return;
+    }
 
     out_fn_name(e, fn);
     PUT(e, "(");
@@ -837,6 +1097,52 @@ static void emit_pattern_cond(Emit *e, const Pattern *pat, TypeId type, Subject 
 // A match on a value is a GNU statement expression (clang and GCC): its value in m_s<id>, the arms
 // an if / else chain, the result in m_r<id>. A body of arms on the parameters is that chain of
 // returns. A name arm declares its name, bound to the value.
+// `a := f(x)` that the body calls as `a()`: each argument now, in a local of its own
+// (`v_a__b0`, ...), the receiver first; `a()` passes them.
+static void emit_bound_args(Emit *e, NodeId define)
+{
+    Unit *u = e->u;
+    const AstNode *n = NODE(u, define);
+    const AstNode *call = NODE(u, n->a);
+    const AstNode *callee = NODE(u, call->a);
+    SymId fn = u->refs[n->a];
+    Unit *home = &cx.units[SYM(fn)->unit];
+    char num[24];
+    int i = 0;
+    if (SYM(fn)->owner)
+    {
+        TypeId rt = type_make(T_PTR, type_make(T_STRUCT, SYM(fn)->owner));
+        out_indent(e);
+        out_type(e, rt, n->tok);
+        PUT(e, " v_");
+        out_tok(e, n->tok);
+        PUT(e, "__b0 = ");
+        if (callee->kind == AST_SELECTOR)
+        {
+            emit_as(e, callee->a, rt);
+        }
+        else
+        {
+            PUT(e, "self");
+        }
+        PUT(e, ";\n");
+        i = 1;
+    }
+    NodeId param = sema_fn_params(home, fn);
+    for (NodeId a = call->b; a && param; a = NEXT(u, a), param = NEXT(home, param), i++)
+    {
+        TypeId pt = sema_param_type(home, fn, param);
+        out_indent(e);
+        out_type(e, pt, n->tok);
+        PUT(e, " v_");
+        out_tok(e, n->tok);
+        snprintf(num, sizeof(num), "__b%d = ", i);
+        put(e, num);
+        emit_as(e, a, pt);
+        PUT(e, ";\n");
+    }
+}
+
 static void emit_stmt(Emit *e, NodeId id, TypeId ret);
 static int tail_call(Emit *e, NodeId id);
 static void emit_tail(Emit *e, NodeId call);
@@ -981,6 +1287,17 @@ static void emit_match_as(Emit *e, NodeId id, int returned)
             }
         }
         e->indent = saved;
+        if (last && tests && (m->aux & MATCH_PASS) && m->a && !returned && type != T_VOID && type != T_NONE)
+        {
+            char line[64]; // a stage: the values no arm takes go on as its value (std.md §14)
+            snprintf(line, sizeof(line), "} else { m_r%u = (", id);
+            put(e, line);
+            out_type(e, type, m->tok);
+            PUT(e, ")(");
+            out_subject(e, subj[0]);
+            PUT(e, "); }\n");
+            continue;
+        }
         put(e, last ? "}\n" : "} else ");
     }
     if (m->a && !returned)
@@ -1569,6 +1886,14 @@ static void emit_stmt(Emit *e, NodeId id, TypeId ret)
         {
             return; // the literal was emitted as a function of its own; calls name it directly
         }
+        if (type_kind(u->types[id]) == T_FUNC) // `f := double`: calls name it; `a := f(x)`: bound
+        {
+            if (NODE(u, n->a)->kind == AST_CALL)
+            {
+                emit_bound_args(e, id);
+            }
+            return;
+        }
         if (type_kind(u->types[id]) == T_ARRAY)
         {
             emit_array_local(e, id, u->types[id], n->a);
@@ -1639,6 +1964,10 @@ static void emit_stmt(Emit *e, NodeId id, TypeId ret)
         return;
     default:
         out_indent(e);
+        if (n->kind == AST_BIN_OP || n->kind == AST_UNARY_OP || n->kind == AST_IDENT || n->kind == AST_NUMBER_LIT)
+        {
+            PUT(e, "(void)"); // a value nothing takes (an arm's, in a statement): computed, dropped
+        }
         emit_expr(e, id);
         PUT(e, ";\n");
         return;
@@ -2237,6 +2566,10 @@ static void backend_c_begin(const BackendJob *job)
         {
             continue; // unsized: written as its value where it is used
         }
+        if (type == T_VOID)
+        {
+            continue; // `a := show(1)`: the compiler ran it, there is no value to hold
+        }
         if (s && sema_device_address(s)) // a device: a constant reference to its registers
         {
             char at[48];
@@ -2295,8 +2628,10 @@ static void backend_c_begin(const BackendJob *job)
         e->u = home;
         if (emittable(e, fn, 1))
         {
+            piece_begin_fn(e, fn);
             emit_signature(e, fn);
             PUT(e, ";\n");
+            piece_end(e);
         }
         e->u = u;
     }
@@ -2339,8 +2674,10 @@ static void backend_c_declare(const BackendJob *job, SymId fn)
     e->u = &cx.units[SYM(fn)->unit];
     if (emittable(e, fn, 0))
     {
+        piece_begin_fn(e, fn);
         emit_signature(e, fn);
         PUT(e, ";\n");
+        piece_end(e);
     }
     e->u = saved;
 }
@@ -2359,7 +2696,9 @@ static void backend_c_function(const BackendJob *job, SymId fn)
     emit_state.u = &cx.units[SYM(fn)->unit];
     if (emittable(&emit_state, fn, 0))
     {
+        piece_begin_fn(&emit_state, fn);
         emit_function(&emit_state, fn);
+        piece_end(&emit_state);
     }
     emit_state.u = caller;
 }
@@ -2391,6 +2730,7 @@ static int backend_c_end(const BackendJob *job)
     }
 
     flush(e);
+    keep_reached(e);
     return e->errors;
 }
 

@@ -257,9 +257,16 @@ void comptime_capture(Unit *u, SymId fn)
     }
 }
 
+static void fold_note(SymId fn, uint8_t bit);
+static int evaluating; // running a value the program asks for while compiling (not a fold) // running a value the program asks for while compiling (not a fold)
+
 static const CtFunc *function(SymId fn)
 {
     audit_comptime(fn);
+    if (evaluating)
+    {
+        fold_note(fn, FOLD_NOTE_VALUE); // for --sig: it computed a value while compiling
+    }
     CtFunc *f = ct_func(fn); // (its address stays: each is allocated on its own)
     if (f->state == 0)
     {
@@ -295,6 +302,7 @@ typedef struct
     {
         const uint8_t *at;
         size_t n;
+        const void *from; // the literal it was made from: made once, read only
     } blocks[64]; // strings made at compile time (their address is a value)
     int nblocks;
 } Vm;
@@ -419,6 +427,45 @@ struct CtFrame
     const CtFunc *f;
     size_t fp, k; // its frame, and the call it is at
 };
+
+// One write of the program, made by the compiler (its stdout), in the program's format: the same
+// text the program would print. Returns 0 for a string it does not hold.
+static int ct_write(const Vm *vm, uint8_t sub, uint64_t v)
+{
+    char num[24];
+    int n;
+    switch (sub)
+    {
+    case MW_STR:
+    {
+        for (int b = 0; b < vm->nblocks; b++)
+        {
+            if ((uint64_t)(uintptr_t)vm->blocks[b].at == v)
+            {
+                fwrite(vm->blocks[b].at + 8, 1, vm->blocks[b].n, stdout);
+                return 1;
+            }
+        }
+        return 0;
+    }
+    case MW_BOOL:
+        fputs(v ? "true" : "false", stdout);
+        return 1;
+    case MW_UINT:
+        n = snprintf(num, sizeof(num), "%llu", (unsigned long long)v);
+        break;
+    case MW_INT:
+        n = snprintf(num, sizeof(num), "%lld", (long long)v);
+        break;
+    case MW_BYTE:
+        fputc((int)(uint8_t)v, stdout);
+        return 1;
+    default:
+        return 0;
+    }
+    fwrite(num, 1, (size_t)n, stdout);
+    return 1;
+}
 
 static int run(Vm *vm, SymId sym, const CtFunc *f, size_t fp)
 {
@@ -595,6 +642,16 @@ static int run(Vm *vm, SymId sym, const CtFunc *f, size_t fp)
         case MIR_STR:
         {
             const MirString *str = &f->strings[in->imm];
+            int again = -1; // a literal made before (a loop): the same block, strings are read only
+            for (int b = 0; b < vm->nblocks && again < 0; b++)
+            {
+                again = vm->blocks[b].from == (const void *)str ? b : -1;
+            }
+            if (again >= 0)
+            {
+                s[in->d] = (uint64_t)(uintptr_t)vm->blocks[again].at;
+                break;
+            }
             if (vm->nblocks == 64)
             {
                 return stop(vm, sym, "makes more strings than the compiler keeps");
@@ -604,6 +661,7 @@ static int run(Vm *vm, SymId sym, const CtFunc *f, size_t fp)
             memcpy(b, &len, 8);
             memcpy(b + 8, str->bytes, str->len);
             vm->blocks[vm->nblocks].at = b;
+            vm->blocks[vm->nblocks].from = str;
             vm->blocks[vm->nblocks++].n = str->len;
             s[in->d] = (uint64_t)(uintptr_t)b;
             break;
@@ -619,7 +677,18 @@ static int run(Vm *vm, SymId sym, const CtFunc *f, size_t fp)
             break;
         }
         case MIR_WRITE:
-            return stop(vm, sym, "prints (it runs only in the program)");
+            // From a compile-time position (a module-level value or statement), output goes to
+            // the compiler's own: the build prints it, the program does not. A fold (the
+            // optimizer computing a call of the program) never prints: the call stays.
+            if (!evaluating)
+            {
+                return stop(vm, sym, "prints (it runs only in the program)");
+            }
+            if (!ct_write(vm, in->sub, s[in->a]))
+            {
+                return stop(vm, sym, "prints a string the compiler does not hold");
+            }
+            break;
         case MIR_GLOAD:
         case MIR_GSTORE:
         case MIR_GADDR:
@@ -717,7 +786,17 @@ static void vm_ready(Vm *vm, const Unit *u)
 
 // Runs `expr` of `type` in the compiler; its value is in vm->stack from slot 0. 0: it could not
 // be run, and *why (or vm->why) says why.
+static int evaluate_value(Vm *vm, Unit *u, NodeId expr, TypeId type, SymId s, const char **why);
 static int evaluate(Vm *vm, Unit *u, NodeId expr, TypeId type, SymId s, const char **why)
+{
+    int outer = evaluating;
+    evaluating = 1;
+    int ok = evaluate_value(vm, u, expr, type, s, why);
+    evaluating = outer;
+    return ok;
+}
+
+static int evaluate_value(Vm *vm, Unit *u, NodeId expr, TypeId type, SymId s, const char **why)
 {
     MirFunc f;
     *why = NULL;
@@ -907,6 +986,11 @@ void comptime_unit(Unit *u)
         }
         TypeId type = sema_value_type(u, s);
         const Token *name = TOK(u, n->tok);
+        if (type == T_VOID && NODE(u, init)->kind == AST_CALL)
+        {
+            statement(&vm, u, init); // no value: it runs here for what it does (its output, its asserts)
+            continue;
+        }
         if (type == T_INT_LIT)
         {
             continue; // unsized: its exact value is the checker's (sema_unsized_value)
@@ -1065,6 +1149,37 @@ int comptime_param_slots(SymId fn)
     return g->state == 1 && g->ret_slots <= 1 && g->params <= FOLD_ARGS ? (int)g->params : -1;
 }
 
+// What the folds of each function came to, for --sig: FOLD_NOTE_* bits, by symbol.
+static uint8_t *fold_notes;
+static size_t fold_notes_cap;
+
+static void fold_note(SymId fn, uint8_t bit)
+{
+    if (fn >= fold_notes_cap)
+    {
+        size_t cap = fold_notes_cap ? fold_notes_cap : 256;
+        while (cap <= fn)
+        {
+            cap *= 2;
+        }
+        uint8_t *grown = (uint8_t *)arena_alloc(cap);
+        memset(grown, 0, cap);
+        if (fold_notes)
+        {
+            memcpy(grown, fold_notes, fold_notes_cap);
+        }
+        fold_notes = grown;
+        fold_notes_cap = cap;
+    }
+    fold_notes[fn] |= bit;
+}
+
+int comptime_fold_notes(SymId fn, uint32_t *budget)
+{
+    *budget = FOLD_STEPS;
+    return fn < fold_notes_cap ? fold_notes[fn] : 0;
+}
+
 int comptime_fold_call(SymId fn, const uint64_t *args, uint32_t nargs, uint64_t *result, uint32_t *nresult)
 {
     if (comptime_param_slots(fn) != (int)nargs)
@@ -1100,12 +1215,16 @@ int comptime_fold_call(SymId fn, const uint64_t *args, uint32_t nargs, uint64_t 
     memcpy(vm->stack, args, nargs * sizeof(uint64_t));
     // the callees it reaches are lowered as it runs: nested, like the function itself
     int nested = mir_nest_begin();
+    int outer = evaluating;
+    evaluating = 0; // a fold computes a call of the program: its output stays the program's
     int ok = nested && run(vm, fn, g, 0);
+    evaluating = outer;
     if (nested)
     {
         mir_nest_end();
     }
     fold_steps += vm->steps;
+    fold_note(fn, ok ? FOLD_NOTE_DONE : vm->steps >= vm->max_steps ? FOLD_NOTE_BUDGET : FOLD_NOTE_REFUSED);
     *m = (Fold){.fn = fn, .nargs = nargs, .ok = (uint8_t)ok, .nresult = (uint8_t)g->ret_slots,
                 .result = vm->stack[0]};
     memcpy(m->args, args, nargs * sizeof(uint64_t));

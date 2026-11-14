@@ -1074,7 +1074,44 @@ void contract_print(void)
                 header = 1;
             }
             char why[160];
-            sig_line("  ", ast.sig_str(u, s->decl, sig, sizeof(sig)), sema_fn_kind(id, why, sizeof(why)));
+            if (sema_is_generic(id))
+            {
+                sig_line("  ", ast.sig_str(u, s->decl, sig, sizeof(sig)), "generic: made once per type, below");
+                continue;
+            }
+            if (sema_spec_index(id)) // a specialization: its own types, as made
+            {
+                size_t k = sema_fn_text(u, id, sig, sizeof(sig));
+                (void)k;
+                memmove(sig + 2, sig + 9, strlen(sig + 9) + 1); // `function ` -> `  ` (indented under it)
+                sig[0] = sig[1] = ' ';
+            }
+            else
+            {
+                ast.sig_str(u, s->decl, sig, sizeof(sig));
+            }
+            sig_line("  ", sig, sema_fn_kind(id, why, sizeof(why)));
+            uint32_t budget;
+            int notes = comptime_fold_notes(id, &budget);
+            if (notes & FOLD_NOTE_VALUE)
+            {
+                printf("      ran while compiling, for a value the program uses (a module-level binding, a type, ...)\n");
+            }
+            if (notes & FOLD_NOTE_DONE)
+            {
+                printf("      a call with known arguments was computed while compiling\n");
+            }
+            if (notes & FOLD_NOTE_BUDGET)
+            {
+                printf("      a call with known arguments is left to run time: it takes more than %u steps, "
+                       "the limit for computing one while compiling\n",
+                       budget);
+            }
+            if (notes & FOLD_NOTE_REFUSED)
+            {
+                printf("      a call with known arguments is left to run time: it does what only the running "
+                       "program can (see its kind)\n");
+            }
         }
         if (header)
         {
