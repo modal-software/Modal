@@ -2270,6 +2270,248 @@ that (comptime.md updated).
 - Not yet: `--cache` skips checking an unchanged file, and so its compile-time output.
 - Tests 389 ok; fuzz 0 differ.
 
+## 53. Pipe stages: `value.(arms)`, `value.(f)`
+
+Plan Phase D1, first of guards.md §5's build order (std.md §14).
+- **Parser** (parse_expr.c `led_stage`): `.(` on anything but an import chain. Arms
+  (`arm_at`) are read by `parse_stage_arms` (parse_stmt.c) into an AST_MATCH with
+  `MATCH_STAGE | MATCH_PARTIAL` and the number of arms opened in aux bits 8..15
+  (`MATCH_OPEN`). A later arms stage on a stage match adds its arms to it (a new contiguous
+  list, `node_list_push` of the old and the new). A stage without a pattern
+  (`stage_continue`): a name alone becomes `AST_CALL(name, value)`; anything else a match of
+  the value with one `_` arm (a sequence), on the arm opened last, or on the value before any
+  arm. A chain on its own line is a statement (`stage_statement`: MATCH_STATEMENT).
+- **Check:** a partial stage reports no missing values; a value stage that leaves some needs
+  them to fit the arms' type (`MATCH_PASS`).
+- **MIR:** a `miss` label for the last arm and the search's gaps: the subject is copied into
+  the result. **C:** `} else { m_rN = (T)(m_sN_0); }`. A value no statement takes is
+  `(void)` in C (an arm's `n + 1` in a statement).
+- Also: arms.modal's second `loop` (outside the `-{ }-` comment) is commented, so the file
+  compiles; the compile-time print checks moved to run/compile_print (the owner changed
+  compiled_value to call loop at run time).
+- Example run/pipes (+ .expected), errors/pipes, errors/pipes_open. Same on C, native,
+  `MODAL_REGS=0`, x86-64. Tests 396 ok; fuzz 0 differ; bench unchanged (structs 2864 B, big
+  emit 33.5 ms).
+
+## 54. Errors: `error`, `, error`, `n, e :=`, going up
+
+guards.md §5, steps 2 and 3 of its build order (names on the left need errors to mean
+anything, so they were built together).
+- **`error`** is a primitive type (`T_ERROR`, types.h): one word (MV_U64, 8 bytes, `uint64_t` in C),
+  nil is 0 (`fits(T_NIL, T_ERROR)`; `const_value` reads `nil` as 0 for an error, so `nil:` is a
+  pattern). `bad_input: error` at module level is an error of the program: comptime_unit gives it
+  its symbol's number (`known`), so patterns, the lowering and C fold it as a constant.
+- **Saying it can fail:** `parse(...): u64, error` (parse_decl.c: `SIG_FAILS` in the signature
+  node's aux; type last only). `sema_fn_fails`. `check(...): error` (an error alone) is an
+  ordinary result, and a call to it alone on a line sends its error up.
+- **Check:** `return bad_input` in a function that fails (`check_return`). A call to a function
+  that fails, not bound with a second name (`Check.handled`), needs the function around it to
+  fail too, or to give an error (`error_goes_up`, a message saying both fixes). `n, e := f()`
+  (parse_define: the second name's token in `b`; `local_decl_at` leaves `n, e :=` alone) pushes n
+  (f's value) and e (error); a second name on a call that cannot fail is e = nil, on a call that
+  gives only an error an error. An e no later token names (`mentioned_later`) is
+  `DEFINE_UNREAD`.
+- **MIR:** a function that fails returns its value then its error (`ret_slots + 1`; never
+  inlined for now, `struct_abi`). `lower_return` writes value and 0, or zero and the error.
+  `finish_call` copies both out of the window; unless the binding takes it
+  (`L.handled_call`), `error_up` returns it when not nil. `DEFINE_UNREAD`: a trap
+  `path:line:col: panic.unhandled: the error in 'h' is not handled` (a trap code in -o binaries).
+- **C:** one `m_res_N { v; e; }` per value type (`emit_res_type`, before the prototypes and in
+  `declare`), so a call returns the very type of its caller; `return (m_res_N){ .v, .e }`; a call
+  whose error goes up is `({ m_res_N t = f(); if (t.e) return (m_res_M){ .e = t.e }; t.v; })`; a
+  binding unpacks `.v` and `.e`. No musttail through these (a struct result).
+- Not yet: panics as errors (division and the rest still stop the program: step 5), type
+  patterns `u64:` / `error:` (step 4), the inferred sets in `--sig` (step 6), a struct value with
+  its error, printing an error, errors at module level.
+- Example run/errors (+ .expected), errors/errors (4 checks). Same on C, native,
+  `MODAL_REGS=0`, x86-64, the ELF runs. Tests 400 ok (the owner's new pipes.modal output waits
+  for its .expected); fuzz 0 differ; bench unchanged (structs 2864 B, big emit 33.5 ms).
+
+## 55. Stages on a call that can fail: `u64:`, `error:`, error names
+
+guards.md §5 step 4.
+- **Check** (`check_error_match`, chosen in check_expr when a stage's value is a call to a
+  function that fails, `call_fails`): the stage takes the call's error (`Check.handled`). Each arm
+  has one pattern, read by `sema_error_arm`: `_` (everything), `error` (any error), an error's
+  name or `nil` (that error), a primitive type name (the value's type: no error; another type is an
+  error), anything else a pattern of the value (no error, and it matches). A function named as an
+  arm's result is given the value (`u64: double`: one parameter that the value fits; its result is
+  the arm's). No arm for errors: they go up (`error_goes_up`), unless `n, e :=` binds the stage.
+  No arm for values: the value goes on (MATCH_PASS; it must fit the arms).
+- **MIR** (`lower_error_match`): value and error in temps; per arm a JZ/JNZ on the error, a
+  compare with the error's number (`miss_if`), or the value's pattern; what no arm took: the
+  error up (`error_up`), the value into the result. Bound by `n, e :=`, the error goes to the
+  binding (`L.handled_error`). **C** (`emit_error_match`): a statement expression over the
+  call's `m_res`; bound by `n, e :=` it gives an `m_res` of the stage's type.
+- `print` named in an arm is not given the value (a std binding, not a Modal function).
+- Example run/error_stages (+ .expected), errors/error_stages (3). Same on C, native,
+  `MODAL_REGS=0`, x86-64, the ELF runs. Tests 403 ok (run/errors and run/pipes: the owner's
+  edits, their .expected wait); fuzz 0 differ; bench unchanged.
+
+## 56. Panics come back to `n, e := f()`
+
+guards.md §5 step 5: bugs are errors with numbers of their own, and a call bound with its error
+is a boundary.
+- **Numbers:** `PANIC_DIVISION` .. `PANIC_STACK` (1..7, cx.h); std/panic.modal names them
+  (`panic.division`, `panic.index`, `panic.assert`, `panic.anytype`, `panic.unhandled`,
+  `panic.raised`, `panic.stack`), bound in std/mod.modal as `panic := import("./panic")`. A
+  program's errors are numbered from `ERROR_FIRST` (16) on. `error_number` (comptime.c) gives
+  std's their fixed numbers, and `sema_comptime_value` computes an error's number on demand
+  (an imported file's values are not computed until it is checked).
+- **Patterns** `panic.division:` (parse_stmt.c: `name.name` is a PAT_NAME over an AST_SELECTOR;
+  `const_value` and `sema_error_arm` read a module's constant). `panic("why")` is the trap
+  primitive (also through `panic := import("std").panic`, a module that is called).
+- **MIR:** every MIR_TRAP carries its panic's number (imm; std's assert gives panic.assert).
+  `n, e := f()` on a call is MIR_CALL `MIR_CALL_GUARD` (var: value slots << 1 | f fails;
+  never inlined, never folded). Its error slot is the window slot after the value.
+- **Native:** stencil `guarded_call`. clang has no `__builtin_setjmp` on aarch64, so the call runs
+  inside an asm block that first saves the callee-saved registers, the stack pointer and the
+  resume point into a 15-word buffer on the stencil's frame (`c->jb`; x86-64 steps over the red
+  zone and aligns the stack); `rt_trap` restores them and jumps back when `c->jb` is set, the
+  panic's number in jb[14]; the stencil zeroes the value and writes the number as the error.
+  The number travels in the top byte of the message's length word (`MirString.panic`), so a trap
+  site has no instruction more; `rt_trap_part` says nothing while a boundary waits. stencilgen
+  re-aims an `adr` inside a stencil when the compact form moves code. Register mode emits the
+  same stencil (it keeps f and c in x0/x1; values held across the call are restored with the
+  registers).
+- **C:** `setjmp`/`longjmp` from <setjmp.h> (`m_jb`, `m_panic`, `m_trap_k(k, msg)`); the
+  boundary unpacks the value and error, or zero and `m_panic`.
+- **The compiler:** `CtFrame.guard`; a trap unwinds the interpreter's frames to the nearest one
+  (`safe := catches(0)` is computed with the panic caught).
+- Measured: `make bench` code +4 B once per program with a trap (the runtime masks the length
+  word), RAM unchanged (Ctx gains one pointer, within the frame's rounding), big emit 33–34 ms.
+  Fuzz 0 differ (scalar, `MODAL_REGS=0`, struct).
+- Example run/panics (+ .expected). Same on C, native, `MODAL_REGS=0`, x86-64, the ELF runs.
+  Tests 404 ok.
+- Not yet: the inferred sets (step 6: a boundary whose call can neither fail nor panic stays a
+  guarded call; `if e` needs `_`), panic.stack (the stack guard), `print(e)`.
+
+## 57. Error sets: inferred, in `--sig`, checked by `if e`, and boundaries that are not needed
+
+guards.md §5 step 6.
+- **Facts while checking** (check.c, "error sets"): per function, the panics the checker cannot
+  prove away (a divisor that is not a nonzero constant nor an arm's nonzero name; an index
+  without `INDEX_SAFE` nor a constant in range; a []u8 index; `trap`/`panic` (std's assert:
+  panic.assert); `T(a)` on an *any; an `e` no line reads, when its call can raise something), the
+  errors it returns (`return bad_input`: its number; a variable: "an error it holds"), and per
+  call an edge: its errors go up (not bound with `, e`, or a stage that leaves some) and its
+  panics go up (not a boundary). Kept in malloc'd tables (2 bytes a symbol, 12 a call), not the
+  arena: a first version with a record per symbol in the arena took big from 41.8 to 53.4 MB.
+- **Sets** (`sema_error_set`): the closure, a fixed point over the edges, recomputed only when
+  facts were added; the errors walk only the error edges. "Whole" when every function reached
+  was checked.
+- **`--sig`:** `errors: bad_input, too_big, panic.division` under a function, and `, error` in
+  its signature.
+- **`if e { ... }`** on `n, e := f()` (`Local.err_of`) with no `_`: checked at the end
+  (`sema_errors_finish`, after every file is checked, from `modules_link`) against f's set plus
+  nil: "'serve' can also give too_big, panic.division: add arms for them, or end with `_`" (an
+  error for a value, a warning for a statement; "not known here" when the set is not whole, a
+  warning under `--cache`). What the arms take and the place are copied when the match is
+  checked: a body's nodes and tokens are gone by the end.
+- **No boundary that is not needed:** `n, e := f()` with f whole and raising nothing is an
+  ordinary call (`raises_nothing` in the lowering), with the warning "'e' is always nil".
+- Measured: big check 20.7–20.9 ms (20.2–20.7 before), memory 41.85 MB (RSS +1.4 MB: the
+  tables), code unchanged. Fuzz 0 differ. ASan clean on the examples.
+- Example run/error_sets (+ .expected), errors/error_sets (2 checks), a `--sig` check.
+
+## 58. Bodies are checked callees first
+
+The owner asked for it before guards.md §5 step 7, after measuring what declaration order cost:
+a function written below its caller was neither inlined (100M calls: 0.04 s above, 0.30 s
+below) nor known to raise nothing (a boundary kept: +1.4 ns a call, +32% in a loop).
+- `check_order` (check.c), before the bodies of a file are checked: the calls of each function
+  are read from its text (a body not parsed yet is one TOK_BODY token; `memchr` for each `(`,
+  then the identifier before it; one in a string or a comment only adds an edge, which can only
+  move a function earlier), looked up in one table of the file's functions by the hash of their
+  names, and a depth-first walk places callees before callers. A cycle keeps its written order.
+  `MODAL_ORDER=0` checks as written (for measuring).
+- Effects: `add` below its loop is inlined (0.30 → 0.04 s) and `n, e := add(...)` has no boundary
+  (the "always nil" warning); examples/budget/deep.modal needs 608 bytes instead of 672 (c is
+  inlined into b: 2 nested calls instead of 3; its expected message updated).
+- Cost (A/B with `MODAL_ORDER=0`, big: 54,000 functions, 3.4 MB): check 10.0 → 12.1 ms, total
+  20.9 → 23.1 ms; 1.2 ms of it the name lookups, 0.8 ms the scan. A first version scanning byte
+  by byte took 4.3 ms. Code sizes of the bench programs unchanged.
+- Within a file only: files are still checked in the order they are loaded.
+- Tests 412 ok (errors/order); fuzz 0 differ (scalar, `MODAL_REGS=0`, struct).
+
+## 59. The arena on an error, decided by the compiler
+
+guards.md §5 step 7, the last one. No garbage collector and nothing written: at a boundary
+`n, e := f(...)` whose call takes the `arena` context (an argument named like its struct), the
+checker decides (`arena_decision`) whether an error gives the arena back:
+- yes when nothing the call allocates can stay reachable after it: its value holds no reference
+  (a number, a bool, an error, nothing), no other argument is a reference (contexts aside, such
+  as `out`), and neither f nor a function it calls uses a mutable module variable (`EF_GLOBALS`
+  in the error facts, noted in `note_global`, closed over every call: `EE_CALLS`);
+- no otherwise, with the reason; also "not known here yet" when f's set is not whole.
+- `DEFINE_ROLLBACK`: before the call the arena struct is copied into the frame (`copy_fields`
+  into a block of the frame, MIR; `m_T m_snapN = *arena;` in C), and when e is not nil it is
+  copied back. A success keeps what the call allocated.
+- `--audit` lists every boundary: "'build': on an error the arena goes back to where it was at
+  the call", or "'count': the arena keeps what it allocated on an error: it, or a function it
+  calls, uses a mutable module variable, which could keep what it allocates".
+- The arena is the program's struct (`used`, `allocs`): the copy puts back all of it.
+- Example run/arena_errors (+ .expected; an error, a panic, a kept one), 2 audit checks. Same on C,
+  native, `MODAL_REGS=0`, x86-64, the ELF runs. Tests 419 ok; fuzz 0 differ; bench unchanged.
+- guards.md §5 is built (steps 1-7).
+
+## 60. Function literals: captures, `: T`, and a pattern alone as a parameter
+
+Plan Phase D1, its literal items.
+- **Captures** (lambda lifting, no closure object): a literal that reads locals of the function
+  around it (`note_capture` in find_name, check.c) takes them as parameters of its own after the
+  ones it declares (`sema_captures`), and every call passes the caller's locals of those names
+  (lower_call; C: extra `v_name` arguments and parameters). A literal is only called (never
+  passed nor returned), so a call always sees them, with the values they have then. A capture is
+  read, never assigned (an error that says to pass it, or return the new value), and one slot (a
+  number, a bool, a []u8, an error, a reference; a struct: an error for now). A small literal is
+  inlined as any function: 100M calls of a capturing literal in a loop, 0.06 s. C makes no
+  musttail into or out of a literal with captures (their prototypes differ: found by
+  errors/closure.modal, which runs now and gives 3).
+- **`(k: u64): k * limit`** (the owner): one line after `:`, its value the result, whose type is
+  the expression's (`fn_ret_type` reads the body's type once it is checked; nothing, for
+  `(x: u64): print(x)`). `:` then a type then `{` is the result type instead (`lit_result_type_at`).
+- **`(x: u64): u64 { ... }`**: a literal's result may be written after `:`, as a function's
+  (`(x: u64) u64 { }` still works). `(...):` is a literal only when the type is followed by `{` on
+  the line, so an arm `(0, _): acc` is not one.
+- **A pattern alone as a parameter**, `small := (0..10) { ... }`: the literal waits for its first
+  call (`PendingLit`), whose argument gives the parameter its type (`u->types[param]`, read by
+  `param_type` and `sema_pattern_of`); its body is checked then, seeing the locals that were
+  there where it is written. A call the pattern does not take does nothing. An unsized argument
+  makes it an int (a later u64 is an error: "argument 1 of 'small' is u64, but it takes int").
+  A literal never called is never checked.
+- Old tests changed with the rule: "a closure is reported" now runs errors/closure.modal; the lazy
+  check (reported only when called) uses a struct-valued match in errors/lazy/util.modal.
+- Example run/closures (+ .expected), errors/closures (3). Same on C, native, `MODAL_REGS=0`,
+  x86-64, the ELF runs. Tests 425 ok; fuzz 0 differ; bench unchanged.
+- Not yet: `john.map(x: x.id)` (arms passed to calls: the owner's two open points), captures
+  through two levels of literals, a struct captured.
+
+## 61. Functions given while compiling: `f: function(T): U`, `x: x * 2`
+
+Plan Phase D1, the first step toward `john.map(x: x.id)` (the owner: an arm passed to a call binds
+the element's name; functions passed by specialization, never a pointer at run time).
+- **The type** `function(T, U): R` (parse_decl.c, AST_TYPE_FUNC). Written in the generic, not
+  inferred from its body: a body's nodes are gone once it is generated, and a specialization is
+  checked in its turn, after the caller's body; the literal given must be typed and made at the
+  call, while the caller is there. The signature also says what the function needs.
+- **The argument** `x: x * 2` in a call (led_call): a literal of one parameter of no type and a
+  one-line body. Its parameter takes the signature's type, the type parameters bound as the call
+  binds them (`function_argument`: a temporary Spec), and it is checked at once. A function by
+  name, an import binding to one, or a literal bound to a local work too. The given function's
+  parameters and result must be the signature's (each an error that says which).
+- **Specialization:** a `function(...)` parameter is known while compiling (`function_params`,
+  `Spec.is_value` 2, the value the given function's symbol); in the specialization its type is
+  `T_FUNC` of that function (`param_type`), so `f(v)` is a direct call. It takes no slot and is
+  not passed (lowering, C), so `each(n + 1, to, f)` makes no new specialization.
+- **A literal checked twice** (the arguments are checked again after the specialization is
+  chosen) gives the same symbol (`AST_FN_LIT` with refs set).
+- Not yet: a literal given that reads the caller's locals (an error: it would need the
+  specialization to pass them); `print(f)`.
+- Example run/functions (+ .expected: `apply` with a literal, a name, u8, a local literal; `each`
+  calling `i: print("item", i)`), errors/functions (3). Same on C, native, `MODAL_REGS=0`,
+  x86-64, the ELF runs. Tests 433 ok; fuzz 0 differ; bench unchanged.
+
 ## Appendix A. The owner's original specification inputs
 
 These are the inputs the design started from, as the owner wrote them. Where the

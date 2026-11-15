@@ -146,7 +146,6 @@ Go's form, Zig's inference, Erlang's supervision; no keyword, no operator, no ga
 
 ```
 print := import("std").io.print
-error := import("std").error
 panic := import("std").panic
 
 bad_input: error                       -- an error of the program: a name, one word at run time
@@ -176,7 +175,7 @@ main(): u8 {
 }
 ```
 
-- **`error`** (std): one word, the error's number and the place it was made; `nil` (0) is ok.
+- **`error`** (a primitive type, like `u64`: no import): one word, the error's number and the place it was made; `nil` (0) is ok.
   A program's errors are module-level `name: error`; their numbers are the compiler's.
 - **Saying it can fail:** a function that returns an error, or lets one go up, has `, error` in
   its result (`f(...): T, error`, or `f(...): error` with no value), always type last. Which
@@ -204,10 +203,10 @@ main(): u8 {
   boundary a few stores in, one out; nothing at panic sites; a boundary whose call cannot
   fail is removed (a warning says `e` is always nil).
 - **Build order** (pipe ops first: the error forms are written with them):
-  1. pipe ops (plan Phase D1): `x.(f)`, `x.(arms)`, chains, rule 1 (a), partial stages;
-  2. names on the left (`a, b :=`);
-  3. errors returned and propagated (`, error`, `return bad_input`);
-  4. type patterns (`u64:`, `error:`) and error names in arms;
-  5. the boundary on native and C, `panic` replacing `trap`, `panic.unhandled`;
-  6. the inferred sets in `--sig`;
-  7. the arena decision by the usage-analysis pass.
+  1. ~~pipe ops (plan Phase D1): `x.(f)`, `x.(arms)`, chains, rule 1 (a), partial stages~~ (§53);
+  2. ~~names on the left (`a, b :=`)~~ (context.md §54);
+  3. ~~errors returned and propagated (`, error`, `return bad_input`)~~ (§54);
+  4. ~~type patterns (`u64:`, `error:`) and error names in arms~~ (context.md §55);
+  5. ~~the boundary on native and C, `panic` replacing `trap`, `panic.unhandled`~~ (context.md §56);
+  6. ~~the inferred sets in `--sig`~~ (context.md §57: also `if e` checked against them, and boundaries removed);
+  7. ~~the arena decision by the usage-analysis pass~~ (context.md §59). All of §5 is built.

@@ -12,9 +12,9 @@ unused(n: u8): u8 {
     return n + 1
 }
 
+pt: struct { u8 x, u8 y }
+
 lambda_user(n: u8): u8 {
-    f := (x: u8) u8 {
-        return x + n
-    }
-    return f(n)
+    p := if n { 0: pt{ x: 1, y: 2 }, _: pt{ x: n, y: n } }
+    return p.x
 }

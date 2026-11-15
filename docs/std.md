@@ -468,3 +468,29 @@ decides**, the arguments are computed **at the binding**, and `print(a)` shows t
 - **Not yet:** a function value passed to or returned from a function (a table of handlers),
   which needs addresses at run time (comptime.md: run time only); `a(more)` adding arguments; a
   std `function` struct read field by field (as `type`).
+
+## 14. Pipe stages (built, context.md §53)
+
+The owner's notes in run/arms.modal and decisions (2026-11-14). No word, no operator: `.(`.
+
+```
+word := c.(48..57: "a digit", _: "not a digit")   -- a match as a stage
+x := u64(5).(double).(double)                     -- x.(f) is f(x): 20
+n.(0..10: n + 1).(seven()).(print).(_: print("big"))
+```
+
+- **A stage of arms** is a match on the value before it.
+- **Every pattern stage of a chain tests the chain's head** (rule 1, option a): the arms of
+  later stages are arms of the same match, alternatives to the first ones ("parallel" in the
+  owner's words: never concurrency). `n.(0..10: a).(_: b)` is `if n { 0..10: a, _: b }`.
+- **A stage without a pattern continues the arm opened last.** A name alone is a function
+  given the value (`.(print)`); anything else runs after it and its value goes on
+  (`.(seven())`). Before any arm it applies to the value itself. After a stage of several
+  arms it is an error (which arm?): put it inside the arm. A match on an intermediate value
+  goes inside the function, by convention, or in a nested chain (`f(n).(0: ..., _: ...)`).
+- **A stage is partial:** what no arm takes goes on, as the stage's value (it must fit the
+  arms' type, or end with `_`), or nothing for a statement. `if value { arms }` stays
+  exhaustive.
+- **Cost:** the same AST_MATCH as `if` (tables, searches); a value that goes on is one copy.
+- **Not yet:** type patterns (`u64:`, `error:`) and error names, with guards.md §5; arms in
+  function literals passed to calls (`john.map(x: x.id)`).

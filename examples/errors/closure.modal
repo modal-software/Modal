@@ -1,3 +1,4 @@
+-- a literal that reads a local of its function (k): it takes k as a parameter of its own (context.md §60)
 f(k: u8): u8 {
     add := (x: u8) u8 {
         return x + k
