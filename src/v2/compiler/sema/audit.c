@@ -49,6 +49,8 @@ static struct
     size_t nlowered, clowered;
     SymId *ran; // functions the compiler ran (module-level values, asserts)
     size_t nran, cran;
+    char **bounds; // "path:line:col: ..." per boundary (guards.md §5): what an error gives back
+    size_t nbounds, cbounds;
 } A;
 
 #define PUSH(arr, n, cap, value)                                                                   \
@@ -92,6 +94,20 @@ void audit_call(SymId from, SymId to)
         }
     }
     PUSH(A.edges, A.nedges, A.cedges, ((Edge){from, to}));
+}
+
+void audit_boundary(Unit *u, uint32_t tok, const char *text)
+{
+    if (!cx.audit)
+    {
+        return;
+    }
+    int line, col;
+    source_pos(u->src, TSTART(TOK(u, tok)), &line, &col);
+    char buf[700];
+    snprintf(buf, sizeof(buf), "%s:%d:%d: %s", u->path, line, col, text);
+    char *copy = strdup(buf);
+    PUSH(A.bounds, A.nbounds, A.cbounds, copy);
 }
 
 void audit_comptime(SymId fn)
@@ -401,6 +417,17 @@ void audit_print(void)
         printf(")\n");
     }
     if (!nstops)
+    {
+        printf("  none\n");
+    }
+
+    // 3b. Boundaries: `n, e := f()`, and whether an error gives the arena back.
+    printf("boundaries (n, e := f(): a panic below comes back; the arena on an error)\n");
+    for (size_t i = 0; i < A.nbounds; i++)
+    {
+        printf("  %s\n", A.bounds[i]);
+    }
+    if (!A.nbounds)
     {
         printf("  none\n");
     }

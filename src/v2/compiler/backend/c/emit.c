@@ -36,6 +36,7 @@ typedef struct
     // (keep_reached). A piece is a prototype, a function or a type descriptor, by its C name.
     char *mem;
     size_t mem_len, mem_cap;
+    NodeId handled; // `n, e := f()`: the call whose result the binding unpacks
     int piece_open; // a piece is being written: started at piece_at
     size_t piece_at;
     char piece_name[96];
@@ -225,6 +226,103 @@ static void out_fn_name(Emit *e, SymId fn)
             }
         }
     }
+}
+
+// ---- errors (guards.md §5) ---------------------------------------------------------------------
+//
+// A function that says `, error` returns `m_res_N` (N: its value's type), `{ v, e }`; one per type,
+// so a call returns the very type its caller returns.
+static uint8_t *res_emitted;
+static size_t res_cap;
+
+static void out_res_name(Emit *e, TypeId t)
+{
+    char name[32];
+    snprintf(name, sizeof(name), "m_res_%u", (unsigned)t);
+    put(e, name);
+}
+
+static void out_type(Emit *e, TypeId t, uint32_t at);
+static void emit_res_type(Emit *e, TypeId t)
+{
+    if (t >= res_cap)
+    {
+        size_t cap = res_cap ? res_cap : 64;
+        while (cap <= t)
+        {
+            cap *= 2;
+        }
+        uint8_t *grown = calloc(cap, 1);
+        if (res_emitted)
+        {
+            memcpy(grown, res_emitted, res_cap);
+            free(res_emitted);
+        }
+        res_emitted = grown;
+        res_cap = cap;
+    }
+    if (res_emitted[t])
+    {
+        return;
+    }
+    res_emitted[t] = 1;
+    PUT(e, "typedef struct { ");
+    if (t != T_VOID)
+    {
+        out_type(e, t, 0);
+        PUT(e, " v; ");
+    }
+    PUT(e, "uint64_t e; } ");
+    out_res_name(e, t);
+    PUT(e, ";\n");
+}
+
+// `return` of the function being written, when it says `, error`: the value with no error, or an
+// error and no value.
+static void emit_as(Emit *e, NodeId id, TypeId want);
+static void emit_fail_return(Emit *e, NodeId value, TypeId ret)
+{
+    PUT(e, "return (");
+    out_res_name(e, ret);
+    PUT(e, "){ ");
+    if (value && e->u->types[value] == T_ERROR && ret != T_ERROR)
+    {
+        PUT(e, ".e = ");
+        emit_as(e, value, T_ERROR);
+    }
+    else
+    {
+        if (value && ret != T_VOID)
+        {
+            PUT(e, ".v = ");
+            emit_as(e, value, ret);
+            PUT(e, ", ");
+        }
+        PUT(e, ".e = 0");
+    }
+    PUT(e, " };\n");
+}
+
+// An error not handled here (`err`, a C expression): this function returns it.
+static void emit_error_up(Emit *e, const char *err)
+{
+    TypeId ret = e->fn ? sema_fn_ret(&cx.units[SYM(e->fn)->unit], e->fn) : T_VOID;
+    PUT(e, "if (");
+    put(e, err);
+    PUT(e, ") return ");
+    if (e->fn && sema_fn_fails(e->fn))
+    {
+        PUT(e, "(");
+        out_res_name(e, ret);
+        PUT(e, "){ .e = ");
+        put(e, err);
+        PUT(e, " }");
+    }
+    else
+    {
+        put(e, err);
+    }
+    PUT(e, "; ");
 }
 
 // ---- pieces: what main does not reach is not written -------------------------------------------
@@ -442,7 +540,7 @@ static void out_type(Emit *e, TypeId t, uint32_t at)
         [T_VOID] = "void",    [T_BOOL] = "bool",    [T_U8] = "uint8_t", [T_U16] = "uint16_t",
         [T_U32] = "uint32_t", [T_U64] = "uint64_t", [T_I8] = "int8_t",  [T_I16] = "int16_t",
         [T_I32] = "int32_t",  [T_I64] = "int64_t",  [T_INT] = "int",    [T_INT_LIT] = "int",
-        [T_STR] = "m_str",
+        [T_STR] = "m_str",     [T_ERROR] = "uint64_t",
     };
     TypeKind k = type_kind(t);
 
@@ -942,7 +1040,10 @@ static void emit_call(Emit *e, NodeId id)
             emit_expr(e, a);
             PUT(e, "), ");
         }
-        PUT(e, "m_trap(\"\"))");
+        int al = 0;
+        const char *an = e->fn ? symbol_name(e->fn, &al) : "";
+        int assert_kind = al == 6 && memcmp(an, "assert", 6) == 0 && strstr(cx.units[SYM(e->fn)->unit].path, "std/");
+        put(e, assert_kind ? "m_trap_k(3, \"\"))" : "m_trap_k(6, \"\"))");
         return;
     }
     uint64_t size;
@@ -1001,6 +1102,17 @@ static void emit_call(Emit *e, NodeId id)
         return;
     }
 
+    int wrap = sema_fn_fails(fn) && e->handled != id; // `n := f()`: its error goes up
+    char tmp[32];
+    snprintf(tmp, sizeof(tmp), "m_t%u", (unsigned)id);
+    if (wrap)
+    {
+        PUT(e, "({ ");
+        out_res_name(e, sema_fn_ret(&cx.units[SYM(fn)->unit], fn));
+        put(e, " ");
+        put(e, tmp);
+        PUT(e, " = ");
+    }
     out_fn_name(e, fn);
     PUT(e, "(");
     int first = 1;
@@ -1032,11 +1144,40 @@ static void emit_call(Emit *e, NodeId id)
     NodeId param = sema_fn_params(home, fn);
     for (NodeId a = n->b; a && param; a = NEXT(u, a), param = NEXT(home, param))
     {
+        if (type_kind(sema_param_type(home, fn, param)) == T_FUNC)
+        {
+            continue; // the function given: the specialization names it
+        }
         put(e, first ? "" : ", ");
         emit_as(e, a, sema_param_type(home, fn, param));
         first = 0;
     }
+    Capture caps[64]; // a literal's captures: the caller's locals of those names
+    uint32_t nc = sema_captures(fn, caps, 64);
+    for (uint32_t i = 0; i < nc; i++)
+    {
+        const Name *nm = name_at(caps[i].name);
+        put(e, first ? "v_" : ", v_");
+        put_n(e, nm->start, nm->len);
+        first = 0;
+    }
     PUT(e, ")");
+    if (wrap)
+    {
+        char err[48];
+        snprintf(err, sizeof(err), "%s.e", tmp);
+        PUT(e, "; ");
+        emit_error_up(e, err);
+        if (sema_fn_ret(home, fn) != T_VOID)
+        {
+            put(e, tmp);
+            PUT(e, ".v; })");
+        }
+        else
+        {
+            PUT(e, "(void)0; })");
+        }
+    }
 }
 
 // What a pattern test compares: a parameter (by its C name), or a temporary of a match.
@@ -1160,8 +1301,162 @@ static void emit_match(Emit *e, NodeId id)
 
 // returned: `return if n { ... }`, written as a statement whose arms return (a call there is a
 // tail call, as in a body of arms).
+// A stage on a call that can fail (MATCH_ERRORS), as a statement expression: the call's value and
+// error in m_sN, each arm testing one side; what no arm takes goes on (an error up, unless a
+// binding `n, e :=` takes it; a value as the stage's value). Bound with `n, e :=`, it gives the
+// result and the error together (an m_res).
+static void emit_error_match(Emit *e, NodeId id)
+{
+    Unit *u = e->u;
+    const AstNode *m = NODE(u, id);
+    NodeId subject = m->a;
+    SymId fn = u->refs[subject];
+    TypeId vt = u->types[subject], type = u->types[id];
+    int handled = e->handled == id;
+    int value = !(m->aux & MATCH_STATEMENT) && type != T_VOID && type != T_NONE;
+    char s[32], r[32], sv[40], se[40];
+    snprintf(s, sizeof(s), "m_s%u", (unsigned)id);
+    snprintf(r, sizeof(r), "m_r%u", (unsigned)id);
+    snprintf(sv, sizeof(sv), "%s.v", s);
+    snprintf(se, sizeof(se), "%s.e", s);
+    PUT(e, "({ ");
+    out_res_name(e, sema_fn_ret(&cx.units[SYM(fn)->unit], fn));
+    put(e, " ");
+    put(e, s);
+    PUT(e, " = ");
+    NodeId saved = e->handled;
+    e->handled = subject;
+    emit_expr(e, subject);
+    e->handled = saved;
+    PUT(e, "; ");
+    if (value)
+    {
+        out_type(e, type, m->tok);
+        put(e, " ");
+        put(e, r);
+        PUT(e, " = 0; ");
+    }
+    for (NodeId arm = m->b; arm; arm = NEXT(u, arm))
+    {
+        const AstNode *a = NODE(u, arm);
+        uint64_t eid;
+        int cls = sema_error_arm(u, a->a, vt, &eid);
+        char cond[64];
+        PUT(e, "if (");
+        if (cls == EARM_ANY)
+        {
+            PUT(e, "1");
+        }
+        else if (cls == EARM_ERROR)
+        {
+            put(e, se);
+        }
+        else if (cls == EARM_NAME)
+        {
+            snprintf(cond, sizeof(cond), "%s == %lluull", se, (unsigned long long)eid);
+            put(e, cond);
+        }
+        else
+        {
+            PUT(e, "!");
+            put(e, se);
+            Pattern pt;
+            NodeId name;
+            if (cls == EARM_VALUE && sema_arm_pattern(u, a->a, vt, &pt))
+            {
+                PUT(e, " && ");
+                emit_pattern_cond(e, &pt, vt, (Subject){0, 0, sv});
+            }
+            else if (cls == EARM_VALUE && (name = sema_arm_name(u, a->a, vt)))
+            {
+                PUT(e, " && ");
+                put(e, sv);
+                PUT(e, " == (");
+                emit_as(e, name, vt);
+                PUT(e, ")");
+            }
+        }
+        PUT(e, ") { ");
+        NodeId res = a->b;
+        SymId given = NODE(u, res)->kind == AST_IDENT && u->refs[res] && SYM(u->refs[res])->kind == SYM_METHOD
+                          ? u->refs[res]
+                          : 0;
+        if (value)
+        {
+            put(e, r);
+            PUT(e, " = (");
+            out_type(e, type, m->tok);
+            PUT(e, ")(");
+        }
+        if (given)
+        {
+            out_fn_name(e, given);
+            PUT(e, "(");
+            put(e, sv);
+            PUT(e, ")");
+        }
+        else if (value)
+        {
+            emit_as(e, res, type);
+        }
+        else
+        {
+            PUT(e, "\n");
+            int saved_indent = e->indent;
+            e->indent = 2;
+            emit_stmt(e, res, e->fn ? sema_fn_ret(&cx.units[SYM(e->fn)->unit], e->fn) : T_VOID);
+            e->indent = saved_indent;
+        }
+        put(e, value ? "); } else " : "; } else ");
+    }
+    PUT(e, "{ ");
+    if (!handled)
+    {
+        emit_error_up(e, se);
+    }
+    if (value)
+    {
+        put(e, r);
+        PUT(e, " = (");
+        out_type(e, type, m->tok);
+        PUT(e, ")(");
+        put(e, sv);
+        PUT(e, "); ");
+    }
+    PUT(e, "} ");
+    if (handled)
+    {
+        PUT(e, "(");
+        out_res_name(e, type);
+        PUT(e, "){ ");
+        if (value)
+        {
+            PUT(e, ".v = ");
+            put(e, r);
+            PUT(e, ", ");
+        }
+        PUT(e, ".e = ");
+        put(e, se);
+        PUT(e, " }; })");
+    }
+    else if (value)
+    {
+        put(e, r);
+        PUT(e, "; })");
+    }
+    else
+    {
+        PUT(e, "(void)0; })");
+    }
+}
+
 static void emit_match_as(Emit *e, NodeId id, int returned)
 {
+    if (NODE(e->u, id)->aux & MATCH_ERRORS)
+    {
+        emit_error_match(e, id);
+        return;
+    }
     Unit *u = e->u;
     const AstNode *m = NODE(u, id);
     TypeId type = u->types[id], types[16];
@@ -1251,6 +1546,11 @@ static void emit_match_as(Emit *e, NodeId id, int returned)
             if (tail_call(e, r))
             {
                 emit_tail(e, r);
+            }
+            else if (e->fn && sema_fn_fails(e->fn))
+            {
+                out_indent(e);
+                emit_fail_return(e, r, ret);
             }
             else
             {
@@ -1489,7 +1789,7 @@ static void emit_expr(Emit *e, NodeId id)
         }
         else if (type == T_NIL)
         {
-            PUT(e, "NULL");
+            PUT(e, "0"); // no reference, or no error
         }
         else
         {
@@ -1801,6 +2101,15 @@ static int tail_call(Emit *e, NodeId id)
     const AstNode *callee_node = NODE(u, n->a);
     SymId fn = u->refs[id];
     uint64_t size;
+    if (sema_fn_fails(fn) || sema_fn_fails(caller))
+    {
+        return 0; // a result with its error: a struct, not the scalar musttail takes here
+    }
+    Capture caps[1];
+    if (sema_captures(fn, caps, 1) || sema_captures(caller, caps, 1))
+    {
+        return 0; // a literal's captures are parameters the other does not have
+    }
     if (callee_node->kind != AST_IDENT || TOK(u, callee_node->tok)->kind == TOK_WRITE || !fn ||
         SYM(fn)->kind != SYM_METHOD || !SYM(fn)->decl || SYM(fn)->owner || SYM(caller)->owner ||
         sema_is_std_print(u, u->refs[n->a]) || sema_std_member(u, u->refs[n->a]) == STD_SYS_PUT ||
@@ -1882,6 +2191,151 @@ static void emit_stmt(Emit *e, NodeId id, TypeId ret)
         PUT(e, "}\n");
         return;
     case AST_DEFINE:
+        if (n->b) // `n, e := f()`: the value and its error (guards.md §5)
+        {
+            TypeId vt = u->types[id];
+            SymId callee = NODE(u, n->a)->kind == AST_CALL ? u->refs[n->a]
+                           : NODE(u, n->a)->kind == AST_MATCH && (NODE(u, n->a)->aux & MATCH_ERRORS)
+                               ? u->refs[NODE(u, n->a)->a]
+                               : 0;
+            int fails = callee && sema_fn_fails(callee);
+            int guard = NODE(u, n->a)->kind == AST_CALL; // a boundary: a panic below comes back here
+            int has_value = vt != T_VOID && vt != T_NONE;
+            char r[48], jb[48];
+            snprintf(r, sizeof(r), "m_r%u", (unsigned)id);
+            snprintf(jb, sizeof(jb), "m_jb%u", (unsigned)id);
+            out_indent(e);
+            if (has_value)
+            {
+                out_type(e, vt, n->tok);
+                PUT(e, " v_");
+                out_tok(e, n->tok);
+                PUT(e, "; ");
+            }
+            PUT(e, "uint64_t v_");
+            out_tok(e, n->b);
+            PUT(e, ";\n");
+            out_indent(e);
+            NodeId arena = 0; // the arena, as it is at the call: given back on an error (DEFINE_ROLLBACK)
+            if (guard && (n->aux & DEFINE_ROLLBACK))
+            {
+                for (NodeId a = NODE(u, n->a)->b; a && !arena; a = NEXT(u, a))
+                {
+                    const Token *t = TOK(u, NODE(u, a)->tok);
+                    TypeId at = u->types[a];
+                    if (NODE(u, a)->kind == AST_IDENT && type_kind(at) == T_PTR && t->len == 5 &&
+                        memcmp(TSTART(t), "arena", 5) == 0)
+                    {
+                        arena = a;
+                    }
+                }
+            }
+            if (arena)
+            {
+                out_struct_name(e, type_ref(type_ref(u->types[arena])));
+                char snap[40];
+                snprintf(snap, sizeof(snap), " m_snap%u = *(", (unsigned)id);
+                put(e, snap);
+                emit_as(e, arena, u->types[arena]);
+                PUT(e, "); ");
+            }
+            if (guard)
+            {
+                PUT(e, "{ jmp_buf ");
+                put(e, jb);
+                PUT(e, "; jmp_buf *m_outer = m_jb; m_jb = &");
+                put(e, jb);
+                PUT(e, "; if (!setjmp(");
+                put(e, jb);
+                PUT(e, ")) { ");
+            }
+            NodeId saved = e->handled;
+            e->handled = n->a;
+            if (fails)
+            {
+                out_res_name(e, vt);
+                put(e, " ");
+                put(e, r);
+                PUT(e, " = ");
+                emit_expr(e, n->a);
+                PUT(e, "; ");
+                if (has_value)
+                {
+                    PUT(e, "v_");
+                    out_tok(e, n->tok);
+                    PUT(e, " = ");
+                    put(e, r);
+                    PUT(e, ".v; ");
+                }
+                PUT(e, "v_");
+                out_tok(e, n->b);
+                PUT(e, " = ");
+                put(e, r);
+                PUT(e, ".e; ");
+            }
+            else // a call that cannot fail: its error is nil, unless a panic comes back
+            {
+                if (has_value)
+                {
+                    PUT(e, "v_");
+                    out_tok(e, n->tok);
+                    PUT(e, " = ");
+                    emit_as(e, n->a, vt);
+                    PUT(e, "; ");
+                }
+                else
+                {
+                    emit_expr(e, n->a);
+                    PUT(e, "; ");
+                }
+                PUT(e, "v_");
+                out_tok(e, n->b);
+                PUT(e, " = 0; ");
+            }
+            e->handled = saved;
+            if (guard)
+            {
+                PUT(e, "} else { ");
+                if (has_value)
+                {
+                    PUT(e, "v_");
+                    out_tok(e, n->tok);
+                    PUT(e, " = (");
+                    out_type(e, vt, n->tok);
+                    PUT(e, "){0}; ");
+                }
+                PUT(e, "v_");
+                out_tok(e, n->b);
+                PUT(e, " = m_panic; } m_jb = m_outer; }");
+            }
+            if (arena)
+            {
+                char snap[64];
+                PUT(e, " if (v_");
+                out_tok(e, n->b);
+                PUT(e, ") *(");
+                emit_as(e, arena, u->types[arena]);
+                snprintf(snap, sizeof(snap), ") = m_snap%u;", (unsigned)id);
+                put(e, snap);
+            }
+            PUT(e, "\n");
+            if (n->aux & DEFINE_UNREAD) // no line reads e: an error that reaches it stops the program
+            {
+                int line, col;
+                source_pos(u->src, TSTART(TOK(u, n->b)), &line, &col);
+                char tail[96];
+                out_indent(e);
+                PUT(e, "if (v_");
+                out_tok(e, n->b);
+                PUT(e, ") m_trap_k(5, \"");
+                put(e, u->path);
+                const Token *et = TOK(u, n->b);
+                snprintf(tail, sizeof(tail), ":%d:%d: panic.unhandled: the error in '%.*s' is not handled\\n\");\n",
+                         line, col, (int)et->len, TSTART(et));
+                put(e, tail);
+            }
+            return;
+        }
         if (NODE(u, n->a)->kind == AST_FN_LIT)
         {
             return; // the literal was emitted as a function of its own; calls name it directly
@@ -1929,6 +2383,12 @@ static void emit_stmt(Emit *e, NodeId id, TypeId ret)
         PUT(e, ";\n");
         return;
     case AST_RETURN:
+        if (e->fn && sema_fn_fails(e->fn))
+        {
+            out_indent(e);
+            emit_fail_return(e, n->a, ret);
+            return;
+        }
         if (n->a && NODE(u, n->a)->kind == AST_UNARY_OP && TOK(u, NODE(u, n->a)->tok)->kind == TOK_AMP &&
             NODE(u, NODE(u, n->a)->a)->kind == AST_STRUCT_LIT) // `return &point{ ... }`: built in self
         {
@@ -1964,6 +2424,20 @@ static void emit_stmt(Emit *e, NodeId id, TypeId ret)
         return;
     default:
         out_indent(e);
+        if (n->kind == AST_CALL && u->types[id] == T_ERROR && u->refs[id] && !sema_fn_fails(u->refs[id]) &&
+            e->fn && (sema_fn_fails(e->fn) || ret == T_ERROR))
+        {
+            char err[32];
+            snprintf(err, sizeof(err), "m_t%u", (unsigned)id); // `run()` alone: its error goes up
+            PUT(e, "{ uint64_t ");
+            put(e, err);
+            PUT(e, " = ");
+            emit_expr(e, id);
+            PUT(e, "; ");
+            emit_error_up(e, err);
+            PUT(e, "}\n");
+            return;
+        }
         if (n->kind == AST_BIN_OP || n->kind == AST_UNARY_OP || n->kind == AST_IDENT || n->kind == AST_NUMBER_LIT)
         {
             PUT(e, "(void)"); // a value nothing takes (an arm's, in a statement): computed, dropped
@@ -1989,7 +2463,14 @@ static void emit_signature(Emit *e, SymId fn)
     int first = 1;
 
     PUT(e, "static ");
-    out_type(e, sema_fn_ret(u, fn), SYM(fn)->tok);
+    if (sema_fn_fails(fn))
+    {
+        out_res_name(e, sema_fn_ret(u, fn)); // the value and its error
+    }
+    else
+    {
+        out_type(e, sema_fn_ret(u, fn), SYM(fn)->tok);
+    }
     PUT(e, " ");
     out_fn_name(e, fn);
     PUT(e, "(");
@@ -2002,8 +2483,12 @@ static void emit_signature(Emit *e, SymId fn)
     int index = 0;
     for (NodeId p = sema_fn_params(u, fn); p; p = NEXT(u, p), index++)
     {
-        put(e, first ? "" : ", ");
         TypeId pt = sema_param_type(u, fn, p);
+        if (type_kind(pt) == T_FUNC)
+        {
+            continue; // `f: function(...)`: known while compiling, not passed
+        }
+        put(e, first ? "" : ", ");
         if (type_kind(pt) == T_ARRAY) // by its address; a mutable one is copied in (emit_function)
         {
             PUT(e, "const ");
@@ -2020,6 +2505,17 @@ static void emit_signature(Emit *e, SymId fn)
         out_type(e, pt, NODE(u, p)->tok);
         put_c(e, ' ');
         out_param_name(e, p, index);
+        first = 0;
+    }
+    Capture caps[64]; // a literal's captures: parameters after its own, named as the locals they are
+    uint32_t nc = sema_captures(fn, caps, 64);
+    for (uint32_t i = 0; i < nc; i++)
+    {
+        put(e, first ? "" : ", ");
+        out_type(e, caps[i].type, 0);
+        const Name *nm = name_at(caps[i].name);
+        PUT(e, " v_");
+        put_n(e, nm->start, nm->len);
         first = 0;
     }
     put(e, first ? "void)" : ")");
@@ -2345,6 +2841,7 @@ static const char *const prelude =
     "#include <stdint.h>\n"
     "#include <stdlib.h>\n" // exit
     "#include <unistd.h>\n" // write: the only system interface the program uses (docs/std.md §1)
+    "#include <setjmp.h>\n" // a boundary (`n, e := f()`, guards.md §5): a panic below comes back to it
     "\n"
     "typedef struct\n"
     "{\n"
@@ -2384,23 +2881,27 @@ static const char *const prelude =
     "}\n"
     "M_RT void m_write_str(m_str s) { mrt_put(s.ptr, s.len); }\n"
     // A trap: the output so far, then the place, then status 1 (as the native backends do).
-    "M_RT void m_trap(const char *m) {\n"
+    // A panic (k: its number) goes back to the boundary there is; else the program stops.
+    "static jmp_buf *m_jb; static uint64_t m_panic;\n"
+    "M_RT void m_trap_k(uint64_t k, const char *m) {\n"
+    "    if (m_jb) { m_panic = k; longjmp(*m_jb, 1); }\n"
     "    size_t n = 0; while (m[n]) n++;\n"
     "    mrt_flush(); mrt_out(2, (const uint8_t *)m, n); exit(1);\n"
     "}\n"
     // a part of trap(a, b, ...) (docs/std.md): written after the output so far, then the next
-    "M_RT void m_trap_part(m_str s) { mrt_flush(); mrt_out(2, s.ptr, s.len); }\n"
+    // (nothing while a boundary waits: the panic comes back to it)
+    "M_RT void m_trap_part(m_str s) { if (m_jb) return; mrt_flush(); mrt_out(2, s.ptr, s.len); }\n"
     // std's any (std/any.modal): T(a) gives a's address when a holds a T, and traps otherwise.
     "M_RT void *m_unany(const uint64_t *a, uint64_t id, const char *m) {\n"
-    "    if (((const uint64_t *)(uintptr_t)a[1])[0] != id) m_trap(m); return (void *)(uintptr_t)a[0];\n"
+    "    if (((const uint64_t *)(uintptr_t)a[1])[0] != id) m_trap_k(4, m); return (void *)(uintptr_t)a[0];\n"
     "}\n"
     // Division: a zero divisor traps; the smallest signed value by -1 wraps (as `0 - x` does).
-    "#define M_DIV(T) M_RT T m_div_##T(T a, T b, const char *m) { if (!b) m_trap(m); \\\n"
+    "#define M_DIV(T) M_RT T m_div_##T(T a, T b, const char *m) { if (!b) m_trap_k(1, m); \\\n"
     "    if ((T)-1 < 0 && b == (T)-1) return (T)(0 - (uint64_t)a); return (T)(a / b); }\n"
     "M_DIV(uint8_t) M_DIV(uint16_t) M_DIV(uint32_t) M_DIV(uint64_t)\n"
     "M_DIV(int8_t) M_DIV(int16_t) M_DIV(int32_t) M_DIV(int64_t)\n"
     // An index: past the length, the program stops with its place (as in the native code).
-    "M_RT uint64_t m_index(uint64_t i, uint64_t n, const char *m) { if (i >= n) m_trap(m); return i; }\n"
+    "M_RT uint64_t m_index(uint64_t i, uint64_t n, const char *m) { if (i >= n) m_trap_k(2, m); return i; }\n"
     "M_RT void m_write_uint(unsigned long long n) {\n"
     "    uint8_t b[24]; int i = 24;\n"
     "    do { b[--i] = (uint8_t)('0' + n % 10); n /= 10; } while (n);\n"
@@ -2515,6 +3016,12 @@ static void backend_c_begin(const BackendJob *job)
             const AstNode *n = NODE(m, d);
             int value = n->kind == AST_FIELD_DECL ||
                         (n->kind == AST_DEFINE && NODE(m, n->a)->kind != AST_FN_LIT && !ast_import_root(m, n->a));
+            SymId vs = scope_find_token(m->scope, TOK(m, n->tok));
+            uint64_t ev;
+            if (value && vs && sema_value_type(m, vs) == T_ERROR && sema_comptime_value(vs, &ev))
+            {
+                continue; // `division: error`: a number, written where it is used
+            }
             if (value)
             {
                 unsupported(e, n->tok, "a module-level value in an imported file");
@@ -2598,7 +3105,7 @@ static void backend_c_begin(const BackendJob *job)
             PUT(e, " = ");
             emit_computed(e, agg, type, 0);
         }
-        else if (init && s && sema_comptime_value(s, &computed))
+        else if ((init || type == T_ERROR) && s && sema_comptime_value(s, &computed))
         {
             // computed by the compiler (docs/comptime.md): the number, in its type
             char num[48];
@@ -2628,6 +3135,10 @@ static void backend_c_begin(const BackendJob *job)
         e->u = home;
         if (emittable(e, fn, 1))
         {
+            if (sema_fn_fails(fn))
+            {
+                emit_res_type(e, sema_fn_ret(home, fn));
+            }
             piece_begin_fn(e, fn);
             emit_signature(e, fn);
             PUT(e, ";\n");
@@ -2674,6 +3185,10 @@ static void backend_c_declare(const BackendJob *job, SymId fn)
     e->u = &cx.units[SYM(fn)->unit];
     if (emittable(e, fn, 0))
     {
+        if (sema_fn_fails(fn))
+        {
+            emit_res_type(e, sema_fn_ret(e->u, fn));
+        }
         piece_begin_fn(e, fn);
         emit_signature(e, fn);
         PUT(e, ";\n");
@@ -2686,12 +3201,6 @@ static void backend_c_declare(const BackendJob *job, SymId fn)
 static void backend_c_function(const BackendJob *job, SymId fn)
 {
     (void)job;
-    if ((SYM(fn)->flags & SYM_F_CAPTURES))
-    {
-        unsupported(&emit_state, SYM(fn)->tok,
-                    "a function literal that uses a local of the function around it (a closure)");
-        return;
-    }
     Unit *caller = emit_state.u;
     emit_state.u = &cx.units[SYM(fn)->unit];
     if (emittable(&emit_state, fn, 0))

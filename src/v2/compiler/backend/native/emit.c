@@ -370,7 +370,7 @@ static void emit_string(uint32_t d, const MirString *str)
         put_bytes("\xe9", 1); // jmp over the data
         put32((uint32_t)padded);
     }
-    uint64_t len = str->len;
+    uint64_t len = str->len | (uint64_t)str->panic << 56; // a panic's number in the top byte
     put_bytes(&len, 8);
     put_bytes(str->bytes, str->len);
     static const uint8_t zero[4] = {0};
@@ -1984,7 +1984,7 @@ static void regs_string(const MirInst *in, const MirString *str)
         put32((uint32_t)padded);
         set32(disp_at, (uint32_t)(nat.len - (disp_at + 4)));
     }
-    uint64_t len = str->len;
+    uint64_t len = str->len | (uint64_t)str->panic << 56; // a panic's number in the top byte
     put_bytes(&len, 8);
     put_bytes(str->bytes, str->len);
     static const uint8_t zero[4] = {0};
@@ -2377,6 +2377,11 @@ static void emit_regs(const MirFunc *f)
                 regs_tail(f, in);
                 break;
             }
+            if (in->sub == MIR_CALL_GUARD) // a boundary: the stencil saves what a panic restores
+            {
+                emit(ST_guarded_call, H(f->frame_size), in->var, 0, (SymId)in->imm, 0);
+                break;
+            }
             regs_call(f, (SymId)in->imm);
             break;
         case MIR_RET:
@@ -2606,7 +2611,8 @@ static void emit_stencils(const MirFunc *f)
                 emit(ST_tail, 0, 0, 0, (SymId)in->imm, 0);
                 break;
             }
-            emit(ST_call, f->frame_size, 0, 0, (SymId)in->imm, 0);
+            emit(in->sub == MIR_CALL_GUARD ? ST_guarded_call : ST_call, f->frame_size,
+                 in->sub == MIR_CALL_GUARD ? in->var : 0, 0, (SymId)in->imm, 0);
             break;
         case MIR_RET:
             emit(ST_ret, 0, 0, 0, 0, 0);

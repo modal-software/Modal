@@ -82,6 +82,40 @@ NodeId parse_type(Parser *p)
     }
     case TOK_IDENTIFIER:
     {
+        if (t->len == 8 && memcmp(TSTART(t), "function", 8) == 0 && t[1].kind == TOK_LPAREN)
+        {
+            // `function(T, U): R`: a function given while compiling (context.md §61)
+            parser_advance(p);
+            parser_advance(p); // '('
+            NodeList ps = list_begin();
+            while (p->current->kind != TOK_RPAREN && p->current->kind != TOK_EOF)
+            {
+                NodeId pt = parse_type(p);
+                if (!pt)
+                {
+                    break;
+                }
+                node_list_push(u, &ps, pt);
+                if (!parser_match(p, TOK_COMMA))
+                {
+                    break;
+                }
+            }
+            if (!parser_consume(p, TOK_RPAREN, "expected ')' after a function type's parameters"))
+            {
+                list_abort(&ps);
+                break;
+            }
+            NodeId params = list_finish(u, &ps);
+            NodeId result = 0;
+            if (p->current->kind == TOK_COLON && !p->current->nl && type_starts_at(p->current + 1))
+            {
+                parser_advance(p);
+                result = parse_type(p);
+            }
+            type = node_new(u, AST_TYPE_FUNC, tok_idx(p, t), params, result);
+            break;
+        }
         // `T.at(i).of`: a path with a call in it is a value known while compiling whose type is
         // std's type; it stands for the type it describes (std.md §11)
         const Token *k = t + 1;
@@ -155,7 +189,10 @@ NodeId parse_params(Parser *p, int *has_self)
             t->kind == TOK_STAR || (t->kind == TOK_LBRACKET && t[1].kind == TOK_RBRACKET) ||
             (t->kind == TOK_LBRACKET && (t[1].kind == TOK_NUMBER || t[1].kind == TOK_IDENTIFIER) &&
              t[2].kind == TOK_RBRACKET); // [N]T: an array, passed by reference
-        if (type_first)
+        // A pattern alone (`(0..10) { ... }`, a literal's): its type is the first call's (context.md §60)
+        int bare = t->kind == TOK_NUMBER || (t->kind == TOK_MINUS && t[1].kind == TOK_NUMBER) ||
+                   t->kind == TOK_STRING;
+        if (type_first || bare)
         {
             if (pending >= 0)
             {
@@ -165,8 +202,8 @@ NodeId parse_params(Parser *p, int *has_self)
                                 wait->len, TSTART(wait));
                 break;
             }
-            NodeId type = parse_type(p);
-            if (!type)
+            NodeId type = bare ? 0 : parse_type(p);
+            if (!type && !bare)
             {
                 break;
             }
@@ -217,6 +254,11 @@ NodeId parse_params(Parser *p, int *has_self)
                     break;
                 }
                 continue;
+            }
+            if (bare)
+            {
+                parser_error_at(p, p->current, "expected a pattern: a number, a range or a string");
+                break;
             }
             const Token *name = p->current;
             if (!parser_consume(p, TOK_IDENTIFIER, "expected a parameter name after its type"))
@@ -334,7 +376,7 @@ static NodeId parse_method(Parser *p, const Token *name, NodeId ret, uint8_t fla
     Unit *u = p->unit;
     int has_self = 0;
     NodeId body = 0;
-    int deferred = 0;
+    int deferred = 0, fails = 0;
     NodeId params = parse_params(p, &has_self);
 
     if (p->panic)
@@ -370,6 +412,13 @@ static NodeId parse_method(Parser *p, const Token *name, NodeId ret, uint8_t fla
                 return 0;
             }
             ret = parse_type(p);
+            if (ret && p->current->kind == TOK_COMMA && p->current[1].kind == TOK_IDENTIFIER &&
+                p->current[1].len == 5 && memcmp(TSTART(p->current + 1), "error", 5) == 0)
+            {
+                parser_advance(p); // `: T, error`: it can fail (guards.md §5)
+                parser_advance(p);
+                fails = 1;
+            }
         }
         else if (!is_body_start(p->current) && !(p->current->nl) && type_starts_at(p->current))
         {
@@ -398,6 +447,7 @@ static NodeId parse_method(Parser *p, const Token *name, NodeId ret, uint8_t fla
     NODE(u, method)->flags |=
         (uint8_t)(flags | (has_self ? AST_F_SELF : 0) | (deferred ? AST_F_LAZY : 0));
     NODE(u, NODE(u, method)->b)->flags |= deferred ? AST_F_LAZY : 0; // its signature node knows too
+    NODE(u, NODE(u, method)->b)->aux |= fails ? SIG_FAILS : 0;
     return method;
 }
 
@@ -556,6 +606,10 @@ static NodeId parse_type_first(Parser *p)
 // cannot either. `*p = 3` stays an assignment: no name follows the type.
 int local_decl_at(const Token *t)
 {
+    if (t->kind == TOK_IDENTIFIER && t[1].kind == TOK_COMMA && t[2].kind == TOK_IDENTIFIER && t[3].kind == TOK_DEFINE)
+    {
+        return 0; // `n, e := f()`: a binding of a value and its error
+    }
     if (t->kind == TOK_IDENTIFIER && !t[1].nl && (t[1].kind == TOK_COLON || t[1].kind == TOK_COMMA))
     {
         return !(t[1].kind == TOK_COLON && t[2].kind == TOK_LBRACE); // `c: {`: the old match form, reported by parse_expression
@@ -653,14 +707,22 @@ int parse_local(Parser *p, NodeList *into)
 NodeId parse_define(Parser *p)
 {
     const Token *name = p->current;
+    uint32_t second = 0;
     parser_advance(p); // name
+    if (p->current->kind == TOK_COMMA) // `n, e := f()`: the value and the error (guards.md §5)
+    {
+        parser_advance(p);
+        second = tok_idx(p, p->current);
+        parser_advance(p);
+    }
     parser_advance(p); // :=
     NodeId value = parse_expression(p);
     if (!value)
     {
         return 0;
     }
-    return node_new(p->unit, AST_DEFINE, tok_idx(p, name), value, 0);
+    // b: the second name's token (not a node: nothing walks it)
+    return node_new(p->unit, AST_DEFINE, tok_idx(p, name), value, second);
 }
 
 // items := item (',' item)*      item := IDENT [ 'as' IDENT ]

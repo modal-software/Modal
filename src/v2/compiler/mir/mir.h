@@ -71,6 +71,11 @@ typedef enum
 // function's caller with the result in slot 0. Its frame is this one's: the depth does not grow,
 // so recursion through tail calls runs in constant stack (Modal's loops are recursion).
 #define MIR_CALL_TAIL 1
+// MIR_CALL sub MIR_CALL_GUARD: a boundary (`n, e := f()`, guards.md §5). A panic below comes back
+// here: the callee's value slots (var >> 1 of them) are zero and its error slot (the one after
+// them) holds the panic's number. var & 1: the callee says `, error` (else the error slot is 0
+// when it returns). MIR_TRAP's imm is its panic's number.
+#define MIR_CALL_GUARD 2
 #define MIR_IS_TAIL(in) ((in)->op == MIR_CALL && (in)->sub == MIR_CALL_TAIL)
 #define MIR_ENDS(in) ((in)->op == MIR_RET || ((in)->op == MIR_TRAP && (in)->sub != MIR_TRAP_PART) || MIR_IS_TAIL(in))
 // Has a label as a target (imm); and does the code after it not follow from it?
@@ -131,6 +136,8 @@ typedef struct
 {
     const uint8_t *bytes;
     size_t len;
+    uint8_t panic; // a panic's message: its number, which the native code keeps in the length
+                   // word's top byte (guards.md §5: no instruction at the trap for it)
 } MirString;
 
 typedef struct MirFunc

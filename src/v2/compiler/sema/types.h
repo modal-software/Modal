@@ -30,6 +30,7 @@ typedef enum
     T_STR,    // []u8
     T_EXTERN, // comes from outside the checked program (std): anything is allowed on it
     T_MODULE, // `self` of a module-level function
+    T_ERROR,  // an error (guards.md §5): one word, its number; nil (0) is ok
     T__PRIM_COUNT,
     // interned: `ref` says of what
     T_STRUCT = T__PRIM_COUNT, // ref = struct symbol

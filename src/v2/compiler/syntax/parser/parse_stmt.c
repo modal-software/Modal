@@ -47,7 +47,8 @@ NodeId parse_statement(Parser *p)
         parser_error_at(p, t, "'else' without an 'if' before it");
         return 0;
     case TOK_IDENTIFIER:
-        if (t[1].kind == TOK_DEFINE)
+        if (t[1].kind == TOK_DEFINE ||
+            (t[1].kind == TOK_COMMA && t[2].kind == TOK_IDENTIFIER && t[3].kind == TOK_DEFINE))
         {
             return parse_define(p);
         }
@@ -134,6 +135,10 @@ static int pattern_len(const Token *t)
             k++;
         } while (depth > 0);
         return k;
+    }
+    if (is_name_token(t) && t[1].kind == TOK_DOT && t[2].kind == TOK_IDENTIFIER) // `panic.division`
+    {
+        return 3;
     }
     if (is_any_token(t) || is_bool_token(t) || t->kind == TOK_STRING || is_name_token(t))
     {
@@ -259,6 +264,17 @@ static NodeId parse_pattern(Parser *p)
             return 0;
         }
         NodeId n = node_new(u, AST_PATTERN, tok_idx(p, t), call, 0);
+        NODE(u, n)->aux = PAT_NAME;
+        return n;
+    }
+    if (is_name_token(t) && t[1].kind == TOK_DOT && t[2].kind == TOK_IDENTIFIER) // a module's value
+    {
+        parser_advance(p);
+        parser_advance(p);
+        parser_advance(p);
+        NodeId ident = node_new(u, AST_IDENT, tok_idx(p, t), 0, 0);
+        NodeId sel = node_new(u, AST_SELECTOR, tok_idx(p, t + 2), ident, 0);
+        NodeId n = node_new(u, AST_PATTERN, tok_idx(p, t), sel, 0);
         NODE(u, n)->aux = PAT_NAME;
         return n;
     }

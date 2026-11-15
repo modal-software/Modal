@@ -207,7 +207,7 @@ static uint32_t add_string(MirFunc *f, const uint8_t *bytes, size_t len)
         f->strings = (MirString *)region_grow_array(REGION_MIR, f->strings, sizeof(MirString),
                                                     &f->strings_cap, f->nstrings + 1);
     }
-    f->strings[f->nstrings] = (MirString){copy, len};
+    f->strings[f->nstrings] = (MirString){copy, len, 0};
     return (uint32_t)f->nstrings++;
 }
 
@@ -358,7 +358,7 @@ static int fold(Opt *o)
             uint32_t nargs = callee != f->sym && SYM(callee)->kind == SYM_METHOD ? mir_param_slots(callee) : 9;
             uint64_t args[8], result;
             uint32_t nresult = 0;
-            int all = nargs <= 8;
+            int all = nargs <= 8 && in->sub != MIR_CALL_GUARD; // (a boundary gives its error slot too)
             for (uint32_t k = 0; k < nargs && all; k++)
             {
                 all = is_known(o, f->frame_size + (MirSlot)k, &args[k]);

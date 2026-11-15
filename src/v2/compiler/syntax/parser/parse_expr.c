@@ -192,11 +192,25 @@ static int paren_opens_fn_literal(const Parser *p, const Token *open)
     {
         return 0;
     }
+    if (after->kind == TOK_COLON && !after[1].nl)
+    {
+        // `(x: u64): u64 { ... }`, as a function is written, or `(k: u64): k * limit`, one line
+        // whose value is the result (its type, the expression's). An arm `(0, _): acc` is read as
+        // an arm before any expression is parsed.
+        return 1;
+    }
     return after->kind == TOK_IDENTIFIER ||
            (after->kind == TOK_LBRACKET && after[1].kind == TOK_RBRACKET);
 }
 
-// (params) [T] { body }
+// After a literal's `)` and `:`: a result type then its body (`u64 {`), not an expression.
+static int lit_result_type_at(const Token *t)
+{
+    t += t->kind == TOK_STAR ? 1 : t->kind == TOK_LBRACKET && t[1].kind == TOK_RBRACKET ? 2 : 0;
+    return t->kind == TOK_IDENTIFIER && !t[1].nl && is_body_start(t + 1);
+}
+
+// (params) [T] { body }   or   (params): expression
 static NodeId parse_fn_literal(Parser *p)
 {
     Unit *u = p->unit;
@@ -208,8 +222,21 @@ static NodeId parse_fn_literal(Parser *p)
     {
         return 0;
     }
+    if (p->current->kind == TOK_COLON && !lit_result_type_at(p->current + 1))
+    {
+        parser_advance(p); // `(k: u64): k * limit`: one line, the result is its value
+        NodeId body = parse_expression(p);
+        if (!body)
+        {
+            return 0;
+        }
+        NodeId fn = node_new_fn(u, AST_FN_LIT, tok_idx(p, open), params, 0, body);
+        NODE(u, fn)->flags |= (uint8_t)(AST_F_ONELINE | (has_self ? AST_F_SELF : 0));
+        return fn;
+    }
     if (!is_body_start(p->current))
     {
+        parser_match(p, TOK_COLON); // `(x: u64): u64 { ... }` or `(x: u64) u64 { ... }`
         ret = parse_type(p);
         if (!ret)
         {
@@ -298,7 +325,27 @@ static NodeId led_call(Parser *p, NodeId left)
     p->paren_depth++;
     while (p->current->kind != TOK_RPAREN && p->current->kind != TOK_EOF)
     {
-        NodeId arg = parse_precedence(p, PREC_ASSIGN);
+        NodeId arg;
+        const Token *t = p->current;
+        if (t->kind == TOK_IDENTIFIER && t[1].kind == TOK_COLON && !t[2].nl)
+        {
+            // `x: x * 2`: a literal of one parameter, x, whose type is the one the callee's
+            // `function(T): U` gives it (context.md §61)
+            parser_advance(p);
+            parser_advance(p);
+            NodeId param = node_new(u, AST_PARAM, tok_idx(p, t), 0, 0);
+            NodeId body = parse_precedence(p, PREC_ASSIGN);
+            if (!body)
+            {
+                break;
+            }
+            arg = node_new_fn(u, AST_FN_LIT, tok_idx(p, t), param, 0, body);
+            NODE(u, arg)->flags |= AST_F_ONELINE;
+        }
+        else
+        {
+            arg = parse_precedence(p, PREC_ASSIGN);
+        }
         if (!arg)
         {
             break;

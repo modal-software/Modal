@@ -572,6 +572,7 @@ Layout type_layout(TypeId t)
         return (Layout){4, 4};
     case T_U64:
     case T_I64:
+    case T_ERROR:
         return (Layout){8, tg->align_i64};
     case T_STR: // the native string: one pointer to its length and bytes
     case T_PTR:

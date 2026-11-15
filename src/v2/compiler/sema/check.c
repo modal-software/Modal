@@ -56,6 +56,7 @@ typedef struct
     uint64_t below;  // inside an arm whose values are 0 .. below - 1 (0: not known): an index in range
     uint8_t frame;   // holds a reference into this function's frame (`a: *T = &T{ ... }`)
     NodeId call;     // `a := f(x)` called later as `a()`: the call, its arguments bound (0: none)
+    SymId err_of;    // `n, e := f()`: e is f's error (its arms are checked against f's set)
 } Local;
 
 typedef struct
@@ -77,8 +78,366 @@ typedef struct
     SymId fn;              // the function whose body is being checked (its kind's facts)
     int returning_ref;     // checking `return &point{ ... }`: built in self's storage
     int local_ref;         // checking a local's `&point{ ... }`: built in this function's frame
+    int fails;             // the function being checked says `, error`: an error may go up
+    NodeId handled;        // the call `n, e := f()` binds: its error is the second name's
+    NodeId guard;          // and that call, a boundary: its panics come back to it
     Local locals[MAX_LOCALS];
 } Check;
+
+// ---- error sets (guards.md §5, step 6) ----------------------------------------------------------
+//
+// Noted while a body is checked: the panics it can raise (a guard the checker cannot prove away),
+// the errors it returns, and its calls (whether their errors and their panics go up from it).
+// The sets are the closure over the calls, computed when asked: `--sig` prints them, an `if e`
+// on a call's error is checked against them at the end, and a boundary whose call can raise
+// nothing is no boundary.
+enum
+{
+    EE_ERRORS = 1, // the callee's errors go up from the caller
+    EE_PANICS = 2, // its panics go up too (the call is not a boundary)
+    EE_CALLS = 4,  // a call (every one: what the callee uses, it uses)
+};
+// Kept small (2 bytes a symbol, 12 a call, 16 a returned error) and outside the arena, which
+// a big program fills with its bodies: malloc'd tables, grown in place.
+enum
+{
+    EF_SEEN = 1, // its body was checked
+    EF_ANY = 2,  // it returns an error it holds: which one is not known
+    EF_GLOBALS = 8, // it uses a mutable module variable (an arena's memory could stay reachable there)
+};
+typedef struct
+{
+    SymId from, to;
+    uint8_t flags;
+} ErrEdge;
+typedef struct
+{
+    SymId fn;
+    uint64_t id;
+} ErrId;
+static uint8_t *ef_panics, *ef_flags; // own: per symbol
+static size_t ef_cap;
+static ErrEdge *ef_edges;
+static size_t ef_nedges, ef_edges_cap;
+static ErrId *ef_ids;
+static size_t ef_nids, ef_ids_cap;
+// the closure, recomputed when facts were added since the last one
+static uint8_t *cl_panics, *cl_flags; // EF_ANY, and 4: whole (every function it reaches is checked)
+static size_t cl_edges = (size_t)-1, cl_ids = (size_t)-1, cl_seen;
+static size_t ef_seen_count;
+
+static void *grow(void *p, size_t *cap, size_t need, size_t size)
+{
+    if (need <= *cap)
+    {
+        return p;
+    }
+    size_t nc = *cap ? *cap : 256;
+    while (nc < need)
+    {
+        nc *= 2;
+    }
+    p = realloc(p, nc * size);
+    if (!p)
+    {
+        fprintf(stderr, "fatal: out of memory\n");
+        exit(2);
+    }
+    *cap = nc;
+    return p;
+}
+
+static void ef_fit(SymId fn)
+{
+    if (fn < ef_cap)
+    {
+        return;
+    }
+    size_t old = ef_cap, cap = ef_cap;
+    ef_panics = (uint8_t *)grow(ef_panics, &cap, (size_t)fn + 1, 1);
+    size_t cap2 = old;
+    ef_flags = (uint8_t *)grow(ef_flags, &cap2, (size_t)fn + 1, 1);
+    memset(ef_panics + old, 0, cap - old);
+    memset(ef_flags + old, 0, cap - old);
+    ef_cap = cap;
+}
+
+static void note_seen(SymId fn)
+{
+    ef_fit(fn);
+    if (!(ef_flags[fn] & EF_SEEN))
+    {
+        ef_flags[fn] |= EF_SEEN;
+        ef_seen_count++;
+    }
+}
+
+static void note_panic(Check *c, int kind)
+{
+    if (c->fn)
+    {
+        ef_fit(c->fn);
+        ef_panics[c->fn] |= (uint8_t)(1u << (kind - 1));
+    }
+}
+
+static void note_any(Check *c)
+{
+    if (c->fn)
+    {
+        ef_fit(c->fn);
+        ef_flags[c->fn] |= EF_ANY;
+    }
+}
+
+static void note_error_id(Check *c, uint64_t id)
+{
+    if (c->fn)
+    {
+        ef_ids = (ErrId *)grow(ef_ids, &ef_ids_cap, ef_nids + 1, sizeof(ErrId));
+        ef_ids[ef_nids++] = (ErrId){c->fn, id};
+    }
+}
+
+static void note_edge(Check *c, SymId to, uint8_t flags)
+{
+    if (!c->fn || !to || !flags)
+    {
+        return;
+    }
+    ef_edges = (ErrEdge *)grow(ef_edges, &ef_edges_cap, ef_nedges + 1, sizeof(ErrEdge));
+    ef_edges[ef_nedges++] = (ErrEdge){c->fn, to, flags};
+}
+
+// The panics, the unknown errors and wholeness over the calls: a fixed point.
+static void errors_close(void)
+{
+    if (cl_edges == ef_nedges && cl_ids == ef_nids && cl_seen == ef_seen_count)
+    {
+        return; // nothing new since
+    }
+    ef_fit((SymId)(cx.syms.size ? cx.syms.size - 1 : 0));
+    static size_t cl_cap;
+    size_t c1 = cl_cap, c2 = cl_cap;
+    cl_panics = (uint8_t *)grow(cl_panics, &c1, ef_cap, 1);
+    cl_flags = (uint8_t *)grow(cl_flags, &c2, ef_cap, 1);
+    cl_cap = c1;
+    for (size_t f = 0; f < ef_cap; f++)
+    {
+        cl_panics[f] = ef_panics[f];
+        cl_flags[f] = (uint8_t)((ef_flags[f] & (EF_ANY | EF_GLOBALS)) | (ef_flags[f] & EF_SEEN ? 4 : 0));
+    }
+    for (int changed = 1; changed;)
+    {
+        changed = 0;
+        for (size_t e = 0; e < ef_nedges; e++)
+        {
+            SymId x = ef_edges[e].from, y = ef_edges[e].to;
+            uint8_t fl = ef_edges[e].flags;
+            if (y >= ef_cap)
+            {
+                continue;
+            }
+            if ((cl_flags[x] & 4) && !(cl_flags[y] & 4))
+            {
+                cl_flags[x] &= (uint8_t)~4;
+                changed = 1;
+            }
+            if ((fl & EE_PANICS) && (cl_panics[y] & ~cl_panics[x]))
+            {
+                cl_panics[x] |= cl_panics[y];
+                changed = 1;
+            }
+            if ((fl & EE_ERRORS) && (cl_flags[y] & EF_ANY) && !(cl_flags[x] & EF_ANY))
+            {
+                cl_flags[x] |= EF_ANY;
+                changed = 1;
+            }
+            if ((fl & EE_CALLS) && (cl_flags[y] & EF_GLOBALS) && !(cl_flags[x] & EF_GLOBALS))
+            {
+                cl_flags[x] |= EF_GLOBALS;
+                changed = 1;
+            }
+        }
+    }
+    cl_edges = ef_nedges;
+    cl_ids = ef_nids;
+    cl_seen = ef_seen_count;
+}
+
+// The errors fn returns, its own and those its error edges bring up (a walk over them: they are
+// few). At most cap are written; returns how many.
+static uint32_t error_ids_of(SymId fn, uint64_t *out, uint32_t cap)
+{
+    SymId stack[256], seen[256];
+    uint32_t ns = 0, nseen = 0, n = 0;
+    stack[ns++] = fn;
+    seen[nseen++] = fn;
+    while (ns)
+    {
+        SymId f = stack[--ns];
+        for (size_t i = 0; i < ef_nids; i++)
+        {
+            if (ef_ids[i].fn != f)
+            {
+                continue;
+            }
+            int have = 0;
+            for (uint32_t k = 0; k < n && !have; k++)
+            {
+                have = out[k] == ef_ids[i].id;
+            }
+            if (!have && n < cap)
+            {
+                out[n++] = ef_ids[i].id;
+            }
+        }
+        for (size_t e = 0; e < ef_nedges; e++)
+        {
+            if (ef_edges[e].from != f || !(ef_edges[e].flags & EE_ERRORS))
+            {
+                continue;
+            }
+            int was = 0;
+            for (uint32_t k = 0; k < nseen && !was; k++)
+            {
+                was = seen[k] == ef_edges[e].to;
+            }
+            if (!was && nseen < 256 && ns < 256)
+            {
+                seen[nseen++] = ef_edges[e].to;
+                stack[ns++] = ef_edges[e].to;
+            }
+        }
+    }
+    return n;
+}
+
+// Does fn, or a function it calls, use a mutable module variable? (1 also when not known.)
+static int uses_globals(SymId fn)
+{
+    errors_close();
+    return !fn || fn >= ef_cap || !(cl_flags[fn] & 4) || (cl_flags[fn] & EF_GLOBALS);
+}
+
+int sema_error_set(SymId fn, uint8_t *panics, const uint64_t **ids, uint32_t *n, int *any)
+{
+    static uint64_t buf[128];
+    *panics = 0;
+    *ids = buf;
+    *n = 0;
+    *any = 0;
+    errors_close();
+    if (!fn || fn >= ef_cap || !(ef_flags[fn] & EF_SEEN))
+    {
+        return 0;
+    }
+    *panics = cl_panics[fn];
+    *n = error_ids_of(fn, buf, 128);
+    *ids = buf;
+    *any = (cl_flags[fn] & EF_ANY) != 0;
+    return (cl_flags[fn] & 4) != 0;
+}
+
+// An error's name, for a message or --sig: `bad_input`, or `panic.division`.
+int sema_error_name(uint64_t id, char *buf, size_t cap)
+{
+    static const char *const panics[] = {"division", "index", "assert", "anytype", "unhandled", "raised", "stack"};
+    if (id >= PANIC_DIVISION && id <= PANIC_STACK)
+    {
+        return snprintf(buf, cap, "panic.%s", panics[id - PANIC_DIVISION]);
+    }
+    if (id >= ERROR_FIRST && id - ERROR_FIRST < cx.syms.size)
+    {
+        int len;
+        const char *name = symbol_name((SymId)(id - ERROR_FIRST), &len);
+        return snprintf(buf, cap, "%.*s", len, name);
+    }
+    return snprintf(buf, cap, "error %llu", (unsigned long long)id);
+}
+
+// `if e { ... }` on the error of a call, `n, e := f()`: its arms are checked against f's set
+// once every body is checked (sema_errors_finish).
+typedef struct
+{
+    Unit *u;
+    Token at; // a copy: the body's tokens and nodes are gone by the end
+    SymId callee;
+    int value;
+    uint32_t ntaken;
+    uint64_t taken[32]; // the errors its arms take (nil is 0)
+} ErrMatch;
+static ErrMatch *err_matches;
+static uint32_t nerr_matches, err_matches_cap;
+
+void sema_errors_finish(void)
+{
+    errors_close();
+    for (uint32_t m = 0; m < nerr_matches; m++)
+    {
+        ErrMatch *em = &err_matches[m];
+        Unit *u = em->u;
+        uint8_t panics;
+        const uint64_t *ids;
+        uint32_t n;
+        int any;
+        int complete = sema_error_set(em->callee, &panics, &ids, &n, &any);
+        // what e can hold: nil, the errors, the panics
+        uint64_t need[96];
+        uint32_t nn = 0;
+        need[nn++] = 0;
+        for (uint32_t i = 0; i < n && nn < 96; i++)
+        {
+            need[nn++] = ids[i];
+        }
+        for (int k = 0; k < 7; k++)
+        {
+            if ((panics & (1u << k)) && nn < 96)
+            {
+                need[nn++] = (uint64_t)(PANIC_DIVISION + k);
+            }
+        }
+        char missing[400] = "";
+        size_t ml = 0;
+        for (uint32_t i = 0; i < nn; i++)
+        {
+            int taken = 0;
+            for (uint32_t t = 0; t < em->ntaken && !taken; t++)
+            {
+                taken = em->taken[t] == need[i];
+            }
+            if (!taken && ml + 40 < sizeof(missing))
+            {
+                char name[64];
+                if (need[i])
+                {
+                    sema_error_name(need[i], name, sizeof(name));
+                }
+                else
+                {
+                    snprintf(name, sizeof(name), "nil");
+                }
+                ml += (size_t)snprintf(missing + ml, sizeof(missing) - ml, "%s%s", ml ? ", " : "", name);
+            }
+        }
+        int len;
+        const char *fname = symbol_name(em->callee, &len);
+        const char *level = em->value ? "error" : "warning";
+        if (!complete || any)
+        {
+            diag_tok(u, &em->at, !complete && cx.cache ? "warning" : level, // (--cache: a file not checked again)
+                    "not every error of '%.*s' is known here (%s): end with `_: ...`", len, fname,
+                    any ? "it returns an error it holds" : "it calls a function not checked yet");
+        }
+        else if (missing[0])
+        {
+            diag_tok(u, &em->at, level,
+                    "'%.*s' can also give %s: add arms for them, or end with `_: ...`", len, fname, missing);
+        }
+    }
+    nerr_matches = 0;
+}
+
 
 // ---- function kinds (docs/comptime.md §2, step 0) --------------------------------------------
 //
@@ -199,6 +558,11 @@ static void note_global(Check *c, SymId sym, uint32_t tok)
     else if (s->flags & SYM_F_MUT)
     {
         note_effect(c, FX_MUTABLE, tok);
+        if (c->fn)
+        {
+            ef_fit(c->fn);
+            ef_flags[c->fn] |= EF_GLOBALS;
+        }
     }
 }
 
@@ -428,9 +792,9 @@ static int fits(TypeId from, TypeId to)
     {
         return 1;
     }
-    if (from == T_NIL && type_kind(to) == T_PTR)
+    if (from == T_NIL && (type_kind(to) == T_PTR || to == T_ERROR))
     {
-        return 1;
+        return 1; // nil: no reference, or no error (guards.md §5)
     }
     if (sema_is_any_ref(to) && type_kind(from) == T_PTR && !sema_is_any_ref(from))
     {
@@ -714,6 +1078,8 @@ static TypeId prim_type(const Token *t)
         return T_NONE;
     case 4:
         return memcmp(s, "bool", 4) == 0 ? T_BOOL : T_NONE;
+    case 5:
+        return memcmp(s, "error", 5) == 0 ? T_ERROR : T_NONE;
     default:
         return T_NONE;
     }
@@ -741,6 +1107,8 @@ static TypeId resolve_type(Unit *u, NodeId tn, SymId owner, int loud)
         TypeId elem = resolve_type(u, n->a, owner, loud);
         return elem == T_NONE ? T_NONE : type_make(T_PTR, elem);
     }
+    case AST_TYPE_FUNC: // `function(T): U`: a function given while compiling (the bound one, in a specialization)
+        return type_make(T_FUNC, 0);
     case AST_TYPE_EXPR: // `T.at(i).of`: what the specialization being read computed for it
         for (uint32_t i = 0; binding && i < binding->nt; i++)
         {
@@ -782,12 +1150,13 @@ static TypeId resolve_type(Unit *u, NodeId tn, SymId owner, int loud)
             }
             return T_NONE;
         }
-        if (!(type_is_int(elem) && elem != T_INT_LIT) && elem != T_BOOL)
+        int struct_elem = type_kind(elem) == T_STRUCT && !sema_is_register_block(type_ref(elem)); // (context.md §62)
+        if (!(type_is_int(elem) && elem != T_INT_LIT) && elem != T_BOOL && !struct_elem)
         {
             if (loud)
             {
                 char got[64];
-                diag_at(u, n->tok, "error", "an array of %s is not supported yet (numbers and bools are)",
+                diag_at(u, n->tok, "error", "an array of %s is not supported yet (numbers, bools and structs are)",
                         type_str(elem, got, sizeof(got)));
             }
             return T_NONE;
@@ -992,6 +1361,14 @@ static TypeId fn_ret_type(Unit *u, SymId fn)
     u = &cx.units[SYM(fn)->unit];
     NodeId decl = SYM(fn)->decl;
     NodeId callable = NODE(u, decl)->kind == AST_DEFINE ? NODE(u, decl)->a : decl;
+    if (NODE(u, callable)->kind == AST_FN_LIT && (NODE(u, callable)->flags & AST_F_ONELINE) &&
+        !fn_ret_node(u, callable))
+    {
+        // `(k: u64): k * limit`: the expression's type, once its body is checked
+        NodeId body = fn_body(u, callable);
+        TypeId t = u->types && body < u->side_cap ? u->types[body] : T_NONE;
+        return t == T_INT_LIT ? T_INT : t == T_NONE ? T_VOID : t;
+    }
     const Spec *old = bind_for(fn);
     TypeId t = resolve_type(u, fn_ret_node(u, callable), SYM(fn)->owner, 0);
     binding = old;
@@ -1015,6 +1392,26 @@ static NodeId fn_params(const Unit *u, SymId fn)
 // as `self` is: the caller's value is shared, never copied.
 static TypeId param_type(Unit *u, NodeId param, SymId owner, int loud)
 {
+    if (!NODE(u, param)->a && (NODE(u, param)->flags & AST_F_PATTERN)) // `(0..10) { ... }`: its first call's
+    {
+        return u->types && param < u->side_cap ? u->types[param] : T_NONE;
+    }
+    if (!NODE(u, param)->a && u->types && param < u->side_cap && u->types[param]) // `x: x * 2`: given by the callee
+    {
+        return u->types[param];
+    }
+    if (NODE(u, param)->a && NODE(u, NODE(u, param)->a)->kind == AST_TYPE_FUNC)
+    {
+        NameId name = token_name(TOK(u, NODE(u, param)->tok)); // the function a specialization was made for
+        for (uint32_t b = 0; binding && b < binding->n; b++)
+        {
+            if (binding->names[b] == name && binding->is_value[b] == 2)
+            {
+                return type_make(T_FUNC, (SymId)binding->values[b]);
+            }
+        }
+        return type_make(T_FUNC, 0);
+    }
     TypeId t = resolve_type(u, NODE(u, param)->a, owner, loud);
     if (!(NODE(u, param)->flags & AST_F_CONTEXT))
     {
@@ -1103,6 +1500,117 @@ static TypeId value_type(Unit *u, SymId s)
     return T_EXTERN;
 }
 
+// `n, e := f(...)` where f takes the `arena` context: does an error give the arena back? Only when
+// nothing the call allocates can stay reachable after it: its value holds no reference, no other
+// argument is one, and neither f nor a function it calls uses a mutable module variable. Decided
+// here, from what the compiler knows of the call; --audit says which, and why not.
+static void arena_decision(Check *c, NodeId define, NodeId call, SymId callee, TypeId vt)
+{
+    Unit *u = c->u;
+    NodeId arena = 0;
+    const char *why = NULL;
+    for (NodeId a = NODE(u, call)->b; a; a = NEXT(u, a))
+    {
+        const AstNode *an = NODE(u, a);
+        TypeId at = u->types[a];
+        int context = an->kind == AST_IDENT && type_kind(at) == T_PTR && type_kind(type_ref(at)) == T_STRUCT;
+        if (context)
+        {
+            int sl;
+            const char *sn = symbol_name(type_ref(type_ref(at)), &sl);
+            const Token *t = TOK(u, an->tok);
+            context = (int)t->len == sl && memcmp(TSTART(t), sn, (size_t)sl) == 0; // `arena`, `out`: a context
+            if (context && sl == 5 && memcmp(sn, "arena", 5) == 0)
+            {
+                arena = a;
+                continue;
+            }
+        }
+        if (!context && (type_kind(at) == T_PTR || at == T_STR))
+        {
+            why = "an argument is a reference, which could keep what it allocates";
+        }
+    }
+    if (!arena)
+    {
+        return;
+    }
+    int cl;
+    const char *cn = symbol_name(callee, &cl);
+    char text[300];
+    if (!why && !(type_is_int(vt) || vt == T_BOOL || vt == T_ERROR || vt == T_VOID || vt == T_NONE))
+    {
+        why = "its value could hold a reference to what it allocates";
+    }
+    if (!why && uses_globals(callee))
+    {
+        errors_close();
+        why = callee < ef_cap && (cl_flags[callee] & 4)
+                  ? "it, or a function it calls, uses a mutable module variable, which could keep what it allocates"
+                  : "what it does is not known here yet";
+    }
+    if (!why)
+    {
+        NODE(u, define)->aux |= DEFINE_ROLLBACK;
+        snprintf(text, sizeof(text), "'%.*s': on an error the arena goes back to where it was at the call", cl, cn);
+    }
+    else
+    {
+        snprintf(text, sizeof(text), "'%.*s': the arena keeps what it allocated on an error: %s", cl, cn, why);
+    }
+    audit_boundary(u, NODE(u, call)->tok, text);
+}
+
+// ---- captures (context.md §60) -----------------------------------------------------------------
+//
+// A function literal that reads locals of the function around it takes them as parameters of its
+// own, after the ones it declares, and every call passes them (lambda lifting): no closure object.
+// It never escapes (a literal is only called), so a call always has them in scope. A capture is
+// read, never assigned, and is one slot (a number, a bool, a string, an error, a reference).
+static Capture *captures;
+static uint32_t ncaptures, captures_cap;
+
+static void note_capture(Check *c, const Token *t, const Local *l)
+{
+    NameId name = token_name(t);
+    for (uint32_t i = 0; i < ncaptures; i++)
+    {
+        if (captures[i].lit == c->literal && captures[i].name == name)
+        {
+            return;
+        }
+    }
+    TypeId ty = l->type;
+    int one = type_is_int(ty) || ty == T_BOOL || ty == T_STR || ty == T_ERROR || type_kind(ty) == T_PTR;
+    if (!one)
+    {
+        char x[64];
+        diag_tok(c->u, t, "error", "a literal reads '%.*s' of the function around it, a %s: only a number, a "
+                 "bool, a []u8, an error or a reference can be read so yet (pass it as a parameter)",
+                 t->len, TSTART(t), type_str(ty, x, sizeof(x)));
+        return;
+    }
+    if (ncaptures == captures_cap)
+    {
+        captures_cap = captures_cap ? captures_cap * 2 : 16;
+        captures = (Capture *)realloc(captures, captures_cap * sizeof(Capture));
+    }
+    captures[ncaptures++] = (Capture){c->literal, name, ty == T_INT_LIT ? T_INT : ty};
+}
+
+uint32_t sema_captures(SymId lit, Capture *out, uint32_t cap)
+{
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < ncaptures; i++)
+    {
+        if (captures[i].lit == lit && n < cap)
+        {
+            out[n++] = captures[i];
+        }
+    }
+    return n;
+}
+
 // ---- names -----------------------------------------------------------------------------------
 
 static void push_local(Check *c, uint32_t tok, TypeId type, int mut)
@@ -1123,7 +1631,7 @@ static void push_local(Check *c, uint32_t tok, TypeId type, int mut)
         diag_at(c->u, tok, "error", "too many locals in one function (limit is %d)", MAX_LOCALS);
         return;
     }
-    c->locals[c->nlocals++] = (Local){tok, type, name, (uint8_t)mut, 0, 0, 0, 0, 0, 0, 0};
+    c->locals[c->nlocals++] = (Local){tok, type, name, (uint8_t)mut, 0, 0, 0, 0, 0, 0, 0, 0};
 }
 
 // `a := f(x)` holds the call itself, its arguments bound, when the body calls `a()` after it:
@@ -1150,6 +1658,32 @@ static int called_bare_later(const Unit *u, uint32_t name_tok)
         else if (t->kind == TOK_IDENTIFIER && t->len == name->len && memcmp(TSTART(t), TSTART(name), t->len) == 0 &&
                  TOK(u, i - 1)->kind != TOK_DOT && TOK(u, i + 1)->kind == TOK_LPAREN &&
                  TOK(u, i + 2)->kind == TOK_RPAREN)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Is the name at name_tok read after it, before the end of its block? (`n, e := f()`: an e no
+// line reads is an error no one handles.)
+static int mentioned_later(const Unit *u, uint32_t name_tok)
+{
+    const Token *name = TOK(u, name_tok);
+    int depth = 0;
+    for (size_t i = name_tok + 1; i < u->tokens.size; i++)
+    {
+        const Token *t = TOK(u, i);
+        if (t->kind == TOK_EOF || (t->kind == TOK_RBRACE && --depth < 0))
+        {
+            return 0;
+        }
+        if (t->kind == TOK_LBRACE)
+        {
+            depth++;
+        }
+        else if (t->kind == TOK_IDENTIFIER && t->len == name->len && memcmp(TSTART(t), TSTART(name), t->len) == 0 &&
+                 TOK(u, i - 1)->kind != TOK_DOT)
         {
             return 1;
         }
@@ -1216,6 +1750,7 @@ static NameKind find_name(Check *c, const Token *t, SymId *sym, TypeId *type)
             if (c->literal && i < c->fn_base)
             {
                 SYM(c->literal)->flags |= SYM_F_CAPTURES; // a closure
+                note_capture(c, t, &c->locals[i]);
             }
             *type = c->locals[i].type;
             c->found_nonzero = c->locals[i].nonzero;
@@ -1253,7 +1788,7 @@ static NameKind find_name(Check *c, const Token *t, SymId *sym, TypeId *type)
     // the language's primitives (docs/std.md §2), after every declaration: a program's own wins
     if (text_is(t, "sizeof") || text_is(t, "alignof") || text_is(t, "offsetof") || text_is(t, "fieldsof") ||
         text_is(t, "load") ||
-        text_is(t, "typeof") || text_is(t, "trap") || type_is_int(prim_type(t)))
+        text_is(t, "typeof") || text_is(t, "trap") || text_is(t, "panic") || type_is_int(prim_type(t)))
     {
         return NAME_BUILTIN;
     }
@@ -1632,6 +2167,13 @@ static TypeId check_convert(Check *c, NodeId id, uint32_t at, TypeId to)
 static TypeId check_trap(Check *c, NodeId id, uint32_t at)
 {
     Unit *u = c->u;
+    {
+        int al = 0;
+        const char *an = c->fn ? symbol_name(c->fn, &al) : "";
+        note_panic(c, al == 6 && memcmp(an, "assert", 6) == 0 && strstr(cx.units[SYM(c->fn)->unit].path, "std/")
+                          ? PANIC_ASSERT
+                          : PANIC_RAISED);
+    }
     if (!NODE(u, id)->b)
     {
         diag_at(u, at, "error", "trap takes the message to stop with: `trap(\"why\")`");
@@ -2220,6 +2762,10 @@ static int sig_generic(SymId fn)
         {
             return 1;
         }
+        if (pt && pt->kind == AST_TYPE_FUNC)
+        {
+            return 1; // a function given while compiling
+        }
     }
     return 0;
 }
@@ -2472,6 +3018,35 @@ static struct
 } generics[GENERIC_MAX];
 static uint32_t ngenerics;
 
+// The parameters typed `function(...)` (context.md §61): known while compiling, each a function
+// given by name or as a literal; the function is made once per set of them.
+static int function_params(SymId fn, int *index, NameId *names, int k)
+{
+    Unit *u = &cx.units[SYM(fn)->unit];
+    int added = 0, i = 0;
+    for (NodeId p = fn_params(u, fn); p && k + added < SPEC_MAX_BOUND; p = NEXT(u, p), i++)
+    {
+        if (NODE(u, p)->a && NODE(u, NODE(u, p)->a)->kind == AST_TYPE_FUNC)
+        {
+            index[k + added] = i;
+            names[k + added] = token_name(TOK(u, NODE(u, p)->tok));
+            added++;
+        }
+    }
+    return added;
+}
+
+static int is_function_param(SymId fn, int i)
+{
+    Unit *u = &cx.units[SYM(fn)->unit];
+    NodeId p = fn_params(u, fn);
+    for (int j = 0; p && j < i; j++)
+    {
+        p = NEXT(u, p);
+    }
+    return p && NODE(u, p)->a && NODE(u, NODE(u, p)->a)->kind == AST_TYPE_FUNC;
+}
+
 static int compile_params(SymId fn, int *index, NameId *names, int *types_count)
 {
     for (uint32_t g = 0; g < ngenerics; g++)
@@ -2489,6 +3064,7 @@ static int compile_params(SymId fn, int *index, NameId *names, int *types_count)
     if (SYM(fn)->kind == SYM_METHOD && !spec_of(fn))
     {
         k += index_params(fn, index, names, k);
+        k += function_params(fn, index, names, k);
     }
     if (k && ngenerics < GENERIC_MAX)
     {
@@ -2711,6 +3287,113 @@ static void spec_type_exprs(Check *caller, Spec *sp, uint32_t at)
 
 // A call of a function made once per type: the specialization for the types its arguments
 // name (made, and checked, the first time).
+// The function given to parameter `pi` of fn (`function(T): U`): a function's name, or a literal.
+// A literal with a parameter of no type (`x: x * 2`) takes the signature's types, the type
+// parameters bound as this call binds them, and is checked now, where it is written.
+static SymId function_argument(Check *c, SymId fn, int pi, NodeId a, const NameId *names, const TypeId *types,
+                               int ntypes)
+{
+    Unit *u = c->u;
+    Unit *home = &cx.units[SYM(fn)->unit];
+    NodeId p = fn_params(home, fn);
+    for (int j = 0; p && j < pi; j++)
+    {
+        p = NEXT(home, p);
+    }
+    const AstNode *ft = NODE(home, NODE(home, p)->a);
+    Spec tmp;
+    memset(&tmp, 0, sizeof(tmp)); // the type parameters as this call binds them
+    tmp.n = (uint32_t)ntypes;
+    memcpy(tmp.names, names, (size_t)ntypes * sizeof(NameId));
+    memcpy(tmp.types, types, (size_t)ntypes * sizeof(TypeId));
+    const Spec *old = binding;
+    binding = &tmp;
+    TypeId want[16];
+    int nwant = 0;
+    for (NodeId t = ft->a; t && nwant < 16; t = NEXT(home, t))
+    {
+        want[nwant++] = resolve_type(home, t, SYM(fn)->owner, 0);
+    }
+    TypeId want_ret = ft->b ? resolve_type(home, ft->b, SYM(fn)->owner, 0) : T_VOID;
+    binding = old;
+    int len;
+    const char *name = symbol_name(fn, &len);
+    const AstNode *an = NODE(u, a);
+    SymId given = 0;
+    if (an->kind == AST_FN_LIT)
+    {
+        int i = 0;
+        for (NodeId q = an->a; q; q = NEXT(u, q), i++)
+        {
+            if (!NODE(u, q)->a && !(NODE(u, q)->flags & AST_F_PATTERN) && i < nwant)
+            {
+                u->types[q] = want[i]; // `x: ...`: x is what the signature says
+            }
+        }
+        TypeId t = check_expr(c, a);
+        given = type_kind(t) == T_FUNC ? type_ref(t) : 0;
+        Capture caps[1];
+        if (given && sema_captures(given, caps, 1))
+        {
+            const Name *nm = name_at(caps[0].name);
+            diag_at(u, an->tok, "error",
+                    "a literal given to '%.*s' reads '%.*s' of the function around it: that is not supported yet "
+                    "(give it as an argument)",
+                    len, name, (int)nm->len, nm->start);
+            return 0;
+        }
+    }
+    else if (an->kind == AST_IDENT)
+    {
+        TypeId t = check_expr(c, a);
+        given = type_kind(t) == T_FUNC ? type_ref(t) : 0;
+        if (!given && u->refs[a] && SYM(u->refs[a])->kind == SYM_METHOD)
+        {
+            given = u->refs[a];
+        }
+        if (!given && u->refs[a] && SYM(u->refs[a])->kind == SYM_IMPORT)
+        {
+            given = module_binding_function(u->refs[a]);
+        }
+    }
+    if (!given)
+    {
+        diag_at(u, an->tok, "error",
+                "'%.*s' takes a function here (`function(...)`): name one, or write one, `x: x * 2`", len, name);
+        return 0;
+    }
+    // its parameters and result must be the signature's
+    Unit *gh = &cx.units[SYM(given)->unit];
+    int i = 0;
+    NodeId gp = sema_fn_params(gh, given);
+    for (; gp && i < nwant; gp = NEXT(gh, gp), i++)
+    {
+        TypeId pt = sema_param_type(gh, given, gp);
+        if (pt != want[i] && !(NODE(gh, gp)->flags & AST_F_PATTERN))
+        {
+            char x[64], y[64];
+            diag_at(u, an->tok, "error", "the function given to '%.*s' takes %s, but its signature gives it %s",
+                    len, name, type_str(pt, x, sizeof(x)), type_str(want[i], y, sizeof(y)));
+            return 0;
+        }
+    }
+    if (gp || i != nwant)
+    {
+        diag_at(u, an->tok, "error", "the function given to '%.*s' takes %d parameters, its signature gives %d",
+                len, name, i + (gp ? 1 : 0), nwant);
+        return 0;
+    }
+    TypeId gr = fn_ret_type(gh, given);
+    if (want_ret != T_VOID && !fits(gr, want_ret))
+    {
+        char x[64], y[64];
+        diag_at(u, an->tok, "error", "the function given to '%.*s' gives %s, but its signature wants %s", len,
+                name, type_str(gr, x, sizeof(x)), type_str(want_ret, y, sizeof(y)));
+        return 0;
+    }
+    return given;
+}
+
 static SymId specialize(Check *c, SymId fn, NodeId args, uint32_t at)
 {
     int index[SPEC_MAX_BOUND], ntypes;
@@ -2727,6 +3410,10 @@ static SymId specialize(Check *c, SymId fn, NodeId args, uint32_t at)
             a = NEXT(c->u, a);
         }
         types[j] = T_NONE;
+        if (is_function_param(fn, index[j]))
+        {
+            continue; // a function: after the types (its literal is typed by them)
+        }
         uint64_t v;
         if (a)
         {
@@ -2780,6 +3467,24 @@ static SymId specialize(Check *c, SymId fn, NodeId args, uint32_t at)
             return 0;
         }
     }
+    for (int j = ntypes; j < k; j++) // a function: a name, or a literal typed by the signature
+    {
+        if (!is_function_param(fn, index[j]))
+        {
+            continue;
+        }
+        NodeId a = args;
+        for (int i = 0; a && i < index[j]; i++)
+        {
+            a = NEXT(c->u, a);
+        }
+        SymId given = a ? function_argument(c, fn, index[j], a, names, types, ntypes) : 0;
+        if (!given)
+        {
+            return 0;
+        }
+        values[j] = given;
+    }
     Spec *sp = NULL;
     for (uint32_t i = 0; i < nspecs && !sp; i++)
     {
@@ -2820,7 +3525,7 @@ static SymId specialize(Check *c, SymId fn, NodeId args, uint32_t at)
         memcpy(sp->values, values, (size_t)k * sizeof(uint64_t));
         for (int j = ntypes; j < k; j++)
         {
-            sp->is_value[j] = 1;
+            sp->is_value[j] = is_function_param(fn, index[j]) ? 2 : 1; // 2: a function (its symbol)
         }
         spec_type_exprs(c, sp, at);
         Unit *home = &cx.units[SYM(fn)->unit];
@@ -2837,6 +3542,49 @@ static SymId specialize(Check *c, SymId fn, NodeId args, uint32_t at)
     return specs[at_index].fn;
 }
 
+// A literal whose parameter is a pattern alone, `f := (0..10) { ... }`, waits for its first call:
+// that call's argument gives the parameter its type (use decides), and the body is checked then,
+// seeing the locals that were there where it is written.
+typedef struct
+{
+    SymId lit;
+    NodeId node;
+    int nlocals; // the locals it can see
+} PendingLit;
+static PendingLit pending_lits[64];
+static uint32_t npending_lits;
+
+static void check_callable(Check *c, NodeId fn, SymId owner, SymId sym);
+static void check_waiting_literal(Check *c, SymId lit, NodeId args)
+{
+    Unit *u = c->u;
+    for (uint32_t i = 0; i < npending_lits; i++)
+    {
+        if (pending_lits[i].lit != lit)
+        {
+            continue;
+        }
+        PendingLit w = pending_lits[i];
+        pending_lits[i] = pending_lits[--npending_lits];
+        NodeId a = args;
+        for (NodeId p = NODE(u, w.node)->a; p; p = NEXT(u, p), a = a ? NEXT(u, a) : 0)
+        {
+            if (NODE(u, p)->a || !(NODE(u, p)->flags & AST_F_PATTERN))
+            {
+                continue;
+            }
+            TypeId at = a ? check_expr(c, a) : T_NONE;
+            u->types[p] = at == T_INT_LIT ? T_INT : at; // the argument's type is the parameter's
+        }
+        int saved = c->nlocals;
+        c->nlocals = w.nlocals < saved ? w.nlocals : saved;
+        check_callable(c, w.node, c->owner, lit);
+        c->nlocals = saved;
+        return;
+    }
+}
+
+static void error_goes_up(Check *c, uint32_t at, SymId fn);
 static TypeId call_function(Check *c, NodeId id, uint32_t at, SymId first)
 {
     NodeId args = NODE(c->u, id)->b;
@@ -2874,6 +3622,12 @@ static TypeId call_function(Check *c, NodeId id, uint32_t at, SymId first)
     check_args(c, args, fn);
     c->u->refs[id] = fn;
     note_call(c, fn);
+    if (fn && sema_fn_fails(fn) && c->handled != id)
+    {
+        error_goes_up(c, at, fn); // `n := parse(s)`: an error of parse goes up
+    }
+    note_edge(c, fn, (uint8_t)((sema_fn_fails(fn) && c->handled != id ? EE_ERRORS : 0) | (c->guard != id ? EE_PANICS : 0) |
+                               EE_CALLS));
     if (fn && c->fn && cx.sym_names[fn] == cx.sym_names[c->fn] && SYM(fn)->owner == SYM(c->fn)->owner)
     {
         SYM(c->fn)->flags |= SYM_F_LOOPS; // the lowering inlines larger bodies into it
@@ -2977,6 +3731,7 @@ static TypeId check_call(Check *c, NodeId id)
                 if (sema_is_any_ref(at)) // `point(a)`: what a points to, as a point
                 {
                     NODE(u, id)->aux = PRIM_UNANY;
+                    note_panic(c, PANIC_ANYTYPE);
                     u->refs[id] = as;
                     set_type(c, callee, T_EXTERN);
                     return type_make(T_PTR, type_make(T_STRUCT, as));
@@ -3009,6 +3764,12 @@ static TypeId check_call(Check *c, NodeId id)
                 check_args(c, args, 0);
                 return T_NONE;
             }
+            if (text_is(t, "panic") && SYM(sym)->kind == SYM_IMPORT && !module_binding_function(sym))
+            {
+                NODE(u, id)->aux = PRIM_TRAP; // `panic := import("std").panic`: a module, and `panic("why")`
+                set_type(c, callee, T_EXTERN);
+                return check_trap(c, id, cn->tok);
+            }
             // `assert := import("std").assert`: a binding that names a function is that function
             SymId bound = SYM(sym)->kind == SYM_IMPORT && sema_std_member(u, sym) == STD_NONE
                               ? module_binding_function(sym)
@@ -3037,6 +3798,7 @@ static TypeId check_call(Check *c, NodeId id)
         }
         else if (kind == NAME_LOCAL && type_kind(type) == T_FUNC)
         {
+            check_waiting_literal(c, type_ref(type), args); // `(0..10) { ... }`: typed by this call
             return call_function(c, id, cn->tok, type_ref(type)); // f := double; f(1)
         }
         else if (kind == NAME_LOCAL && type != T_EXTERN && type != T_NONE)
@@ -3064,9 +3826,9 @@ static TypeId check_call(Check *c, NodeId id)
                 NODE(u, id)->aux = PRIM_LOAD;
                 return check_load(c, id, cn->tok);
             }
-            if (text_is(t, "trap"))
+            if (text_is(t, "trap") || text_is(t, "panic"))
             {
-                NODE(u, id)->aux = PRIM_TRAP;
+                NODE(u, id)->aux = PRIM_TRAP; // `panic("why")`: panic.raised (guards.md §5)
                 return check_trap(c, id, cn->tok);
             }
             TypeId to = prim_type(t);
@@ -3195,6 +3957,11 @@ static TypeId check_binary(Check *c, const AstNode *n)
     {
         diag_at(c->u, NODE(c->u, n->b)->tok, "error", "division by zero");
         return T_NONE;
+    }
+    if (op == TOK_SLASH && !(exact_value(c->u, n->b, &divisor) && divisor != 0) &&
+        !(NODE(c->u, n->b)->kind == AST_IDENT && (NODE(c->u, n->b)->aux & IDENT_NONZERO)))
+    {
+        note_panic(c, PANIC_DIVISION); // a divisor the compiler cannot prove not zero
     }
     if (l == T_INT_LIT && r != T_INT_LIT)
     {
@@ -3327,6 +4094,36 @@ static int frame_reference(Check *c, NodeId id)
     return l && l->frame ? 2 : 0;
 }
 
+// Does fn say `, error` in its result (guards.md §5)?
+int sema_fn_fails(SymId fn)
+{
+    if (!fn || SYM(fn)->kind != SYM_METHOD || !SYM(fn)->decl)
+    {
+        return 0;
+    }
+    const Unit *u = &cx.units[SYM(fn)->unit];
+    NodeId decl = SYM(fn)->decl;
+    NodeId callable = NODE(u, decl)->kind == AST_DEFINE ? NODE(u, decl)->a : decl;
+    NodeId sig = NODE(u, callable)->b;
+    return sig && NODE(u, callable)->kind != AST_DEFINE && (NODE(u, sig)->aux & SIG_FAILS);
+}
+
+// An error that is not handled here goes up: the function must say so.
+static void error_goes_up(Check *c, uint32_t at, SymId fn)
+{
+    if (c->fails || c->ret == T_ERROR || !c->in_callable)
+    {
+        return;
+    }
+    int len, ml = 0;
+    const char *name = symbol_name(fn, &len);
+    const char *mine = c->fn ? symbol_name(c->fn, &ml) : "";
+    diag_at(c->u, at, "error",
+            "'%.*s' can fail, and its error is not handled here: bind it, `n, e := %.*s(...)`, or say that "
+            "'%.*s' can fail too (`, error` in its result)",
+            len, name, len, name, ml, mine);
+}
+
 static void check_return(Check *c, NodeId id, NodeId value)
 {
     const AstNode *v = value ? NODE(c->u, value) : NULL;
@@ -3334,6 +4131,25 @@ static void check_return(Check *c, NodeId id, NodeId value)
                        NODE(c->u, v->a)->kind == AST_STRUCT_LIT;
     TypeId got = value ? check_expr(c, value) : T_VOID;
     c->returning_ref = 0;
+    if (value && got == T_ERROR && (c->fails || c->ret == T_ERROR))
+    {
+        uint64_t eid;
+        if (const_value(c->u, value, T_ERROR, &eid))
+        {
+            if (eid)
+            {
+                note_error_id(c, eid);
+            }
+        }
+        else if (c->fn)
+        {
+            note_any(c); // an error it holds: which one is not known here
+        }
+    }
+    if (c->fails && got == T_ERROR && c->ret != T_ERROR)
+    {
+        return; // `return bad_input` in `parse(...): u64, error` (guards.md §5)
+    }
     if (value && sema_is_any_ref(c->ret) && type_kind(got) == T_PTR && !sema_is_any_ref(got))
     {
         diag_at(c->u, v->tok, "error",
@@ -3852,6 +4668,203 @@ static NodeId static_arm(Check *c, NodeId id, const TypeId *types, const NodeId 
     return 0;
 }
 
+// Is `call` (not checked yet) a call to a function that says `, error`? Its callee is looked up
+// by name, as check_call will.
+static int call_fails(Check *c, NodeId call)
+{
+    const AstNode *cn = NODE(c->u, NODE(c->u, call)->a);
+    if (cn->kind != AST_IDENT)
+    {
+        return 0;
+    }
+    SymId sym;
+    TypeId type;
+    NameKind k = find_name(c, TOK(c->u, cn->tok), &sym, &type);
+    if (k == NAME_SYMBOL && SYM(sym)->kind == SYM_IMPORT)
+    {
+        sym = module_binding_function(sym);
+    }
+    for (SymId f = (k == NAME_SYMBOL || k == NAME_MEMBER) ? sym : 0; f; f = SYM(f)->next_overload)
+    {
+        if (SYM(f)->kind == SYM_METHOD && sema_fn_fails(f))
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// What an arm of a stage on a call that can fail tests (guards.md §5): a type as a pattern says
+// which side, an error's name one error, anything else the value.
+int sema_error_arm(const Unit *u, NodeId pat, TypeId value_type, uint64_t *id)
+{
+    const AstNode *p = NODE(u, pat);
+    *id = 0;
+    if (p->aux & PAT_ANY)
+    {
+        return EARM_ANY;
+    }
+    if (!(p->aux & PAT_NAME) || !p->a || (NODE(u, p->a)->kind != AST_IDENT && NODE(u, p->a)->kind != AST_SELECTOR))
+    {
+        return EARM_VALUE;
+    }
+    const Token *t = TOK(u, NODE(u, p->a)->tok);
+    if (NODE(u, p->a)->kind == AST_SELECTOR) // `panic.division`: a module's error
+    {
+        SymId s = u->refs ? u->refs[p->a] : 0;
+        uint64_t v;
+        if (s && SYM(s)->kind == SYM_CONST && sema_comptime_value(s, &v))
+        {
+            *id = v;
+            return EARM_NAME;
+        }
+        return EARM_VALUE;
+    }
+    if (text_is(t, "error"))
+    {
+        return EARM_ERROR;
+    }
+    if (text_is(t, "nil"))
+    {
+        return EARM_NAME; // no error: 0
+    }
+    TypeId prim = prim_type(t);
+    if (prim != T_NONE && prim != T_VOID)
+    {
+        (void)value_type;
+        return EARM_VALUE_TYPE;
+    }
+    SymId s = u->refs ? u->refs[p->a] : 0;
+    uint64_t v;
+    if (s && SYM(s)->kind == SYM_CONST && sema_value_type((Unit *)&cx.units[SYM(s)->unit], s) == T_ERROR &&
+        sema_comptime_value(s, &v))
+    {
+        *id = v;
+        return EARM_NAME;
+    }
+    return EARM_VALUE;
+}
+
+// A stage on a call that can fail: its value and its error, each arm on one side. What no arm
+// takes goes on: a value passes (it must fit the arms), an error goes up (or to `n, e :=`).
+static TypeId check_error_match(Check *c, NodeId id)
+{
+    Unit *u = c->u;
+    AstNode *m = NODE(u, id);
+    NodeId subject = m->a;
+    NodeId saved = c->handled;
+    c->handled = subject; // the stage takes the call's error
+    TypeId vt = check_expr(c, subject);
+    c->handled = saved;
+    SymId fn = u->refs[subject];
+    int errors_taken = 0, values_taken = 0, value_arms = 1;
+    TypeId result = T_NONE;
+    char x[64], y[64];
+    for (NodeId arm = m->b; arm; arm = NEXT(u, arm))
+    {
+        const AstNode *a = NODE(u, arm);
+        NodeId pat = a->a;
+        if (NEXT(u, pat))
+        {
+            diag_at(u, a->tok, "error", "an arm on a call that can fail takes one pattern");
+            continue;
+        }
+        const AstNode *pn = NODE(u, pat);
+        if ((pn->aux & PAT_NAME) && pn->a && NODE(u, pn->a)->kind == AST_SELECTOR)
+        {
+            check_expr(c, pn->a); // `panic.division`
+        }
+        if ((pn->aux & PAT_NAME) && pn->a && NODE(u, pn->a)->kind == AST_IDENT)
+        {
+            const Token *t = TOK(u, NODE(u, pn->a)->tok);
+            if (!text_is(t, "error") && !text_is(t, "nil") && prim_type(t) == T_NONE)
+            {
+                check_expr(c, pn->a); // a name: it must exist (an error, or a value)
+            }
+        }
+        uint64_t eid;
+        int cls = sema_error_arm(u, pat, vt, &eid);
+        Pattern pt;
+        if (cls == EARM_ANY)
+        {
+            errors_taken = values_taken = 1;
+        }
+        else if (cls == EARM_ERROR)
+        {
+            errors_taken = 1;
+        }
+        else if (cls == EARM_VALUE_TYPE)
+        {
+            const Token *t = TOK(u, NODE(u, pn->a)->tok);
+            if (prim_type(t) != vt)
+            {
+                diag_at(u, pn->tok, "error", "'%.*s' is not the value's type, %s", t->len, TSTART(t),
+                        type_str(vt, x, sizeof(x)));
+            }
+            values_taken = 1;
+        }
+        else if (cls == EARM_VALUE && !sema_arm_pattern(u, pat, vt, &pt) && !sema_arm_name(u, pat, vt))
+        {
+            diag_at(u, pn->tok, "error", "this pattern does not fit the value, %s, nor is it an error",
+                    type_str(vt, x, sizeof(x)));
+        }
+        NodeId r = a->b;
+        TypeId t = check_expr(c, r);
+        if (type_kind(t) == T_FUNC && NODE(u, r)->kind == AST_IDENT) // `u64: double`: given the value
+        {
+            SymId f = type_ref(t);
+            NodeId p = sema_fn_params(u, f);
+            if (!p || NEXT(&cx.units[SYM(f)->unit], p) ||
+                !fits(vt, sema_param_type(&cx.units[SYM(f)->unit], f, p)))
+            {
+                diag_at(u, NODE(u, r)->tok, "error", "a function named in an arm is given the value, %s: it "
+                        "takes one parameter of that type", type_str(vt, x, sizeof(x)));
+            }
+            note_call(c, f);
+            t = fn_ret_type(u, f);
+        }
+        if (is_statement(u, r) || t == T_VOID)
+        {
+            value_arms = 0;
+            continue;
+        }
+        if (result == T_NONE || result == T_INT_LIT)
+        {
+            result = t == T_NONE ? result : t;
+        }
+        else if (!fits(t, result) && t != T_NONE)
+        {
+            diag_at(u, a->tok, "error", "this arm gives %s, but the arms above give %s",
+                    type_str(t, x, sizeof(x)), type_str(result, y, sizeof(y)));
+        }
+    }
+    m->aux |= MATCH_ERRORS;
+    if (!errors_taken && c->handled != id && fn)
+    {
+        error_goes_up(c, m->tok, fn);
+        note_edge(c, fn, EE_ERRORS);
+    }
+    if (!value_arms || (m->aux & MATCH_STATEMENT))
+    {
+        return T_VOID;
+    }
+    if (result == T_INT_LIT)
+    {
+        result = vt;
+    }
+    if (!values_taken)
+    {
+        if (!fits(vt, result))
+        {
+            diag_at(u, m->tok, "error", "a value no arm takes goes on, but it is %s and the arms give %s: add "
+                    "`%s: ...` or `_: ...`", type_str(vt, x, sizeof(x)), type_str(result, y, sizeof(y)),
+                    type_str(vt, x, sizeof(x)));
+        }
+        m->aux |= MATCH_PASS;
+    }
+    return result;
+}
+
 static TypeId check_match(Check *c, NodeId id)
 {
     Unit *u = c->u;
@@ -4122,7 +5135,45 @@ static TypeId check_match(Check *c, NodeId id)
     // A statement may leave values untaken (it does nothing for them): a warning. A value, or a
     // body that returns one, takes them all.
     const char *level = (m->aux & MATCH_STATEMENT) || (on_params && c->ret == T_VOID) ? "warning" : "error";
-    if (!full && (m->aux & MATCH_PARTIAL)) // a pipe stage: what no arm takes goes on (std.md §14)
+    SymId err_callee = 0; // `if e { ... }` with `n, e := f()`: checked against f's set, at the end
+    if (!full && ns == 1 && types[0] == T_ERROR && m->a && NODE(u, m->a)->kind == AST_IDENT &&
+        !(m->aux & MATCH_PARTIAL))
+    {
+        NameId en = token_name(TOK(u, NODE(u, m->a)->tok));
+        for (int i = c->nlocals - 1; i >= 0; i--)
+        {
+            if (c->locals[i].name == en)
+            {
+                err_callee = c->locals[i].err_of;
+                break;
+            }
+        }
+    }
+    if (err_callee)
+    {
+        if (nerr_matches == err_matches_cap)
+        {
+            uint32_t nc = err_matches_cap ? err_matches_cap * 2 : 16;
+            ErrMatch *grown = (ErrMatch *)arena_alloc(nc * sizeof(ErrMatch));
+            if (nerr_matches)
+            {
+                memcpy(grown, err_matches, nerr_matches * sizeof(ErrMatch));
+            }
+            err_matches = grown;
+            err_matches_cap = nc;
+        }
+        ErrMatch *em = &err_matches[nerr_matches++];
+        *em = (ErrMatch){u, *TOK(u, m->tok), err_callee, !(m->aux & MATCH_STATEMENT) && value_arms, 0, {0}};
+        for (NodeId arm = m->b; arm && em->ntaken < 32; arm = NEXT(u, arm))
+        {
+            Pattern pt;
+            if (sema_arm_pattern(u, NODE(u, arm)->a, T_ERROR, &pt) && pt.kind == PATTERN_VALUE)
+            {
+                em->taken[em->ntaken++] = pt.lo;
+            }
+        }
+    }
+    else if (!full && (m->aux & MATCH_PARTIAL)) // a pipe stage: what no arm takes goes on (std.md §14)
     {
         if (value_arms && result != T_NONE && !(m->aux & MATCH_STATEMENT))
         {
@@ -4317,6 +5368,10 @@ static void check_callable(Check *c, NodeId fn, SymId owner, SymId sym)
     SymId saved_fn = c->fn;
     int saved_fn_base = c->fn_base;
     c->fn = sym;
+    if (sym)
+    {
+        note_seen(sym); // its body: what it can raise is noted as it is checked
+    }
     if (sym && cx.kinds)
     {
         facts_of(sym)->checked = 1;
@@ -4332,6 +5387,11 @@ static void check_callable(Check *c, NodeId fn, SymId owner, SymId sym)
     c->has_self = (flags & AST_F_SELF) ? 1 : (kind == AST_FN_LIT && saved_self);
     c->in_callable = 1;
     c->ret = resolve_type(u, ret_node, owner, 1);
+    int saved_fails = c->fails;
+    {
+        NodeId sig = NODE(u, fn)->b;
+        c->fails = sig && (NODE(u, sig)->aux & SIG_FAILS);
+    }
     c->block_base = c->nlocals;
 
     for (NodeId p = params; p; p = NEXT(u, p))
@@ -4355,7 +5415,11 @@ static void check_callable(Check *c, NodeId fn, SymId owner, SymId sym)
         }
     }
 
-    if (flags & AST_F_ONELINE)
+    if ((flags & AST_F_ONELINE) && NODE(u, fn)->kind == AST_FN_LIT && !ret_node)
+    {
+        check_expr(c, body); // `(k: u64): k * limit`: its result's type is the expression's
+    }
+    else if (flags & AST_F_ONELINE)
     {
         check_return(c, body, body); // `T name(params): expr` returns the expression
     }
@@ -4387,6 +5451,7 @@ static void check_callable(Check *c, NodeId fn, SymId owner, SymId sym)
     c->block_base = saved_base;
     c->nlocals = saved_locals;
     c->ret = saved_ret;
+    c->fails = saved_fails;
 
     if (sym)
     {
@@ -4652,7 +5717,10 @@ static TypeId check_expr(Check *c, NodeId id)
         type = check_struct_lit(c, id);
         break;
     case AST_MATCH:
-        type = check_match(c, id);
+        type = (n->aux & MATCH_STAGE) && n->a && !NEXT(u, n->a) && NODE(u, n->a)->kind == AST_CALL &&
+                       call_fails(c, n->a)
+                   ? check_error_match(c, id)
+                   : check_match(c, id);
         break;
     case AST_IF: // if cond then [else other]: a statement
     {
@@ -4691,6 +5759,7 @@ static TypeId check_expr(Check *c, NodeId id)
         }
         if (base == T_STR)
         {
+            note_panic(c, PANIC_INDEX);
             type = T_U8;
             break;
         }
@@ -4729,6 +5798,10 @@ static TypeId check_expr(Check *c, NodeId id)
             diag_at(u, NODE(u, n->b)->tok, "error", "index %lld is out of range for %s (0 to %u)",
                     (long long)k, type_str(base, got, sizeof(got)), type_len(base) - 1);
         }
+        if (!(NODE(u, id)->aux & INDEX_SAFE) && !(exact_value(u, n->b, &k) && k >= 0 && k < (Exact)type_len(base)))
+        {
+            note_panic(c, PANIC_INDEX);
+        }
         type = type_ref(base);
         break;
     }
@@ -4749,6 +5822,14 @@ static TypeId check_expr(Check *c, NodeId id)
             for (int i = c->nlocals - 1; i >= 0 && !local; i--)
             {
                 local = c->locals[i].name == name ? &c->locals[i] : NULL;
+            }
+            if (local && c->literal && local - c->locals < c->fn_base)
+            {
+                const Token *nt = TOK(u, named->tok);
+                diag_at(u, n->tok, "error",
+                        "'%.*s' is a local of the function around this literal: the literal reads it, and "
+                        "cannot assign to it (give it as a parameter, or return the new value)",
+                        nt->len, TSTART(nt));
             }
         }
         TypeId through = t->kind == AST_INDEX ? u->types[t->a] : T_NONE;
@@ -4863,8 +5944,73 @@ static TypeId check_expr(Check *c, NodeId id)
         c->literal_name = NODE(u, n->a)->kind == AST_FN_LIT ? n->tok : 0;
         int frame = frame_reference(c, n->a);
         c->local_ref = frame == 1;
+        NodeId saved_handled = c->handled;
+        NodeId saved_guard = c->guard;
+        if (n->b && (NODE(u, n->a)->kind == AST_CALL || NODE(u, n->a)->kind == AST_MATCH))
+        {
+            c->handled = n->a; // `n, e := f()`: f's error is e's (also through a stage on f)
+            c->guard = NODE(u, n->a)->kind == AST_CALL ? n->a : 0;
+        }
         type = check_expr(c, n->a);
+        c->handled = saved_handled;
+        c->guard = saved_guard;
         c->local_ref = 0;
+        if (n->b) // the value, then the error (guards.md §5)
+        {
+            const Token *second = TOK(u, n->b);
+            SymId callee = NODE(u, n->a)->kind == AST_CALL ? u->refs[n->a]
+                           : NODE(u, n->a)->kind == AST_MATCH && (NODE(u, n->a)->aux & MATCH_ERRORS)
+                               ? u->refs[NODE(u, n->a)->a]
+                               : 0;
+            if (!callee || SYM(callee)->kind != SYM_METHOD)
+            {
+                diag_at(u, n->b, "error", "'%.*s' would be the error of a call: `n, e := f(...)`", second->len,
+                        TSTART(second));
+            }
+            else if (type == T_ERROR && !sema_fn_fails(callee))
+            {
+                diag_at(u, n->b, "error", "this call gives only an error: bind it alone, `%.*s := ...`",
+                        second->len, TSTART(second));
+            }
+            if (type == T_INT_LIT)
+            {
+                type = T_INT;
+            }
+            push_local(c, n->tok, type == T_VOID ? T_NONE : type, 0);
+            c->locals[c->nlocals - 1].bound = 1;
+            push_local(c, n->b, T_ERROR, 0);
+            c->locals[c->nlocals - 1].bound = 1;
+            c->locals[c->nlocals - 1].err_of = NODE(u, n->a)->kind == AST_CALL ? callee : 0;
+            if (!mentioned_later(u, n->b))
+            {
+                NODE(u, id)->aux |= DEFINE_UNREAD; // an error that reaches it stops the program (panic.unhandled)
+            }
+            if (callee && NODE(u, n->a)->kind == AST_CALL)
+            {
+                arena_decision(c, id, n->a, callee, type);
+            }
+            int nothing = 0; // what the call can raise, when it is known already
+            if (callee && NODE(u, n->a)->kind == AST_CALL && !sema_fn_fails(callee))
+            {
+                uint8_t pn;
+                const uint64_t *ids;
+                uint32_t ni;
+                int any;
+                nothing = sema_error_set(callee, &pn, &ids, &ni, &any) == 1 && !pn && !ni && !any;
+            }
+            if (nothing)
+            {
+                int cl;
+                const char *cn = symbol_name(callee, &cl);
+                diag_at(u, n->b, "warning", "'%.*s' is always nil: '%.*s' can neither fail nor panic", second->len,
+                        TSTART(second), cl, cn);
+            }
+            else if (NODE(u, id)->aux & DEFINE_UNREAD)
+            {
+                note_panic(c, PANIC_UNHANDLED);
+            }
+            break;
+        }
         NodeId bound_call = 0;
         int bindable = type != T_NONE && NODE(u, n->a)->kind == AST_CALL && called_bare_later(u, n->tok)
                            ? bindable_call(c, n->a)
@@ -4945,7 +6091,12 @@ static TypeId check_expr(Check *c, NodeId id)
         c->block_base = c->nlocals;
         for (NodeId s = n->a; s; s = NEXT(u, s))
         {
-            check_expr(c, s);
+            TypeId st = check_expr(c, s);
+            if (st == T_ERROR && NODE(u, s)->kind == AST_CALL && u->refs[s] && !sema_fn_fails(u->refs[s]))
+            {
+                error_goes_up(c, NODE(u, s)->tok, u->refs[s]); // `run()` alone: its error goes up
+                note_edge(c, u->refs[s], EE_ERRORS);
+            }
         }
         c->nlocals = saved_count; // a block's locals end with the block
         c->block_base = saved_base;
@@ -4957,10 +6108,31 @@ static TypeId check_expr(Check *c, NodeId id)
         // any other, and it is generated now, while the body around it is in memory.
         uint32_t name_tok = c->literal_name ? c->literal_name : n->tok; // named by its binding
         c->literal_name = 0;
+        if (u->refs[id] && SYM(u->refs[id])->kind == SYM_METHOD && (SYM(u->refs[id])->flags & SYM_F_LITERAL))
+        {
+            type = type_make(T_FUNC, u->refs[id]); // checked already (an argument checked again)
+            break;
+        }
         SymId lit = symbol_new(u, SYM_METHOD, SYM_F_LITERAL, name_tok, 0, id);
         u->refs[id] = lit;
-        check_callable(c, id, c->owner, lit);
         type = type_make(T_FUNC, lit);
+        int bare = 0; // a pattern alone as a parameter: typed by the first call, checked then
+        for (NodeId p = n->a; p && !bare; p = NEXT(u, p))
+        {
+            bare = !NODE(u, p)->a && (NODE(u, p)->flags & AST_F_PATTERN);
+            if (!NODE(u, p)->a && !(NODE(u, p)->flags & AST_F_PATTERN) && !u->types[p])
+            {
+                diag_at(u, NODE(u, p)->tok, "error", "'%.*s' needs a type: `(%.*s: u64): ...`, or give the literal to "
+                        "a parameter whose `function(...)` types it", TOK(u, NODE(u, p)->tok)->len,
+                        TSTART(TOK(u, NODE(u, p)->tok)), TOK(u, NODE(u, p)->tok)->len, TSTART(TOK(u, NODE(u, p)->tok)));
+            }
+        }
+        if (bare && npending_lits < 64)
+        {
+            pending_lits[npending_lits++] = (PendingLit){lit, id, c->nlocals};
+            break;
+        }
+        check_callable(c, id, c->owner, lit);
         break;
     }
     default: // import chains: checked by the module linker
@@ -5361,7 +6533,8 @@ int sema_pattern_of(Unit *u, NodeId param, SymId owner, Pattern *out, int loud)
     {
         return 0;
     }
-    return pattern_from(u, n, resolve_type(u, n->a, owner, 0), out, loud);
+    TypeId t = n->a ? resolve_type(u, n->a, owner, 0) : u->types && param < u->side_cap ? u->types[param] : T_NONE;
+    return t == T_NONE ? 0 : pattern_from(u, n, t, out, loud);
 }
 
 static int const_value(const Unit *u, NodeId e, TypeId type, uint64_t *v);
@@ -5456,6 +6629,10 @@ static int const_value(const Unit *u, NodeId e, TypeId type, uint64_t *v)
         *v = 0 - *v;
         return 1;
     }
+    if (NODE(u, e)->kind == AST_SELECTOR && u->refs && u->refs[e] && SYM(u->refs[e])->kind == SYM_CONST)
+    {
+        return sema_comptime_value(u->refs[e], v); // `panic.division`: a module's constant
+    }
     if (NODE(u, e)->kind != AST_IDENT)
     {
         if (!exact_value(u, e, &x))
@@ -5467,6 +6644,11 @@ static int const_value(const Unit *u, NodeId e, TypeId type, uint64_t *v)
     }
     if (sema_unsized_value(u, e, v, &negative))
     {
+        return 1;
+    }
+    if (type == T_ERROR && text_is(TOK(u, NODE(u, e)->tok), "nil") && !(u->refs && u->refs[e]))
+    {
+        *v = 0; // no error
         return 1;
     }
     SymId s = u->refs ? u->refs[e] : 0;
@@ -5739,6 +6921,194 @@ void sema_syntax_only(Unit *u)
     }
 }
 
+// ---- the order bodies are checked in (context.md §58) -------------------------------------------
+//
+// Callees first: a function's body is checked, and generated, after the bodies of the functions of
+// its file that it calls. When its turn comes, what they can raise is known (a boundary on a call
+// that can raise nothing is no boundary) and they are lowered (a small one is inlined), whatever
+// order they are written in. A cycle (recursion) keeps the order it is written in. The calls are
+// read from the bodies' text before they are parsed: a name followed by `(`.
+typedef struct
+{
+    uint32_t hash; // of the declaration's name, as text
+    uint32_t idx;  // its index + 1 (0: empty)
+} OrderSlot;
+typedef struct
+{
+    Unit *u;
+    NodeId *decls;    // the file's declarations, as written
+    uint32_t n;
+    uint8_t *state;   // 0 not visited, 1 in progress, 2 placed
+    NodeId *out;
+    uint32_t nout;
+    OrderSlot *slots; // the functions by the hash of their names' text (one probe per call)
+    uint32_t mask;
+} Order;
+
+static int is_function_decl(const Unit *u, NodeId d)
+{
+    const AstNode *n = NODE(u, d);
+    return n->kind == AST_METHOD_DECL || (n->kind == AST_DEFINE && NODE(u, n->a)->kind == AST_FN_LIT);
+}
+
+static uint32_t text_hash(const char *p, size_t n)
+{
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < n; i++)
+    {
+        h = (h ^ (uint8_t)p[i]) * 16777619u;
+    }
+    return h | 1u; // never 0
+}
+
+static void order_visit(Order *o, uint32_t i);
+
+// The functions named by the text w[0..n) (overloads and clauses share a name): each is visited.
+static void order_calls_text(Order *o, const char *w, size_t n)
+{
+    uint32_t h = text_hash(w, n);
+    for (uint32_t k = h & o->mask;; k = (k + 1) & o->mask)
+    {
+        const OrderSlot *sl = &o->slots[k];
+        if (!sl->idx)
+        {
+            return;
+        }
+        if (sl->hash != h || o->state[sl->idx - 1])
+        {
+            continue;
+        }
+        const Token *t = TOK(o->u, NODE(o->u, o->decls[sl->idx - 1])->tok);
+        if (t->len == n && memcmp(TSTART(t), w, n) == 0)
+        {
+            order_visit(o, sl->idx - 1);
+        }
+    }
+}
+
+static int ident_byte(char ch)
+{
+    return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_';
+}
+
+// The names a body not tokenized yet calls: the identifier before each `(`. Each `(` is found
+// with memchr (most of a body is not calls); one in a string or a comment only adds an edge, which
+// moves a function earlier, never changes what it means.
+static void order_scan_text(Order *o, const char *p, size_t len)
+{
+    const char *start = p, *end = p + len;
+    while (p < end && (p = memchr(p, '(', (size_t)(end - p))) != NULL)
+    {
+        const char *w = p;
+        while (w > start && (w[-1] == ' ' || w[-1] == '\t'))
+        {
+            w--;
+        }
+        const char *e = w;
+        while (w > start && ident_byte(w[-1]))
+        {
+            w--;
+        }
+        if (e > w && !(*w >= '0' && *w <= '9'))
+        {
+            order_calls_text(o, w, (size_t)(e - w));
+        }
+        p++;
+    }
+}
+
+static void order_visit(Order *o, uint32_t i)
+{
+    Unit *u = o->u;
+    o->state[i] = 1;
+    NodeId d = o->decls[i];
+    if (is_function_decl(u, d))
+    {
+        // its tokens: up to the next declaration's first (a body not parsed yet is one token)
+        uint32_t from = NODE(u, d)->tok, to = i + 1 < o->n ? NODE(u, o->decls[i + 1])->tok : (uint32_t)u->tokens.size;
+        for (uint32_t t = from + 1; t < to && t < u->tokens.size; t++)
+        {
+            const Token *k = TOK(u, t);
+            if (k->kind == TOK_EOF)
+            {
+                break;
+            }
+            if (k->kind == TOK_BODY)
+            {
+                order_scan_text(o, TSTART(k), k->len);
+            }
+            else if (k->kind == TOK_IDENTIFIER && t + 1 < to && TOK(u, t + 1)->kind == TOK_LPAREN)
+            {
+                order_calls_text(o, TSTART(k), k->len);
+            }
+        }
+    }
+    o->state[i] = 2;
+    o->out[o->nout++] = d;
+}
+
+// The file's declarations in checking order (out holds n): callees first.
+static uint32_t check_order(Unit *u, NodeId **out)
+{
+    Order o = {u, NULL, 0, NULL, NULL, 0, NULL, 0};
+    for (NodeId d = NODE(u, u->root)->a; d; d = NEXT(u, d))
+    {
+        o.n++;
+    }
+    uint32_t cap = 16;
+    while (cap < o.n * 2 + 2)
+    {
+        cap *= 2;
+    }
+    o.mask = cap - 1;
+    o.decls = (NodeId *)malloc((o.n + 1) * sizeof(NodeId));
+    o.out = (NodeId *)malloc((o.n + 1) * sizeof(NodeId));
+    o.state = (uint8_t *)calloc(o.n + 1, 1);
+    o.slots = (OrderSlot *)calloc(cap, sizeof(OrderSlot));
+    if (!o.decls || !o.out || !o.state || !o.slots)
+    {
+        fprintf(stderr, "fatal: out of memory\n");
+        exit(2);
+    }
+    uint32_t i = 0;
+    for (NodeId d = NODE(u, u->root)->a; d; d = NEXT(u, d), i++)
+    {
+        o.decls[i] = d;
+        if (is_function_decl(u, d))
+        {
+            const Token *t = TOK(u, NODE(u, d)->tok);
+            uint32_t h = text_hash(TSTART(t), t->len), k = h & o.mask;
+            while (o.slots[k].idx)
+            {
+                k = (k + 1) & o.mask;
+            }
+            o.slots[k] = (OrderSlot){h, i + 1};
+        }
+    }
+    static int off = -1;
+    if (off < 0)
+    {
+        const char *env = getenv("MODAL_ORDER"); // 0: as written (for measuring)
+        off = env && env[0] == '0';
+    }
+    for (i = 0; i < o.n; i++)
+    {
+        if (off)
+        {
+            o.out[o.nout++] = o.decls[i];
+        }
+        else if (o.state[i] == 0)
+        {
+            order_visit(&o, i);
+        }
+    }
+    free(o.decls);
+    free(o.state);
+    free(o.slots);
+    *out = o.out;
+    return o.nout;
+}
+
 void sema_check(Unit *u)
 {
     // One type and one resolved declaration per node (8 bytes), which is all a backend
@@ -5761,16 +7131,26 @@ void sema_check(Unit *u)
             }
             codegen_begin(u); // everything a signature can mention is checked by now
         }
-        for (NodeId d = NODE(u, u->root)->a; d; d = NEXT(u, d))
+        if (!functions)
+        {
+            for (NodeId d = NODE(u, u->root)->a; d; d = NEXT(u, d))
+            {
+                c.nlocals = 0;
+                c.block_base = 0;
+                check_decl(&c, d, u->scope, 0, functions);
+            }
+            continue;
+        }
+        NodeId *order;
+        uint32_t n = check_order(u, &order); // the bodies: callees first
+        for (uint32_t i = 0; i < n; i++)
         {
             c.nlocals = 0;
             c.block_base = 0;
-            check_decl(&c, d, u->scope, 0, functions);
-            if (functions)
-            {
-                sema_drain_specs(); // the specializations its body made, now that it is done
-            }
+            check_decl(&c, order[i], u->scope, 0, functions);
+            sema_drain_specs(); // the specializations its body made, now that it is done
         }
+        free(order);
     }
 }
 

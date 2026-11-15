@@ -40,6 +40,10 @@ typedef struct
     NodeId rest_of, rest; // the statement being lowered in a block, and the ones after it
     int has_self;   // slot 0 holds self (a reference)
     int struct_abi; // a parameter or the result is a struct value: never inlined
+    int fails;      // the function says `, error`: its error is the slot after its value
+    NodeId handled_call;  // `n, e := f()`: the call whose error the binding takes
+    NodeId guard_call;    // and the call that is a boundary (a panic below comes back to it)
+    MirSlot handled_error; // and that error, once the call is lowered
     int loops;      // the function calls itself (a loop): larger bodies are inlined into it
     int for_compiler; // lowered for the compiler to run (comptime.c): descriptors are its own
     TypeId ret;
@@ -244,7 +248,7 @@ static void keep_if_small(const MirFunc *f)
         {
             uint8_t *bytes = (uint8_t *)arena_alloc(f->strings[i].len + 1);
             memcpy(bytes, f->strings[i].bytes, f->strings[i].len);
-            k->strings[i] = (MirString){bytes, f->strings[i].len};
+            k->strings[i] = (MirString){bytes, f->strings[i].len, f->strings[i].panic};
         }
     }
     k->nlabels = f->nlabels;
@@ -448,7 +452,7 @@ int mir_clause_hold(const MirFunc *f)
         {
             uint8_t *bytes = (uint8_t *)arena_alloc(f->strings[i].len + 1);
             memcpy(bytes, f->strings[i].bytes, f->strings[i].len);
-            h->f.strings[i] = (MirString){bytes, f->strings[i].len};
+            h->f.strings[i] = (MirString){bytes, f->strings[i].len, f->strings[i].panic};
         }
     }
     h->next = next;
@@ -936,6 +940,7 @@ static int int_variant(TypeId t)
     case T_U32:
         return MV_U32;
     case T_U64:
+    case T_ERROR:
         return MV_U64;
     case T_I8:
         return MV_I8;
@@ -1303,6 +1308,7 @@ static int const_value(NodeId id, uint64_t *out)
 static MirSlot lower_expr(NodeId id);
 static MirSlot lower_call(NodeId id);
 static MirSlot lower_struct_addr(NodeId id);
+static MirSlot element_addr(NodeId id, uint32_t *off);
 static MirSlot lower_field_base(NodeId base, uint32_t tok, int *ok);
 static MirSlot array_addr(NodeId arr, uint32_t tok);
 static void lower_struct_into(NodeId id, MirSlot dst);
@@ -1607,7 +1613,7 @@ static MirSlot lower_string(const Token *t)
         f->strings = (MirString *)region_grow_array(REGION_MIR, f->strings, sizeof(MirString),
                                                     &f->strings_cap, f->nstrings + 1);
     }
-    f->strings[f->nstrings] = (MirString){bytes, n};
+    f->strings[f->nstrings] = (MirString){bytes, n, 0};
     MirInst *i = inst(MIR_STR);
     i->d = temp();
     i->imm = f->nstrings++;
@@ -1779,7 +1785,7 @@ static MirSlot string_slot(const uint8_t *src, size_t len)
         f->strings = (MirString *)region_grow_array(REGION_MIR, f->strings, sizeof(MirString),
                                                     &f->strings_cap, f->nstrings + 1);
     }
-    f->strings[f->nstrings] = (MirString){bytes, len};
+    f->strings[f->nstrings] = (MirString){bytes, len, 0};
     MirInst *i = inst(MIR_STR);
     i->d = temp();
     i->imm = f->nstrings++;
@@ -1958,7 +1964,7 @@ static void flush_pending(void)
         f->strings = (MirString *)region_grow_array(REGION_MIR, f->strings, sizeof(MirString),
                                                     &f->strings_cap, f->nstrings + 1);
     }
-    f->strings[f->nstrings] = (MirString){bytes, npending};
+    f->strings[f->nstrings] = (MirString){bytes, npending, 0};
     MirSlot d = temp();
     MirInst *i = inst(MIR_STR);
     i->d = d;
@@ -2416,6 +2422,17 @@ static int typeof_into(NodeId id, MirSlot dst, uint32_t k)
 
 static void lower_struct_into(NodeId id, MirSlot dst)
 {
+    if (NODE(L.u, id)->kind == AST_INDEX) // an element of an array of structs: copied out, field by field
+    {
+        TypeId et = L.u->types[id];
+        MirSlot src = lower_struct_addr(id);
+        MirInst *a = inst(MIR_ADDR);
+        a->d = temp();
+        a->a = dst;
+        a->imm = slots_of(et);
+        copy_fields(a->d, 0, src, 0, type_ref(et));
+        return;
+    }
     Unit *u = L.u;
     const AstNode *n = NODE(u, id);
     TypeId t = u->types[id];
@@ -2571,6 +2588,18 @@ static MirSlot lower_struct_addr(NodeId id)
     {
         return lower_struct_addr(n->a);
     }
+    if (n->kind == AST_INDEX) // `people[i]`: the element where it is (a write through it reaches the array)
+    {
+        uint32_t off;
+        MirSlot at = element_addr(id, &off);
+        if (!off)
+        {
+            return at;
+        }
+        MirSlot moved = temp();
+        bini(MB_ADD, MV_U64, moved, at, off);
+        return moved;
+    }
     uint32_t k = slots_of(u->types[id]);
     MirSlot base;
     if (!(n->kind == AST_IDENT && !u->refs[id] && find_local(token_name(TOK(u, n->tok)), &base)))
@@ -2588,7 +2617,13 @@ static MirSlot lower_struct_addr(NodeId id)
 
 
 // The end of a call whose arguments are computed: inlined, or copied into the window and called.
-static MirSlot finish_call(SymId fn, const Inlinable *inline_body, MirSlot *args, const uint32_t *argk,
+static void error_up(MirSlot err);
+static int raises_nothing(SymId fn);
+static NodeId arena_argument(NodeId call);
+static void copy_fields(MirSlot dst, uint32_t doff, MirSlot src, uint32_t soff, SymId st);
+static uint32_t struct_slots(SymId s);
+
+static MirSlot finish_call(NodeId id, SymId fn, const Inlinable *inline_body, MirSlot *args, const uint32_t *argk,
                            const uint32_t *argw, int nargs)
 {
     Unit *u = L.u;
@@ -2619,7 +2654,47 @@ static MirSlot finish_call(SymId fn, const Inlinable *inline_body, MirSlot *args
             copy_slots(SLOT_WIN | argw[i], args[i], argk[i]);
         }
     }
-    inst(MIR_CALL)->imm = fn;
+    MirInst *call = inst(MIR_CALL);
+    call->imm = fn;
+    if (id && id == L.guard_call) // `n, e := f()`: a boundary, a panic below comes back here
+    {
+        TypeId rt = sema_fn_ret(u, fn);
+        uint32_t k = rt == T_VOID ? 0 : slots_of(rt);
+        if (k > 127)
+        {
+            unsupported(NODE(u, id)->tok, "a boundary on a call whose value takes more than 127 slots");
+        }
+        call->sub = MIR_CALL_GUARD;
+        call->var = (uint8_t)(k << 1 | (sema_fn_fails(fn) ? 1u : 0u)); // (no slot field: passes rename those)
+        MirSlot val = temp(), err = temp();
+        if (k)
+        {
+            into(SLOT_WIN | 0, val);
+        }
+        into(SLOT_WIN | k, err);
+        L.handled_error = err;
+        return val;
+    }
+    if (sema_fn_fails(fn)) // the value, then its error in the next slot (guards.md §5)
+    {
+        TypeId rt = sema_fn_ret(u, fn);
+        uint32_t k = rt == T_VOID ? 0 : slots_of(rt);
+        MirSlot val = temp(), err = temp();
+        if (k)
+        {
+            into(SLOT_WIN | 0, val);
+        }
+        into(SLOT_WIN | k, err);
+        if (id && id == L.handled_call)
+        {
+            L.handled_error = err; // `n, e := f()`: the binding takes it
+        }
+        else
+        {
+            error_up(err); // `n := f()`: an error goes up
+        }
+        return val;
+    }
     if (sema_fn_ret(u, fn) == T_VOID)
     {
         return temp();
@@ -2742,7 +2817,7 @@ static MirSlot lower_bound_call(NodeId id)
             args[i] = c;
         }
     }
-    return finish_call(fn, inline_body, args, argk, argw, na);
+    return finish_call(id, fn, inline_body, args, argk, argw, na);
 }
 
 static MirSlot lower_call(NodeId id)
@@ -2841,7 +2916,11 @@ static MirSlot lower_call(NodeId id)
         trap_place(place, pl < 0 ? 0 : (size_t)pl >= sizeof(place) ? sizeof(place) - 1 : (size_t)pl, shown,
                    sizeof(shown));
         int tl = snprintf(text, sizeof(text), "%s: the *any holds another type\n", shown); // no type names
-        inst(MIR_TRAP)->a = string_slot((const uint8_t *)text, (size_t)(tl < 0 ? 0 : tl));
+        MirSlot msg = string_slot((const uint8_t *)text, (size_t)(tl < 0 ? 0 : tl));
+        MirInst *tr = inst(MIR_TRAP);
+        tr->a = msg;
+        tr->imm = PANIC_ANYTYPE;
+        L.f->strings[L.f->nstrings - 1].panic = (uint8_t)tr->imm; // (its message: made just before)
         place_label(ok);
         MirInst *at = inst(MIR_LOAD);
         at->var = MV_U64;
@@ -2882,7 +2961,14 @@ static MirSlot lower_call(NodeId id)
             p->a = part;
         }
         MirSlot last = string_slot((const uint8_t *)text, len);
-        inst(MIR_TRAP)->a = last;
+        MirInst *tr = inst(MIR_TRAP);
+        tr->a = last;
+        int al;
+        const char *an = symbol_name(L.f->sym, &al); // std's assert stops with panic.assert
+        tr->imm = al == 6 && memcmp(an, "assert", 6) == 0 && strstr(cx.units[SYM(L.f->sym)->unit].path, "std/")
+                      ? PANIC_ASSERT
+                      : PANIC_RAISED;
+        L.f->strings[L.f->nstrings - 1].panic = (uint8_t)tr->imm; // (its message: made just before)
         return temp();
     }
     if (callee->kind == AST_IDENT && sema_is_std_print(u, u->refs[n->a]))
@@ -2915,9 +3001,9 @@ static MirSlot lower_call(NodeId id)
     // anything (a call would reuse the window); otherwise into a temporary, copied at the end.
     // A call that is inlined keeps its arguments where they are computed.
     const Inlinable *inline_body = inlinable_for(fn);
-    if (inline_body && inline_body->n > INLINE_MAX && !L.loops)
+    if (inline_body && ((inline_body->n > INLINE_MAX && !L.loops) || id == L.guard_call))
     {
-        inline_body = NULL; // larger than a call outside a loop is worth
+        inline_body = NULL; // larger than a call outside a loop is worth; or a boundary
     }
     MirSlot args[256];
     uint32_t argk[256], argw[256]; // slots each argument takes, and where in the window
@@ -2971,6 +3057,10 @@ static MirSlot lower_call(NodeId id)
             break;
         }
         TypeId pt = sema_param_type(u, fn, param);
+        if (type_kind(pt) == T_FUNC)
+        {
+            continue; // the function given: the specialization calls it by name, nothing is passed
+        }
         int calls_after = 0;
         for (NodeId b = NEXT(u, a); b; b = NEXT(u, b))
         {
@@ -2994,7 +3084,27 @@ static MirSlot lower_call(NodeId id)
         win++;
         nargs++;
     }
-    return finish_call(fn, inline_body, args, argk, argw, nargs);
+    {
+        Capture caps[64]; // a literal's captures: the caller's locals of those names, after the arguments
+        uint32_t nc = sema_captures(fn, caps, 64);
+        for (uint32_t i = 0; i < nc && nargs < 256; i++)
+        {
+            MirSlot from;
+            int ref;
+            if (!find_local_ref(caps[i].name, &from, &ref) || ref)
+            {
+                unsupported(callee->tok, "a literal that reads a local this call cannot see");
+                break;
+            }
+            MirSlot r = temp();
+            into(from, r);
+            args[nargs] = inline_body ? r : into(r, SLOT_WIN | win);
+            argk[nargs] = 1;
+            argw[nargs] = win++;
+            nargs++;
+        }
+    }
+    return finish_call(id, fn, inline_body, args, argk, argw, nargs);
 }
 
 static void guard_divisor(MirSlot b, uint32_t tok);
@@ -3106,7 +3216,10 @@ static void guard_divisor(MirSlot b, uint32_t tok)
     j->a = b;
     j->imm = ok;
     MirSlot m = string_slot((const uint8_t *)text, (size_t)n);
-    inst(MIR_TRAP)->a = m;
+    MirInst *tr = inst(MIR_TRAP);
+    tr->a = m;
+    tr->imm = PANIC_DIVISION;
+    L.f->strings[L.f->nstrings - 1].panic = (uint8_t)tr->imm; // (its message: made just before)
     place_label(ok);
 }
 
@@ -3192,7 +3305,11 @@ static void guard_index(MirSlot i, uint64_t len, uint32_t tok)
     MirInst *j = inst(MIR_JNZ);
     j->a = t;
     j->imm = ok;
-    inst(MIR_TRAP)->a = string_slot((const uint8_t *)text, (size_t)n);
+    MirSlot msg = string_slot((const uint8_t *)text, (size_t)n);
+    MirInst *tr = inst(MIR_TRAP);
+    tr->a = msg;
+    tr->imm = PANIC_INDEX;
+    L.f->strings[L.f->nstrings - 1].panic = (uint8_t)tr->imm; // (its message: made just before)
     place_label(ok);
 }
 
@@ -3231,7 +3348,11 @@ static MirSlot element_addr(NodeId id, uint32_t *off)
                    sizeof(shown));
         int k = snprintf(text, sizeof(text), "%s: index out of range (past the string's end)\n", shown);
         k = k < 0 ? 0 : k >= (int)sizeof(text) ? (int)sizeof(text) - 1 : k;
-        inst(MIR_TRAP)->a = string_slot((const uint8_t *)text, (size_t)k);
+        MirSlot msg = string_slot((const uint8_t *)text, (size_t)k);
+        MirInst *tr = inst(MIR_TRAP);
+        tr->a = msg;
+        tr->imm = PANIC_INDEX;
+        L.f->strings[L.f->nstrings - 1].panic = (uint8_t)tr->imm; // (its message: made just before)
         place_label(ok);
         MirSlot addr = temp();
         MirInst *add = inst(MIR_BIN);
@@ -3810,6 +3931,14 @@ static MirSlot lower_expr(NodeId id)
         const AstNode *target = NODE(u, n->a);
         SymId s = u->refs[n->a];
         MirSlot slot;
+        if (target->kind == AST_INDEX && is_struct(u->types[n->a])) // people[i] = person{ ... }: field by field
+        {
+            MirSlot value = lower_struct_addr(n->b); // computed first: it may read the array
+            uint32_t off;
+            MirSlot addr = element_addr(n->a, &off);
+            copy_fields(addr, off, value, 0, type_ref(u->types[n->a]));
+            return temp();
+        }
         if (target->kind == AST_INDEX) // a[i] = v: the element, in its width
         {
             MirSlot value = lower_as(n->b, u->types[n->a]);
@@ -3933,9 +4062,58 @@ static MirSlot lower_expr(NodeId id)
 
 static MirSlot lower_match_as(NodeId id, TypeId want, int returned);
 
+// An error not handled here: when it is not nil, this function returns it (its value at zero).
+static void error_up(MirSlot err)
+{
+    if (!L.fails && L.ret != T_ERROR)
+    {
+        return; // (the checker allowed it nowhere else)
+    }
+    uint32_t ok = new_label();
+    MirInst *j = inst(MIR_JZ);
+    j->a = err;
+    j->imm = ok;
+    uint32_t k = L.fails && L.ret != T_VOID ? slots_of(L.ret) : 0;
+    if (k)
+    {
+        MirInst *z = inst(MIR_ZERO);
+        z->a = 0;
+        z->imm = k;
+    }
+    into(err, k);
+    inst(MIR_RET);
+    place_label(ok);
+}
+
 static void lower_return(NodeId value)
 {
     const AstNode *v = value ? NODE(L.u, value) : NULL;
+    if (L.fails) // `return x` gives no error; `return bad_input` an error and the value at zero
+    {
+        uint32_t k = L.ret == T_VOID ? 0 : slots_of(L.ret);
+        if (value && L.u->types[value] == T_ERROR && L.ret != T_ERROR)
+        {
+            MirSlot err = temp();
+            into(lower_as(value, T_ERROR), err);
+            if (k)
+            {
+                MirInst *z = inst(MIR_ZERO);
+                z->a = 0;
+                z->imm = k;
+            }
+            into(err, k);
+        }
+        else
+        {
+            if (value)
+            {
+                into(lower_as(value, L.ret), 0);
+            }
+            into(emit_const(0), k);
+        }
+        inst(MIR_RET);
+        return;
+    }
     if (v && v->kind == AST_MATCH && v->a && L.ret != T_VOID && !is_struct(L.ret))
     {
         // `return if n { 0: acc, _: s(n - 1, acc + n) }`: each arm returns its own value, so a call
@@ -4021,6 +4199,81 @@ static void lower_stmt(NodeId id)
     }
     case AST_DEFINE:
     {
+        if (n->b) // `n, e := f()`: the value and the error (guards.md §5)
+        {
+            TypeId vt = u->types[id];
+            if (is_struct(vt) || is_array(vt))
+            {
+                unsupported(n->tok, "a struct or array value with its error");
+                return;
+            }
+            MirSlot vs = temp(), es = temp();
+            NodeId saved = L.handled_call, saved_guard = L.guard_call;
+            L.handled_call = n->a;
+            L.guard_call = NODE(u, n->a)->kind == AST_CALL && !raises_nothing(u->refs[n->a]) ? n->a : 0;
+            L.handled_error = 0;
+            // the arena, as it is at the call: given back on an error (DEFINE_ROLLBACK, the checker's)
+            NodeId arena = (n->aux & DEFINE_ROLLBACK) ? arena_argument(n->a) : 0;
+            MirSlot arena_at = 0, snapshot = 0;
+            SymId arena_st = 0;
+            if (arena)
+            {
+                arena_st = type_ref(type_ref(u->types[arena]));
+                arena_at = temp();
+                into(lower_expr(arena), arena_at);
+                uint32_t k = L.perm;
+                L.perm += struct_slots(arena_st);
+                MirInst *ad = inst(MIR_ADDR);
+                ad->d = temp();
+                ad->a = SLOT_PERM | k;
+                ad->imm = struct_slots(arena_st);
+                snapshot = ad->d;
+                copy_fields(snapshot, 0, arena_at, 0, arena_st);
+            }
+            MirSlot v = lower_expr(n->a);
+            L.handled_call = saved;
+            L.guard_call = saved_guard;
+            if (vt != T_VOID && vt != T_NONE)
+            {
+                into(v, vs);
+            }
+            into(L.handled_error ? L.handled_error : emit_const(0), es); // a call that cannot fail: nil
+            if (arena)
+            {
+                uint32_t kept = new_label();
+                MirInst *j = inst(MIR_JZ);
+                j->a = es;
+                j->imm = kept;
+                copy_fields(arena_at, 0, snapshot, 0, arena_st); // an error: the arena as it was
+                place_label(kept);
+            }
+            push_local(token_name(TOK(u, n->tok)), vs);
+            push_local(token_name(TOK(u, n->b)), es);
+            if (n->aux & DEFINE_UNREAD) // no line reads e: an error that reaches it stops the program
+            {
+                uint32_t ok = new_label();
+                MirInst *j = inst(MIR_JZ);
+                j->a = es;
+                j->imm = ok;
+                int line, col;
+                source_pos(u->src, TSTART(TOK(u, n->b)), &line, &col);
+                char place[540], shown[540], text[640];
+                int pl = snprintf(place, sizeof(place), "%s:%d:%d", u->path, line, col);
+                trap_place(place, pl < 0 ? 0 : (size_t)pl >= sizeof(place) ? sizeof(place) - 1 : (size_t)pl, shown,
+                           sizeof(shown));
+                const Token *et = TOK(u, n->b);
+                int tl = snprintf(text, sizeof(text), "%s: panic.unhandled: the error in '%.*s' is not handled\n",
+                                  shown, (int)et->len, TSTART(et));
+                MirSlot msg = string_slot((const uint8_t *)text, (size_t)(tl < 0 ? 0 : tl));
+                MirInst *tr = inst(MIR_TRAP);
+                tr->a = msg;
+                tr->imm = PANIC_UNHANDLED;
+                L.f->strings[L.f->nstrings - 1].panic = (uint8_t)tr->imm; // (its message: made just before)
+                place_label(ok);
+            }
+            L.top = top + 2;
+            return;
+        }
         if (NODE(u, n->a)->kind == AST_FN_LIT)
         {
             return; // generated as a function of its own; calls to the local name it directly
@@ -4130,9 +4383,15 @@ static void lower_stmt(NodeId id)
         L.top = top;
         return;
     default:
-        lower_expr(id);
+    {
+        MirSlot r = lower_expr(id);
+        if (n->kind == AST_CALL && u->types[id] == T_ERROR && u->refs[id] && !sema_fn_fails(u->refs[id]))
+        {
+            error_up(r); // `run()` alone: its error goes up
+        }
         L.top = top;
         return;
+    }
     }
 }
 
@@ -4545,8 +4804,132 @@ static int match_tree(const AstNode *m, int ns, TypeId t, uint32_t miss, uint32_
 }
 
 // returned: the match is a `return`'s value; each arm returns (and the function ends there).
+// The `arena` context a call takes: its argument (an identifier named like its struct), or 0.
+static NodeId arena_argument(NodeId call)
+{
+    Unit *u = L.u;
+    for (NodeId a = NODE(u, call)->b; a; a = NEXT(u, a))
+    {
+        TypeId at = u->types[a];
+        const Token *t = TOK(u, NODE(u, a)->tok);
+        if (NODE(u, a)->kind == AST_IDENT && type_kind(at) == T_PTR && type_kind(type_ref(at)) == T_STRUCT &&
+            t->len == 5 && memcmp(TSTART(t), "arena", 5) == 0)
+        {
+            return a;
+        }
+    }
+    return 0;
+}
+
+// A call whose function, and every one it reaches, was checked, and which can neither fail nor
+// panic: `n, e := f()` on it needs no boundary (e is nil).
+static int raises_nothing(SymId fn)
+{
+    uint8_t panics;
+    const uint64_t *ids;
+    uint32_t n;
+    int any;
+    return fn && !sema_fn_fails(fn) && sema_error_set(fn, &panics, &ids, &n, &any) == 1 && !panics && !n && !any;
+}
+
+// A stage on a call that can fail (MATCH_ERRORS): its value and its error, each arm testing one
+// side (sema_error_arm). What no arm takes goes on: an error up (or to `n, e :=`), a value as
+// the stage's value.
+static MirSlot lower_error_match(NodeId id, TypeId want)
+{
+    Unit *u = L.u;
+    const AstNode *m = NODE(u, id);
+    NodeId subject = m->a;
+    TypeId vt = u->types[subject];
+    int handled = L.handled_call == id; // `n, e := parse(s).(...)`
+    NodeId saved = L.handled_call;
+    L.handled_call = subject;
+    L.handled_error = 0;
+    MirSlot v0 = lower_expr(subject);
+    MirSlot err0 = L.handled_error ? L.handled_error : emit_const(0);
+    L.handled_call = saved;
+    MirSlot val = temp(), err = temp();
+    into(v0, val);
+    into(err0, err);
+    int value = !(m->aux & MATCH_STATEMENT) && want != T_VOID && want != T_NONE;
+    MirSlot r = value ? temp() : 0;
+    uint32_t end = new_label(), top = L.top;
+    for (NodeId arm = m->b; arm; arm = NEXT(u, arm))
+    {
+        const AstNode *a = NODE(u, arm);
+        uint32_t next = new_label();
+        uint64_t eid;
+        int cls = sema_error_arm(u, a->a, vt, &eid);
+        if (cls == EARM_ERROR || cls == EARM_VALUE_TYPE || cls == EARM_VALUE)
+        {
+            MirInst *j = inst(cls == EARM_ERROR ? MIR_JZ : MIR_JNZ); // an error / no error
+            j->a = err;
+            j->imm = next;
+        }
+        if (cls == EARM_NAME)
+        {
+            miss_if(MB_NE, MV_U64, err, eid, next);
+        }
+        if (cls == EARM_VALUE)
+        {
+            Pattern pt;
+            NodeId name;
+            if (sema_arm_pattern(u, a->a, vt, &pt))
+            {
+                pattern_test(&pt, vt, val, next);
+            }
+            else if ((name = sema_arm_name(u, a->a, vt)))
+            {
+                miss_unless_equal(val, name, vt, next);
+            }
+        }
+        NodeId res = a->b;
+        SymId given = NODE(u, res)->kind == AST_IDENT && u->refs[res] && SYM(u->refs[res])->kind == SYM_METHOD
+                          ? u->refs[res]
+                          : 0;
+        if (given) // `u64: double`: the function is given the value
+        {
+            into(val, SLOT_WIN | 0);
+            inst(MIR_CALL)->imm = given;
+            if (value)
+            {
+                into(SLOT_WIN | 0, r);
+            }
+        }
+        else if (value)
+        {
+            into(lower_as(res, want), r);
+        }
+        else
+        {
+            lower_stmt(res);
+        }
+        L.top = top;
+        inst(MIR_JUMP)->imm = end;
+        place_label(next);
+    }
+    if (!handled)
+    {
+        error_up(err); // an error no arm took
+    }
+    if (value)
+    {
+        into(val, r); // a value no arm took goes on
+    }
+    place_label(end);
+    if (handled)
+    {
+        L.handled_error = err;
+    }
+    return value ? r : temp();
+}
+
 static MirSlot lower_match_as(NodeId id, TypeId want, int returned)
 {
+    if (NODE(L.u, id)->aux & MATCH_ERRORS)
+    {
+        return lower_error_match(id, want);
+    }
     Unit *u = L.u;
     const AstNode *m = NODE(u, id);
     MirSlot subj[16];
@@ -4701,20 +5084,17 @@ int mir_lower(Unit *u, SymId fn, MirFunc *out)
     L.nlocals = 0;
     L.ret = sema_fn_ret(u, fn);
     L.has_self = SYM(fn)->owner != 0;
-    L.struct_abi = is_struct(L.ret);
+    L.fails = sema_fn_fails(fn);
+    L.struct_abi = is_struct(L.ret) || L.fails; // (a result with its error: never inlined, for now)
     L.loops = (SYM(fn)->flags & SYM_F_LOOPS) != 0; // it calls itself (the checker saw it)
     L.for_compiler = 0;
-    *out = (MirFunc){.u = u, .sym = fn, .returns = L.ret != T_VOID,
-                     .ret_slots = L.ret == T_VOID ? 0 : slots_of(L.ret)};
+    L.handled_call = 0;
+    L.guard_call = 0;
+    *out = (MirFunc){.u = u, .sym = fn, .returns = L.ret != T_VOID || L.fails,
+                     .ret_slots = (L.ret == T_VOID ? 0 : slots_of(L.ret)) + (uint32_t)L.fails};
     if (!mir_lowerable(u, fn, 0))
     {
         unsupported(SYM(fn)->tok, "a module-level function that takes `self`");
-        return 0;
-    }
-    if (SYM(fn)->flags & SYM_F_CAPTURES)
-    {
-        unsupported(SYM(fn)->tok,
-                    "a function literal that uses a local of the function around it (a closure)");
         return 0;
     }
 
@@ -4741,6 +5121,10 @@ int mir_lower(Unit *u, SymId fn, MirFunc *out)
     for (NodeId p = sema_fn_params(u, fn); p; p = NEXT(u, p))
     {
         TypeId pt = sema_param_type(u, fn, p);
+        if (type_kind(pt) == T_FUNC)
+        {
+            continue; // `f: function(...)`: known while compiling, no slot (its calls name the function)
+        }
         uint32_t k = param_slots(pt);
         L.struct_abi |= is_struct(pt);
         MirSlot slot = temp_n(k);
@@ -4751,12 +5135,24 @@ int mir_lower(Unit *u, SymId fn, MirFunc *out)
             L.locals[L.nlocals - 1].ref = (uint8_t)is_array(pt); // an array parameter: its address
         }
     }
+    {
+        Capture caps[64]; // what it reads of the function around it: parameters after its own
+        uint32_t nc = sema_captures(fn, caps, 64);
+        for (uint32_t i = 0; i < nc; i++)
+        {
+            push_local(caps[i].name, temp());
+        }
+    }
     uint32_t params_end = L.top;
     out->param_slots = params_end;
     MirSlot next_slot = first_param;
     for (NodeId p = sema_fn_params(u, fn); p; p = NEXT(u, p))
     {
         MirSlot slot = next_slot;
+        if (type_kind(sema_param_type(u, fn, p)) == T_FUNC)
+        {
+            continue;
+        }
         next_slot += param_slots(sema_param_type(u, fn, p));
         Pattern pat;
         if (!sema_pattern_of(u, p, SYM(fn)->owner, &pat, 0))
@@ -4923,10 +5319,12 @@ static void region_start(void)
 uint32_t mir_param_slots(SymId fn)
 {
     Unit *u = &cx.units[SYM(fn)->unit];
-    uint32_t k = SYM(fn)->owner != 0;
+    Capture caps[64];
+    uint32_t k = (SYM(fn)->owner != 0) + sema_captures(fn, caps, 64); // a literal's captures: one slot each
     for (NodeId p = sema_fn_params(u, fn); p; p = NEXT(u, p))
     {
-        k += slots_of(sema_param_type(u, fn, p));
+        TypeId pt = sema_param_type(u, fn, p);
+        k += type_kind(pt) == T_FUNC ? 0 : slots_of(pt); // a function given while compiling: no slot
     }
     return k;
 }

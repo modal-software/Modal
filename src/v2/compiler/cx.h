@@ -509,6 +509,7 @@ const char *trap_code_text(uint32_t n); // the text of trap N, or NULL
 int trap_codes_write(const char *path); // <out>.traps; 0 when there are none
 void audit_call(SymId from, SymId to); // --audit: a call, inlined or not
 void audit_comptime(SymId fn);         // --audit: the compiler ran fn
+void audit_boundary(Unit *u, uint32_t tok, const char *text); // --audit: a boundary and its arena
 // Clauses (literal patterns: `u8 fact(u8 0): 1`).
 int sema_pattern(Unit *u, NodeId param, SymId owner, uint64_t *value, int loud);
 // What a pattern parameter matches: one value, a range (both ends included, in the parameter's
@@ -541,9 +542,57 @@ NodeId sema_arm_name(Unit *u, NodeId pat, TypeId type); // a run-time name patte
 // many arms the last stage opened (a stage without a pattern continues that arm). MATCH_PARTIAL: a
 // stage need not take every value. MATCH_PASS (the checker): a value stage whose untaken values go
 // on as the match's value.
+// AST_SIG aux: SIG_FAILS, the result says `, error` (`parse(...): u64, error`, guards.md §5).
+#define SIG_FAILS 1
+// AST_DEFINE aux: DEFINE_UNREAD, `n, e := f()` with an e no line reads.
+#define DEFINE_UNREAD 1
+// DEFINE_ROLLBACK: a boundary whose call takes the `arena` context and lets nothing it allocates
+// stay reachable: on an error the arena is put back as it was (guards.md §5 step 7).
+#define DEFINE_ROLLBACK 2
+int sema_fn_fails(SymId fn); // the result says `, error`
+// The errors fn can give its caller (guards.md §5 step 6): the panics (bit kind - 1), the errors it
+// returns, and whether one is not known (it returns one it holds). Returns 1 when every function
+// it reaches was checked (the set is whole).
+int sema_error_set(SymId fn, uint8_t *panics, const uint64_t **ids, uint32_t *n, int *any);
+int sema_error_name(uint64_t id, char *buf, size_t cap); // `bad_input`, `panic.division`
+void sema_errors_finish(void); // every body is checked: `if e` on a call's error against its set
+// A function literal's captures (context.md §60): locals of the function around it that it reads,
+// passed by every call after its declared arguments.
+typedef struct
+{
+    SymId lit;
+    NameId name;
+    TypeId type;
+} Capture;
+uint32_t sema_captures(SymId lit, Capture *out, uint32_t cap);
 #define MATCH_STAGE 4
 #define MATCH_PARTIAL 8
 #define MATCH_PASS 16
+// MATCH_ERRORS: a stage on a call that can fail, `parse(s).(u64: double, error: 0)`: each arm tests
+// its value or its error (sema_error_arm); what no arm takes goes on (a value passes, an error up).
+#define MATCH_ERRORS 32
+enum
+{
+    EARM_ANY,        // `_`: everything
+    EARM_ERROR,      // `error:`: any error
+    EARM_NAME,       // `bad_input:` (or `nil:`): that error (*id)
+    EARM_VALUE_TYPE, // `u64:` (the value's type): no error
+    EARM_VALUE,      // a pattern of the value (a literal, a range, a name): no error, and it matches
+};
+int sema_error_arm(const Unit *u, NodeId pat, TypeId value_type, uint64_t *id);
+// The panics (guards.md §5): bugs, each an error of a number of its own (std/panic.modal names
+// them). A program's own errors are numbered from ERROR_FIRST on, so they never meet these.
+enum
+{
+    PANIC_DIVISION = 1,
+    PANIC_INDEX = 2,
+    PANIC_ASSERT = 3,
+    PANIC_ANYTYPE = 4,
+    PANIC_UNHANDLED = 5,
+    PANIC_RAISED = 6,
+    PANIC_STACK = 7,
+    ERROR_FIRST = 16,
+};
 #define MATCH_OPEN(aux) (((aux) >> 8) & 0xff)
 // A string literal's bytes, escapes decoded; returns the length (at most cap are written).
 size_t sema_pattern_text(const Unit *u, uint32_t tok, uint8_t *out, size_t cap);

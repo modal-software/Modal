@@ -136,8 +136,40 @@ static void fit(void)
     }
 }
 
+// An error's number: std's panics (std/panic.modal) have fixed ones, PANIC_* (the code the
+// backends give each guard carries them); every other error its symbol's, past them.
+static uint64_t error_number(const Unit *u, uint32_t name_tok, SymId s)
+{
+    size_t pl = strlen(u->path);
+    if (pl >= 15 && strcmp(u->path + pl - 15, "std/panic.modal") == 0)
+    {
+        static const char *const names[] = {"division", "index", "assert", "anytype", "unhandled", "raised", "stack"};
+        const Token *t = TOK(u, name_tok);
+        for (int i = 0; i < 7; i++)
+        {
+            if (t->len == strlen(names[i]) && memcmp(TSTART(t), names[i], t->len) == 0)
+            {
+                return (uint64_t)(PANIC_DIVISION + i);
+            }
+        }
+    }
+    return (uint64_t)s + ERROR_FIRST;
+}
+
 int sema_comptime_value(SymId s, uint64_t *out)
 {
+    if ((s >= values_cap || known[s] != 1) && s && SYM(s)->kind == SYM_CONST && !SYM(s)->owner)
+    {
+        // `bad_input: error` of a file not computed yet (an import): its number needs nothing else
+        Unit *home = &cx.units[SYM(s)->unit];
+        const AstNode *d = NODE(home, SYM(s)->decl);
+        if (d->kind == AST_FIELD_DECL && !d->b && !(d->flags & (AST_F_MUT | AST_F_PLACED)) &&
+            sema_value_type(home, s) == T_ERROR)
+        {
+            *out = error_number(home, d->tok, s);
+            return 1;
+        }
+    }
     if (s >= values_cap || known[s] != 1)
     {
         return 0;
@@ -156,7 +188,7 @@ const ComptimeAggregate *sema_comptime_aggregate(SymId s)
 // into the compiler), nor can a device's registers. The slots holding a string are marked.
 static const char *portable(TypeId t, uint32_t off, uint8_t *is_str, uint32_t k)
 {
-    if (type_is_int(t) || t == T_BOOL)
+    if (type_is_int(t) || t == T_BOOL || t == T_ERROR)
     {
         return NULL;
     }
@@ -211,7 +243,7 @@ static void keep(CtFunc *to, const MirFunc *f)
     {
         uint8_t *b = (uint8_t *)arena_alloc(f->strings[i].len + 8);
         memcpy(b, f->strings[i].bytes, f->strings[i].len);
-        to->strings[i] = (MirString){b, f->strings[i].len};
+        to->strings[i] = (MirString){b, f->strings[i].len, f->strings[i].panic};
     }
     to->frame_size = f->frame_size;
     to->params = f->param_slots;
@@ -426,6 +458,7 @@ struct CtFrame
     SymId sym;
     const CtFunc *f;
     size_t fp, k; // its frame, and the call it is at
+    uint8_t guard; // the call is a boundary (MIR_CALL_GUARD): its var, + 1 (0: an ordinary call)
 };
 
 // One write of the program, made by the compiler (its stdout), in the program's format: the same
@@ -617,7 +650,8 @@ static int run(Vm *vm, SymId sym, const CtFunc *f, size_t fp)
                 vm->frames = grown;
                 vm->frames_cap = cap;
             }
-            vm->frames[depth++] = (struct CtFrame){sym, f, fp, k};
+            vm->frames[depth++] =
+                (struct CtFrame){sym, f, fp, k, (uint8_t)(in->sub == MIR_CALL_GUARD ? (in->var & 0xff) + 1 : 0)};
             sym = callee;
             f = g;
             fp = callee_fp;
@@ -637,6 +671,10 @@ static int run(Vm *vm, SymId sym, const CtFunc *f, size_t fp)
             fp = back->fp;
             k = back->k; // the loop goes on after the call
             s = vm->stack + fp;
+            if (back->guard && !((back->guard - 1) & 1)) // a boundary on a call that cannot fail: e = nil
+            {
+                s[f->frame_size + ((back->guard - 1) >> 1)] = 0;
+            }
             break;
         }
         case MIR_STR:
@@ -708,8 +746,35 @@ static int run(Vm *vm, SymId sym, const CtFunc *f, size_t fp)
                     break;
                 }
             }
+            int caught = -1; // the nearest boundary: the panic goes back to it (guards.md §5)
+            for (int d = (int)depth - 1; d >= 0 && caught < 0; d--)
+            {
+                caught = vm->frames[d].guard ? d : -1;
+            }
             if (in->sub == MIR_TRAP_PART)
             {
+                if (caught >= 0)
+                {
+                    vm->trap_len -= vm->trap_len; // (it says nothing: the boundary takes it)
+                }
+                break;
+            }
+            if (caught >= 0)
+            {
+                const struct CtFrame *back = &vm->frames[caught];
+                depth = (uint32_t)caught;
+                sym = back->sym;
+                f = back->f;
+                fp = back->fp;
+                k = back->k;
+                s = vm->stack + fp;
+                uint32_t nv = (uint32_t)((back->guard - 1) >> 1);
+                for (uint32_t i = 0; i < nv; i++)
+                {
+                    s[f->frame_size + i] = 0;
+                }
+                s[f->frame_size + nv] = in->imm; // the panic's number is the error
+                vm->trap_len = 0;
                 break;
             }
             vm->trapped = 1;
@@ -975,6 +1040,18 @@ void comptime_unit(Unit *u)
             continue;
         }
         NodeId init = n->kind == AST_FIELD_DECL ? n->b : n->kind == AST_DEFINE ? n->a : 0;
+        if (!init && n->kind == AST_FIELD_DECL && !(n->flags & (AST_F_MUT | AST_F_PLACED)))
+        {
+            // `bad_input: error`: an error of the program, a number of its own (guards.md §5)
+            SymId es = scope_find_token(u->scope, TOK(u, n->tok));
+            if (es && SYM(es)->kind == SYM_CONST && sema_value_type(u, es) == T_ERROR)
+            {
+                fit();
+                values[es] = error_number(u, n->tok, es);
+                known[es] = 1;
+            }
+            continue;
+        }
         if (!init || (n->flags & AST_F_PLACED) || written_out(u, init))
         {
             continue;

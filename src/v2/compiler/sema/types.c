@@ -116,7 +116,7 @@ char *type_str(TypeId t, char *buf, size_t cap)
         [T_INT_LIT] = "int",   [T_U8] = "u8",        [T_U16] = "u16",   [T_U32] = "u32",
         [T_U64] = "u64",       [T_I8] = "i8",        [T_I16] = "i16",   [T_I32] = "i32",
         [T_I64] = "i64",       [T_INT] = "int",      [T_STR] = "[]u8",  [T_EXTERN] = "external",
-        [T_MODULE] = "module",
+        [T_MODULE] = "module", [T_ERROR] = "error",
     };
     size_t n = 0;
 

@@ -26,14 +26,15 @@
 
 // The runtime context. Its buffer and the value stack are sized when the program is compiled
 // (backend/native/emit.c, memory budgets): exactly what the program needs when that is known.
+typedef uint64_t u64;
 typedef struct Ctx
 {
     uint32_t len, cap; // bytes waiting in buf, and its size
     uint8_t *buf;
     uint64_t *globals; // module-level variables: the bottom of the value stack
+    u64 *jb;           // the boundary a panic goes back to (`n, e := f()`, guards.md §5), or 0
 } Ctx;
 
-typedef uint64_t u64;
 
 extern char HOLE_A[], HOLE_B[], HOLE_C[];
 extern void CONTINUE(u64 *f, Ctx *c, u64 acc);
@@ -149,14 +150,60 @@ RUNTIME void rt_write_bool(Ctx *c, u64 b)
 // far goes out first, then this part to the error output; the trap that follows ends it.
 RUNTIME void rt_trap_part(Ctx *c, const uint8_t *msg)
 {
+    if (c->jb)
+    {
+        return; // a boundary waits: the panic goes back to it, and says nothing
+    }
     rt_flush(c);
     u64 n;
     __builtin_memcpy(&n, msg, 8);
+    n &= 0x00ffffffffffffffull; // (the top byte: a panic's number)
     write(2, msg + 8, n);
 }
 
+// A panic: back to the boundary there is (its number is the error there), or the program stops
+// with its message.
 RUNTIME __attribute__((noreturn)) void rt_trap(Ctx *c, const uint8_t *msg)
 {
+    if (c->jb)
+    {
+        // back to the boundary: the registers a call keeps, the stack, then its resume point
+        // (saved by guarded_call: jb[0..] as that stencil lays them out); the panic's number,
+        // the top byte of the message's length word, goes in jb[14]
+        u64 len;
+        __builtin_memcpy(&len, msg, 8);
+        c->jb[14] = len >> 56;
+#if defined(__aarch64__)
+        register u64 *j __asm__("x17") = c->jb;
+        __asm__ volatile("ldp x19, x20, [x17, #0]\n\t"
+                         "ldp x21, x22, [x17, #16]\n\t"
+                         "ldp x23, x24, [x17, #32]\n\t"
+                         "ldp x25, x26, [x17, #48]\n\t"
+                         "ldp x27, x28, [x17, #64]\n\t"
+                         "ldp x29, x30, [x17, #80]\n\t"
+                         "ldr x16, [x17, #96]\n\t"
+                         "mov sp, x16\n\t"
+                         "ldr x16, [x17, #104]\n\t"
+                         "br x16"
+                         :
+                         : "r"(j)
+                         : "memory");
+#else
+        u64 *j = c->jb;
+        __asm__ volatile("movq 0(%0), %%rbx\n\t"
+                         "movq 8(%0), %%rbp\n\t"
+                         "movq 16(%0), %%r12\n\t"
+                         "movq 24(%0), %%r13\n\t"
+                         "movq 32(%0), %%r14\n\t"
+                         "movq 40(%0), %%r15\n\t"
+                         "movq 48(%0), %%rsp\n\t"
+                         "jmpq *56(%0)"
+                         :
+                         : "D"(j)
+                         : "memory");
+#endif
+        __builtin_unreachable();
+    }
     rt_trap_part(c, msg); // (one copy of the code: clang would otherwise outline what they share)
     exit(1);
 }
@@ -176,6 +223,7 @@ int st_entry(void)
     ctx.cap = (uint32_t)bytes;
     ctx.buf = out;
     ctx.globals = stack;
+    ctx.jb = 0;
     stack[A] = 0;
     CALLEE(stack + A, &ctx, 0);
     rt_flush(&ctx);
@@ -194,6 +242,7 @@ int st_entry_direct(void)
     ctx.cap = 0;
     ctx.buf = 0;
     ctx.globals = stack;
+    ctx.jb = 0;
     stack[A] = 0;
     CALLEE(stack + A, &ctx, 0);
     return (int)stack[A];
@@ -209,6 +258,7 @@ int st_entry_void_direct(void)
     ctx.cap = 0;
     ctx.buf = 0;
     ctx.globals = stack;
+    ctx.jb = 0;
     CALLEE(stack + A, &ctx, 0);
     return 0;
 }
@@ -224,6 +274,7 @@ int st_entry_void(void)
     ctx.cap = (uint32_t)bytes;
     ctx.buf = out;
     ctx.globals = stack;
+    ctx.jb = 0;
     CALLEE(stack + A, &ctx, 0);
     rt_flush(&ctx);
     return 0;
@@ -429,6 +480,96 @@ STENCIL(jnz_a)
 STENCIL(call) // CALLEE with its frame at slot A of this one
 {
     CALLEE(f + A, c, 0);
+    NEXT_FRESH;
+}
+
+// A boundary (MIR_CALL_GUARD, `n, e := f()`): CALLEE with its frame at slot A. B >> 1: its value's
+// slots; B & 1: it says `, error`. A panic below comes back here: the value is zero and the error
+// slot (after the value) holds the panic's number; a callee that cannot fail leaves it 0. The
+// registers the caller keeps across the call come back too: a function with __builtin_setjmp
+// saves every callee-saved register, and restores them when it ends.
+STENCIL(guarded_call)
+{
+    u64 jb[15];
+    u64 *outer = c->jb;
+    u64 *g = f + A;
+    u64 k = B >> 1;
+    u64 resumed;
+    c->jb = jb;
+    // The call runs inside the asm, which first saves what rt_trap restores: the registers a call
+    // keeps, the stack pointer, and the resume point (label 1). The compiler sees one asm that
+    // keeps those registers, as any call does; on the way back it is the same.
+#if defined(__aarch64__)
+    __asm__ volatile("stp x19, x20, [%[jb], #0]\n\t"
+                     "stp x21, x22, [%[jb], #16]\n\t"
+                     "stp x23, x24, [%[jb], #32]\n\t"
+                     "stp x25, x26, [%[jb], #48]\n\t"
+                     "stp x27, x28, [%[jb], #64]\n\t"
+                     "stp x29, x30, [%[jb], #80]\n\t"
+                     "mov x16, sp\n\t"
+                     "str x16, [%[jb], #96]\n\t"
+                     "adr x16, 1f\n\t"
+                     "str x16, [%[jb], #104]\n\t"
+                     "mov x0, %[g]\n\t"
+                     "mov x1, %[c]\n\t"
+                     "mov x2, #0\n\t"
+                     "bl CALLEE\n\t"
+                     "mov %[r], #0\n\t"
+                     "b 2f\n"
+                     "1:\n\t"
+                     "mov %[r], #1\n"
+                     "2:"
+                     : [r] "=r"(resumed)
+                     : [jb] "r"(jb), [g] "r"(g), [c] "r"(c)
+                     : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
+                       "x14", "x15", "x16", "x17", "x30", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v16",
+                       "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29",
+                       "v30", "v31", "memory", "cc");
+#else
+    __asm__ volatile("movq %%rbx, 0(%[jb])\n\t"
+                     "movq %%rbp, 8(%[jb])\n\t"
+                     "movq %%r12, 16(%[jb])\n\t"
+                     "movq %%r13, 24(%[jb])\n\t"
+                     "movq %%r14, 32(%[jb])\n\t"
+                     "movq %%r15, 40(%[jb])\n\t"
+                     "movq %%rsp, 48(%[jb])\n\t"
+                     "leaq 1f(%%rip), %%rax\n\t"
+                     "movq %%rax, 56(%[jb])\n\t"
+                     "movq %[g], %%rdi\n\t"
+                     "movq %[c], %%rsi\n\t"
+                     "subq $128, %%rsp\n\t" // past the red zone
+                     "pushq %%rbx\n\t"
+                     "movq %%rsp, %%rbx\n\t"
+                     "andq $-16, %%rsp\n\t"
+                     "xorl %%edx, %%edx\n\t"
+                     "call CALLEE\n\t"
+                     "movq %%rbx, %%rsp\n\t"
+                     "popq %%rbx\n\t"
+                     "addq $128, %%rsp\n\t"
+                     "movq $0, %[r]\n\t"
+                     "jmp 2f\n"
+                     "1:\n\t"
+                     "movq $1, %[r]\n"
+                     "2:"
+                     : [r] "=r"(resumed)
+                     : [jb] "r"(jb), [g] "r"(g), [c] "r"(c)
+                     : "rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3",
+                       "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14",
+                       "xmm15", "memory", "cc");
+#endif
+    c->jb = outer;
+    if (resumed)
+    {
+        for (u64 i = 0; i < k; i++)
+        {
+            g[i] = 0;
+        }
+        g[k] = jb[14]; // the panic's number, left by rt_trap
+    }
+    else if (!(B & 1))
+    {
+        g[k] = 0;
+    }
     NEXT_FRESH;
 }
 

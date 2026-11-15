@@ -1091,6 +1091,35 @@ void contract_print(void)
                 ast.sig_str(u, s->decl, sig, sizeof(sig));
             }
             sig_line("  ", sig, sema_fn_kind(id, why, sizeof(why)));
+            {
+                uint8_t panics;
+                const uint64_t *ids;
+                uint32_t nids;
+                int any;
+                if (sema_error_set(id, &panics, &ids, &nids, &any) >= 0 && (panics || nids || any))
+                {
+                    char line[600], name[64];
+                    size_t ll = 0;
+                    for (uint32_t i = 0; i < nids && ll + 70 < sizeof(line); i++)
+                    {
+                        sema_error_name(ids[i], name, sizeof(name));
+                        ll += (size_t)snprintf(line + ll, sizeof(line) - ll, "%s%s", ll ? ", " : "", name);
+                    }
+                    for (int k = 0; k < 7 && ll + 70 < sizeof(line); k++)
+                    {
+                        if (panics & (1u << k))
+                        {
+                            sema_error_name((uint64_t)(PANIC_DIVISION + k), name, sizeof(name));
+                            ll += (size_t)snprintf(line + ll, sizeof(line) - ll, "%s%s", ll ? ", " : "", name);
+                        }
+                    }
+                    if (any)
+                    {
+                        snprintf(line + ll, sizeof(line) - ll, "%san error it holds", ll ? ", " : "");
+                    }
+                    printf("      errors: %s\n", line);
+                }
+            }
             uint32_t budget;
             int notes = comptime_fold_notes(id, &budget);
             if (notes & FOLD_NOTE_VALUE)
@@ -1245,4 +1274,5 @@ void modules_link(void)
         cx.phase_ns[PHASE_CHECK] +=
             clock_ns() - t - (cx.phase_ns[PHASE_PARSE] + cx.phase_ns[PHASE_EMIT] - inside);
     }
+    sema_errors_finish(); // the errors each function can give are known now
 }

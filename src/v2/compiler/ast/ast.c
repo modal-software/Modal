@@ -8,7 +8,7 @@
 const uint8_t ast_child_mask[AST__COUNT] = {
     [AST_MODULE] = 1,     [AST_STRUCT_DECL] = 1, [AST_FIELD_DECL] = 3, [AST_METHOD_DECL] = 3,
     [AST_PARAM] = 1,      [AST_DEFINE] = 1,      [AST_VAL_DECL] = 3,   [AST_TYPE_SLICE] = 1,
-    [AST_TYPE_PTR] = 1, [AST_TYPE_EXPR] = 1,   [AST_TYPE_STRUCT] = 1, [AST_FN_LIT] = 3,     [AST_BLOCK] = 1,
+    [AST_TYPE_PTR] = 1, [AST_TYPE_EXPR] = 1, [AST_TYPE_FUNC] = 3,   [AST_TYPE_STRUCT] = 1, [AST_FN_LIT] = 3,     [AST_BLOCK] = 1,
     [AST_RETURN] = 1,     [AST_ASSIGN] = 3,      [AST_BIN_OP] = 3,     [AST_UNARY_OP] = 1,
     [AST_CALL] = 3,       [AST_INDEX] = 3,       [AST_SELECTOR] = 1,   [AST_PAREN_GROUP] = 1,
     [AST_IMPORT_ALL] = 1, [AST_IMPORT_PICK] = 3,  [AST_SIG] = 3,
@@ -45,6 +45,7 @@ static const char *ast_kind_name(AstNodeKind kind)
         [AST_TYPE_PTR] = "type-ptr",
         [AST_TYPE_STRUCT] = "type-struct",
         [AST_TYPE_EXPR] = "type-expr",
+        [AST_TYPE_FUNC] = "type-function",
         [AST_FN_LIT] = "fn",
         [AST_BLOCK] = "block",
         [AST_RETURN] = "return",
@@ -219,6 +220,10 @@ static char *ast_sig_str(const Unit *u, NodeId decl, char *buf, size_t cap)
     {
         str_puts(&s, ": ");
         str_type(&s, u, ret);
+        if (u->nodes.data[fid].b && (u->nodes.data[u->nodes.data[fid].b].aux & 1)) // SIG_FAILS
+        {
+            str_puts(&s, ", error");
+        }
     }
     return buf;
 }
