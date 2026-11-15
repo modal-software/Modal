@@ -1,0 +1,26 @@
+-- print(e): an error's name (nil, bad_input, panic.division), or `error N` for one the program
+-- cannot name. The names reach the binary only because the program prints an error.
+print := import("std").io.print
+panic := import("std").panic
+
+bad_input: error
+too_big: error
+
+u64 half(u64 n) { return 100 / n }
+
+parse([]u8 s): u64, error {
+    if s {
+        "": return bad_input
+        "big": return too_big
+        _: return 1
+    }
+}
+main(): u8 {
+    a, e := parse("")
+    b, f := parse("big")
+    c, g := parse("x")
+    d, h := half(0)
+    print("errors:", e, f, g, h)
+    print(panic.index)
+    return 0
+}

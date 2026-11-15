@@ -151,7 +151,7 @@ else
     echo "FAIL  unknown backend is rejected"
     fail=1
 fi
-for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms arm_edges arm_search arm_consts clauses_nil arrays fields reflect field_use nested module_structs any types generic fields_each bound; do
+for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms arm_edges arm_search arm_consts clauses_nil arrays fields reflect field_use nested module_structs any types generic fields_each bound pipes errors error_stages panics error_sets arena_errors closures functions struct_arrays generic_loop print_errors struct_errors captures; do
     if $BIN --run $EX/run/$prog.modal 2>&1 | cmp -s - $EX/run/$prog.expected; then
         echo "ok    $prog.modal compiles to C and prints the expected output"
     else
@@ -220,11 +220,16 @@ expect_output "an immutable local needs its value" "locals_syntax.modal:3:.*immu
 expect_output "a local declares one name" "locals_syntax.modal:4:.*a local declares one name" $L
 expect_output "a struct is not declared in a function" "locals_syntax.modal:5:.*declared at module level" $L
 
-expect_output "a closure is reported" "closure.modal:2:.*a closure" $EX/errors/closure.modal -o ${TMPDIR:-/tmp}/modal-test-closure-$$.c
+if [ "$($BIN --run $EX/errors/closure.modal >/dev/null 2>&1; echo $?)" = 3 ]; then
+    echo "ok    a literal reading a local of its function runs (f(2) = 3)"
+else
+    echo "FAIL  a literal reading a local of its function runs (f(2) = 3)"
+    fail=1
+fi
 
 # the native backend (copy-and-patch): same output and exit status as the C backend
 if [ "$(uname -m)" = arm64 ] || [ "$(uname -m)" = aarch64 ]; then
-    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms arm_edges arm_search arm_consts clauses_nil arrays fields reflect field_use nested module_structs any types generic fields_each bound; do
+    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms arm_edges arm_search arm_consts clauses_nil arrays fields reflect field_use nested module_structs any types generic fields_each bound pipes errors error_stages panics error_sets arena_errors closures functions struct_arrays generic_loop print_errors struct_errors captures; do
         if $BIN --backend native --run $EX/run/$prog.modal 2>&1 | cmp -s - $EX/run/$prog.expected; then
             echo "ok    $prog.modal compiles to arm64 by copy-and-patch and prints the expected output"
         else
@@ -249,12 +254,12 @@ if [ "$(uname -m)" = arm64 ] || [ "$(uname -m)" = aarch64 ]; then
     fi
     LZ=${TMPDIR:-/tmp}/modal-test-lazy-$$
     expect_output "what cannot be generated is reported only when called" \
-        "util.modal:16:.*closure.*in 'f', which the program calls" $EX/errors/lazy/main.modal --backend native -o $LZ
+        "util.modal:18:.*this struct value is not supported yet (in 'lambda_user', which the program calls)" $EX/errors/lazy/main.modal --backend native -o $LZ
     rm -f "$LZ"
 fi
 # x86-64: on an x86-64 host, or on Apple Silicon through Rosetta
 if [ "$(uname -m)" = x86_64 ] || arch -x86_64 /usr/bin/true 2>/dev/null; then
-    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms arm_edges arm_search arm_consts clauses_nil arrays fields reflect field_use nested module_structs any types generic fields_each bound; do
+    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms arm_edges arm_search arm_consts clauses_nil arrays fields reflect field_use nested module_structs any types generic fields_each bound pipes errors error_stages panics error_sets arena_errors closures functions struct_arrays generic_loop print_errors struct_errors captures; do
         if $BIN --backend x86_64 --run $EX/run/$prog.modal 2>&1 | cmp -s - $EX/run/$prog.expected; then
             echo "ok    $prog.modal compiles to x86-64 by copy-and-patch and prints the expected output"
         else
@@ -285,7 +290,7 @@ for cpu in arm64 x86_64; do
     else
         continue
     fi
-    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms arm_edges arm_search arm_consts clauses_nil arrays fields reflect field_use nested module_structs any types generic fields_each bound; do
+    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms arm_edges arm_search arm_consts clauses_nil arrays fields reflect field_use nested module_structs any types generic fields_each bound pipes errors error_stages panics error_sets arena_errors closures functions struct_arrays generic_loop print_errors struct_errors captures; do
         if $BIN --target $cpu-linux -o "$ELF" $EX/run/$prog.modal >/dev/null 2>&1 &&
             $runner "$ELF" 2>&1 | untrap "$ELF.traps" | cmp -s - $EX/run/$prog.expected; then
             echo "ok    $prog.modal as a Linux $cpu ELF prints the expected output"
@@ -327,23 +332,23 @@ done
 # memory budgets: the value stack sized from the call graph; mod.modal's max_code / max_ram
 BG=${TMPDIR:-/tmp}/modal-test-budget-$$
 CV_OUT=$(mktemp)
-if [ "$($BIN $EX/run/compiled_value.modal -o "$CV_OUT" 2>/dev/null | head -1)" = 11 ] &&
+if [ "$($BIN $EX/run/compile_print.modal -o "$CV_OUT" 2>/dev/null | head -1)" = 11 ] &&
     ! grep -q "loop\|m_desc_\|assert\|g_a" "$CV_OUT"; then
     echo "ok    c: a function only the compiler ran prints in the build and is not in the program"
 else
     echo "FAIL  c: a function only the compiler ran prints in the build and is not in the program"
     fail=1
 fi
-if [ "$($BIN --backend arm64 --run $EX/run/compiled_value.modal 2>/dev/null)" = 11 ]; then
+if [ "$($BIN --backend arm64 --run $EX/run/compile_print.modal 2>/dev/null)" = 11 ]; then
     echo "ok    native: the compiler's print comes before the program, which prints nothing"
 else
     echo "FAIL  native: the compiler's print comes before the program, which prints nothing"
     fail=1
 fi
 rm -f "$CV_OUT"
-expect_output "sig: a generic is listed once, its specializations under it" "loop(T: type, n: T) *generic: made once per type" $EX/run/compiled_value.modal --sig
-expect_output "sig: a specialization with its own types" "^    loop(type, u64) *run time" $EX/run/compiled_value.modal --sig
-expect_output "sig: a function that ran for a module-level value says so" "ran while compiling, for a value the program uses" $EX/run/compiled_value.modal --sig
+expect_output "sig: a generic is listed once, its specializations under it" "loop(T: type, n: T) *generic: made once per type" $EX/run/compile_print.modal --sig
+expect_output "sig: a specialization with its own types" "^    loop(type, u64) *run time" $EX/run/compile_print.modal --sig
+expect_output "sig: a function that ran for a module-level value says so" "ran while compiling, for a value the program uses" $EX/run/compile_print.modal --sig
 expect_output "a function that needs nothing runs at both times" "twice(n: u8): u8 *both$" $EX/kinds.modal --sig
 expect_output "a function that prints is run time, where" "log(n: u8) *run time  (prints, kinds.modal:10)" $EX/kinds.modal --sig
 expect_output "the kind follows the calls" "step(n: u8): u8 *run time  (prints, through 'log', kinds.modal:10)" $EX/kinds.modal --sig
@@ -452,6 +457,41 @@ GE=$EX/errors/generic.modal
 expect_output "generic: an argument of the bound type" "generic.modal:15:.*.c. should be point, but it is rgb" $GE
 expect_output "generic: the type argument names a type" "generic.modal:16:.*takes this argument as a type" $GE
 expect_output "generic: a constant fits the bound type" "generic.modal:17:.*300 does not fit u8" $GE
+expect_output "order: a function written below its caller is checked first" "order.modal:4:.*'f' is always nil: 'add' can neither fail nor panic" $EX/errors/order.modal --warn
+expect_output "arena: an error gives back what the call allocated" "arena_errors.modal:48:.*'build': on an error the arena goes back" $EX/run/arena_errors.modal --audit
+expect_output "arena: kept when a module variable could hold what it allocated" "arena_errors.modal:54:.*'count': the arena keeps what it allocated on an error: it, or a function it calls, uses a mutable module variable" $EX/run/arena_errors.modal --audit
+CL=$EX/errors/closures.modal
+expect_output "closures: a literal reads a local, never assigns it" "closures.modal:5:.*'count' is a local of the function around this literal" $CL
+expect_output "closures: a capture is one slot" "closures.modal:7:.*a literal reads 'p' of the function around it, a \\[4\\]u8" $CL
+expect_output "closures: a pattern parameter's type is its first call's" "closures.modal:10:.*argument 1 of 'small' is u64, but it takes int" $CL
+FN=$EX/errors/functions.modal
+expect_output "functions: the one given has the signature's types" "functions.modal:8:.*the function given to 'apply' takes u8, but its signature gives it u64" $FN
+expect_output "functions: a function is given, not a value" "functions.modal:10:.*'apply' takes a function here" $FN
+NE_OUT=${TMPDIR:-/tmp}/modal-test-noerrnames-$$
+if $BIN --backend native -o "$NE_OUT" $EX/run/error_sets.modal >/dev/null 2>&1 && ! grep -q "bad_input\|too_big\|panic\." "$NE_OUT"; then
+    echo "ok    errors: a program that prints no error carries no error names"
+else
+    echo "FAIL  errors: a program that prints no error carries no error names"
+    fail=1
+fi
+rm -f "$NE_OUT" "$NE_OUT.traps"
+expect_output "errors: a module-level value's call that gives an error stops the compiler" "module_errors.modal:10:.*'b' cannot be computed by the compiler: gets an error from a call" $EX/errors/module_errors.modal
+SE=$EX/errors/error_sets.modal
+expect_output "error sets: a match on a call's error takes its whole set" "error_sets.modal:18:.*'serve' can also give too_big, panic.division" $SE
+expect_output "error sets: an error that is always nil is said" "error_sets.modal:26:.*'f' is always nil: 'add' can neither fail nor panic" $SE --warn
+expect_output "error sets: --sig lists what each function can give" "errors: bad_input, too_big, panic.division" $EX/run/error_sets.modal --sig
+ES=$EX/errors/error_stages.modal
+expect_output "error stages: an error no arm takes goes up" "error_stages.modal:5:.*'parse' can fail, and its error is not handled here" $ES
+expect_output "error stages: a type pattern is the value's type" "error_stages.modal:6:.*'u8' is not the value's type, u64" $ES
+expect_output "error stages: a value no arm takes must fit the arms" "error_stages.modal:7:.*a value no arm takes goes on, but it is u64 and the arms give \[\]u8" $ES
+ER=$EX/errors/errors.modal
+expect_output "errors: an error not handled needs a function that can fail" "errors.modal:12:.*'parse' can fail, and its error is not handled here" $ER
+expect_output "errors: the second name is the error of a call" "errors.modal:13:.*'b' would be the error of a call" $ER
+expect_output "errors: a call that gives only an error binds one name" "errors.modal:14:.*this call gives only an error: bind it alone" $ER
+expect_output "errors: a call alone sends its error up" "errors.modal:15:.*'check' can fail, and its error is not handled here" $ER
+PI=$EX/errors/pipes.modal
+expect_output "pipes: what no arm takes goes on, so it must fit the arms" "pipes.modal:5:.*the values no arm takes go on as the stage's value, but they are u8 and the arms give \[\]u8" $PI
+expect_output "pipes: a stage continues one arm" "pipes_open.modal:4:.*would continue several arms" $EX/errors/pipes_open.modal
 BC=$EX/errors/bound.modal
 expect_output "bound: a bound call takes no arguments" "bound.modal:7:.*holds a call with its arguments already given" $BC
 expect_output "bound: a bound call is not its result" "bound.modal:8:.*cannot be applied to function inc and int" $BC
@@ -530,7 +570,7 @@ expect_output "the value stack is sized exactly from the call graph" "^memory .*
 expect_output "a recursive program says which function has no known depth" "'fact' calls itself" $EX/run/patterns.modal --backend native -o "$BG" --stats
 expect_output "a program within its budgets compiles" "^ok: .*small.modal" $EX/budget/small.modal --backend native -o "$BG"
 expect_output "code over max_code is an error" "deep.modal:21:.*code is [0-9]* bytes, over max_code = 1200" $EX/budget/deep.modal --backend native -o "$BG"
-expect_output "memory over max_ram is an error, with what it is made of" "deep.modal:21:.*over max_ram = 512 (mod.modal): value stack 40, output buffer 64, 3 nested calls" $EX/budget/deep.modal --backend native -o "$BG"
+expect_output "memory over max_ram is an error, with what it is made of" "deep.modal:21:.*over max_ram = 512 (mod.modal): value stack 24, output buffer 64, 2 nested calls" $EX/budget/deep.modal --backend native -o "$BG"
 rm -f "$BG"
 BM=${TMPDIR:-/tmp}/modal-test-bare-$$
 expect_output "bare metal needs a memory map" "bare.modal:2:.*runs without a system: its mod.modal gives the memory map" $EX/errors/bare.modal --target arm64-none -o "$BM"

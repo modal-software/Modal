@@ -156,6 +156,19 @@ static size_t compact_arm64(const char *name, const unsigned char *code, size_t 
         {
             relocated |= rel[r].offset == k * 4;
         }
+        if (!relocated && (w & 0x9f000000u) == 0x10000000u) // adr of a label in this stencil
+        {
+            int64_t imm = (int64_t)(int32_t)((((w >> 5) & 0x7ffffu) << 2 | ((w >> 29) & 3u)) << 11) >> 11;
+            int64_t target = (int64_t)k + imm / 4;
+            if ((imm & 3) || target < 0 || target > (int64_t)ninsn)
+            {
+                fail("an adr out of the stencil", name);
+            }
+            int64_t delta = ((int64_t)new_at[target] - (int64_t)new_at[k]); // bytes
+            w = (w & 0x9f00001fu) | (((uint32_t)delta & 3u) << 29) | ((((uint32_t)delta >> 2) & 0x7ffffu) << 5);
+            memcpy(out + new_at[k], &w, 4);
+            continue;
+        }
         if ((w & 0x1f000000u) == 0x10000000u || (w & 0x3b000000u) == 0x18000000u)
         {
             fail("a PC-relative data reference (adr, adrp or a literal load)", name);

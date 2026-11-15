@@ -1,0 +1,47 @@
+-- Captures (context.md §60, §63): a literal reads the locals around it through any number of
+-- literals, a struct by value, and through a function given while compiling: the specialization
+-- made for that literal takes its captures, every call passes them, and it passes them on.
+
+print := import("std").io.print
+type := import("std").type
+
+T apply(T: type, v: T, f: function(T): T): f(v)
+
+each(n, to: u64, f: function(u64)) {
+    n.(to: print("done"), 
+        _: {
+            f(n)
+            each(n + 1, to, f
+        )}
+    )
+}
+nil given() {
+    u64 limit = 3
+    u64 n = 100
+    print(apply(u64, 5, x: x * limit))
+    print(apply(u64, 5, x: x + n))
+    print(apply(u64, 5, x: x + 1))
+    each(0, 3, i: print("item", i, "of", limit))
+}
+point: struct { i32 x, i32 y }
+main(): u8 {
+    u64 base = 100
+    p := point{ x: 3, y: 4 }
+    outer := (a: u64): u64 {
+        inner := (b: u64): b + base
+        return inner(a) + 1
+    }
+    print(outer(5))
+    sum := (): i32 { return p.x + p.y }
+    print(sum())
+    deep := (k: i32): i32 {
+        mid := (m: i32): i32 {
+            low := (z: i32): z * p.x
+            return low(m) + p.y
+        }
+        return mid(k)
+    }
+    print(deep(10))
+    given()
+    return 0
+}

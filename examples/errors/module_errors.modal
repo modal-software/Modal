@@ -1,0 +1,13 @@
+-- a module-level value is computed by the compiler: an error from a call in it has nowhere to go
+bad_input: error
+parse([]u8 s): u64, error {
+    if s {
+        "": return bad_input
+        _: return 7
+    }
+}
+a := parse("x")
+b := parse("")
+main(): u8 {
+    return u8(a)
+}

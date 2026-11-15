@@ -2512,6 +2512,54 @@ the element's name; functions passed by specialization, never a pointer at run t
   calling `i: print("item", i)`), errors/functions (3). Same on C, native, `MODAL_REGS=0`,
   x86-64, the ELF runs. Tests 433 ok; fuzz 0 differ; bench unchanged.
 
+## 62. Arrays of structs
+
+The first half of the collections step (for `john.map(x: x.id)`).
+- The checker lets a struct be an array's element (`resolve_type`; a register block still not).
+  The element is laid out as the struct is (fields by use included: a field no one reads has no
+  bytes in any element), packed, `i * size`.
+- MIR: `people[i] = person{ ... }` stores field by field at the element's address
+  (`copy_fields`, the value computed first: it may read the array); `lower_struct_addr` of an
+  element is its address in place (so `people[i].id = 9`, `ps[i].at.x = ...` through a
+  `*[3]person`, reach the array); `lower_struct_into` copies one out (`p := people[1]`, an
+  element passed by value). C had it already (a C array of the struct).
+- Example run/struct_arrays (+ .expected: a []u8 and a struct inside the element, an unread
+  field, a copy, writes through a reference, a recursion over the elements). Same on C, native,
+  `MODAL_REGS=0`, x86-64, the ELF runs. Tests 438 ok; fuzz 0 differ (scalar, struct); bench
+  unchanged.
+
+## 63. Small gaps closed (before collections, the owner's order)
+
+- **C: no musttail through `T: type`.** A specialization's type parameters are constants, so C no
+  longer passes them: the signature, the calls and bound calls leave them out
+  (`sema_bound_type`), and the body reads the bound descriptor (`m_desc_N`) where it names T.
+  A recursion `loop(T: type, n: T)` has only numbers then, and is a musttail: 100M turns under
+  `--run` (no -O) give 100000001 (they overflowed C's stack, §51). Example run/generic_loop.
+- **`print(e)`**: an error's name (`nil`, `bad_input`, `panic.division`), or `error N` for one the
+  program cannot name: a compare per error it can (`sema_errors_list`, `write_error` in lower.c;
+  a statement expression in C); a module's error (`panic.index`) is its number in C too. The names
+  are in the binary only because the program prints an error (a check: error_sets' binary holds
+  none). Example run/print_errors.
+- **A struct value with its error:** `parse(...): point, error` returns the struct's slots then the
+  error (`lower_return`, `finish_call` and the boundary copy k slots; `p, e :=` binds a block);
+  at zero on an error or a panic. Example run/struct_errors.
+- **A fallible call at module level:** `a := parse("x")` is 7; one that gives an error stops the
+  compiler, "'b' cannot be computed by the compiler: gets an error from a call, and nothing here
+  handles it" (`error_up` with nowhere to go traps; mir_lower_expr starts with no error state of
+  the last function). errors/module_errors. (`a, e :=` at module level: not yet.)
+- **Captures, the three gaps of §60:** through any number of literals (`Check.lits`: every literal
+  between the read and the local's function captures it, and passes it to the inner one's calls);
+  a struct, by value (its slots, copied at each call); and a literal given to `function(...)`: the
+  specialization made for it takes the literal's captures as parameters of its own, under names of
+  its own (`sema_capture_name`, so none of its locals meets them), every call passes them, and it
+  passes them on, to `f` and to itself (`captures_passed` in lower.c, the same in C). Two
+  lifetime bugs found by it: a specialization made for a literal is checked before the body that
+  made the literal is released (`literal_specs_waiting`), and one made while a body is checked
+  again for the compiler is not queued for the backend (its literal is gone after). An array is
+  still not captured. Example run/captures; ASan clean.
+- **`macho.c`:** `LC_DYLD_INFO_ONLY` is 0x80000022 again (an edit had made it 0x80000023, which
+  stopped every Mach-O executable from loading: the x86-64 runs, `-o` binaries).
+
 ## Appendix A. The owner's original specification inputs
 
 These are the inputs the design started from, as the owner wrote them. Where the
