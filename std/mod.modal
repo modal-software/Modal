@@ -13,3 +13,5 @@ any := import("./any").any
 type := import("./type").type
 field := import("./type").field
 panic := import("./panic")
+map := import(array).map
+fold := import(array).fold
