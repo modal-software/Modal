@@ -1,0 +1,46 @@
+-- Pipe stages (std.md §14): `value.(...)`. A stage of arms tests the chain's head: every pattern
+-- stage of a chain is an arm of one match, so `n.(0..10: a).(_: b)` is `if n { 0..10: a, _: b }`.
+-- A stage is partial: what no arm takes goes on (as the value, or nothing for a statement). A
+-- stage without a pattern continues the arm opened last: a name alone is given the value
+-- (`x.(f)` is `f(x)`), anything else runs after it and its value goes on.
+print := import("std").io.print
+
+u64 double(u64 n) { return n * 2 }
+u64 seven() { return 7 }
+
+nil each(u64 n) {
+    n.(0..3: {
+        print(n)
+        each(n + 1)
+    }).(_: print("finished"))
+}
+
+[]u8 gap() {
+    return "inicio de main"
+}
+
+print(gap())
+
+main(): u8 {
+    u8 c = 50
+    word := 
+    c
+        .(48..57: "a digit", _: "not a digit")    -- a match as a stage
+    print(word)
+
+    print(u64(21).(double))                            -- f(x)
+    x := u64(5).(double).(double)                      -- a chain: 20
+    print("digito:", x)
+
+    print(x.(0..10: 1), x.(20: 1))                     -- partial: 20 goes on; 20 is taken
+    n := u64(4)
+
+    n
+      .(0..10: n + 1)
+      .(seven())
+      .(print)
+      .(_: print("big"))   -- 0..10: n + 1, then seven(), printed
+    u64(40).(0..10: print("small")).(_: print("big"))      -- the other arm of the same match
+    each(0)
+    return 0
+}

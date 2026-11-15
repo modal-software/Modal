@@ -1,0 +1,7 @@
+-- the order bodies are checked in: callees first, whatever order they are written in. add is
+-- written below main, and is still known to raise nothing when main is checked: f is always nil.
+main(): u8 {
+    b, f := add(1, 2)
+    return u8(b)
+}
+u64 add(u64 a, u64 b) { return a + b }

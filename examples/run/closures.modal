@@ -1,0 +1,55 @@
+-- Function literals (plan Phase D1): a literal reads the locals of the function around it (they
+-- are parameters of its own that every call passes, with the values they have then: no closure
+-- object; it is inlined like any small function). A literal's parameter can be a pattern alone,
+-- `(0..10) { ... }`: its type is the first call's, and a call it does not take does nothing.
+print := import("std").io.print
+nil each(u64 n, u64 limit) {
+    step := (k: u64): k * limit        -- one line: the result's type is the expression's
+    n
+     .(0..4: {
+        print(step(n))
+        each(n + 1, limit)
+     })
+     .(_: print("finished"))
+}
+u64 sum(u64 i, u64 acc, u64 w) {
+    weight := (x: u64): u64 { return x * w }
+    return if i { 0: acc, _: sum(i - 1, acc + weight(i), w) }
+}
+nil patterns() {
+    u64 limit = 7
+    small := (0..10) { print("small, limit", limit) }
+    small(u64(3))
+    small(u64(30))
+    u64 n = 4
+    n.(small)
+    pick := (0..9) {
+        print("one digit")
+    }
+    u64(12).(pick)
+    u64(5).(pick)
+}
+
+nil one_line() {
+    u64 base = 10
+    add := (x: u64): x + base
+    say := (x: u64): print("say", x)
+    big := (x: u64): x > 100
+    print(add(1), big(add(200)), big(3))
+    say(add(2))
+    print(u64(7).(add).(add))
+}
+
+main(): u8 {
+    u64 base = 10
+    add := (x: u64): u64 { return x + base }
+    print(add(1))
+    base = 20
+    print(add(1))
+    print(u64(5).(add))
+    each(0, 3)
+    print(sum(100000000, 0, 2))
+    patterns()
+    one_line()
+    return 0
+}

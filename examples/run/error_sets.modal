@@ -1,0 +1,51 @@
+-- Error sets (guards.md §5, step 6): what each function can give its caller is inferred: the
+-- errors it returns or lets go up, and the panics the compiler could not prove away (`--sig` lists
+-- them). `if e` on a call's error is checked against that set: every one listed, no `_` needed;
+-- one missing, and the message names it. A boundary on a call that can raise nothing is removed.
+print := import("std").io.print
+panic := import("std").panic
+bad_input: error
+too_big: error
+u64 half(u64 n) { return 100 / n }
+u64 add(u64 a, u64 b) { return a + b }
+parse([]u8 s): u64, error {
+    if s {
+        "": return bad_input
+        "big": return too_big
+        "0": return 0
+        _: return 1
+    }
+}
+serve([]u8 s): u64, error {
+    n := parse(s)
+    return half(n)
+}
+main(): u8 {
+    a, e := serve("x")
+    if e {
+        nil: print(a)
+        bad_input: print("bad")
+        too_big: print("big")
+        panic.division: print("div")
+    }
+    b, f := add(1, 2)           -- add can neither fail nor panic: no boundary (a warning says f is nil)
+    print(b)
+    c, g := serve("")
+    if g {
+        nil: print(c)
+        bad_input: print("bad")
+        _: print("other")
+    }
+    print(words("x"), words(""), words("big"), words("0"))
+    return 0
+}
+words([]u8 s): []u8 {
+    a, e := serve(s)
+    w := if e {
+        nil: "ok"
+        bad_input: "bad"
+        too_big: "big"
+        panic.division: "div"
+    }
+    return w
+}

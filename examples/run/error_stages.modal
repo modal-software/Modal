@@ -1,0 +1,37 @@
+-- Stages on a call that can fail (guards.md §5): a type as a pattern says which side an arm
+-- tests, `u64:` the value and `error:` any error; an error's name one error; a value pattern
+-- the value. What no arm takes goes on: a value as the stage's value, an error up (or to the
+-- `e` of `n, e :=`). A function named in an arm is given the value.
+print := import("std").io.print
+bad_input: error
+too_big: error
+parse([]u8 s): u64, error {
+    if s {
+        "": return bad_input
+        "big": return too_big
+        "zero": return 0
+        _: return 42
+    }
+}
+u64 double(u64 n) { return n * 2 }
+nil show(u64 n) { print("value", n) }
+safe([]u8 s): u64, error {
+    return parse(s).(bad_input: 1)           -- only bad_input becomes 1; too_big goes up
+}
+main(): u8 {
+    print(parse("x").(u64: double, error: 0))     -- 84
+    print(parse("").(u64: double, error: 0))      -- 0
+    print(parse("zero").(0: 7, error: 9))         -- 7
+    print(parse("x").(0: 7, error: 9))            -- 42 goes on
+    n, e := parse("big").(error: 5)
+    print(n)
+    e.(too_big: print("e is too_big"), nil: print("e nil"))
+    a, f := safe("")
+    print(a)
+    f.(nil: print("f nil"))
+    b, g := safe("big")
+    g.(too_big: print("g too_big"), nil: print("g nil"))
+    parse("").(bad_input: print("empty"), error: print("other"), u64: show)
+    parse("y").(bad_input: print("empty"), error: print("other"), u64: show)
+    return 0
+}

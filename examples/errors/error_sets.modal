@@ -1,0 +1,28 @@
+-- error sets: a match on a call's error must take every error of its set (or end with `_`)
+bad_input: error
+too_big: error
+u64 half(u64 n) { return 100 / n }
+parse([]u8 s): u64, error {
+    if s {
+        "": return bad_input
+        "big": return too_big
+        _: return 1
+    }
+}
+serve([]u8 s): u64, error {
+    n := parse(s)
+    return half(n)
+}
+gaps([]u8 s): []u8 {
+    a, e := serve(s)
+    w := if e {
+        nil: "ok"
+        bad_input: "bad"
+    }
+    return w
+}
+u64 add(u64 a, u64 b) { return a + b }
+main(): u8 {
+    b, f := add(1, 2)
+    return u8(b)
+}

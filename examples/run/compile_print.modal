@@ -1,0 +1,15 @@
+-- a module-level binding runs its call in the compiler: the build prints 11, and the program
+-- holds nothing of loop (--sig says it ran while compiling)
+print := import("std").io.print
+type := import("std").type
+
+loop(T: type, n: T) {
+    (_, 0..10): loop(u64, n + 1)
+    _: print(n)
+}
+
+a := loop(u64, 1)
+
+main(): u8 {
+    return 0
+}

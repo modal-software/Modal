@@ -1,0 +1,7 @@
+43
+empty
+too big, and the value is zero: 0
+checked 3
+run ok
+run failed
+./examples/run/errors.modal:52:8: panic.unhandled: the error in 'h' is not handled

@@ -1,0 +1,78 @@
+-- Panics (guards.md §5): bugs (a division by zero, an index past the end, an assert, an *any of
+-- another type, panic("why")) are errors with numbers of their own, std's panic.division and the
+-- rest. A call bound with its error, `n, e := f()`, is a boundary: a panic anywhere below comes back
+-- to it as e, the frames between are dropped, and nothing is printed. With no boundary above, a
+-- panic stops the program with its message, as before.
+print := import("std").io.print
+assert := import("std").assert
+panic := import("std").panic
+bad_input: error
+u64 half(u64 n): 100 / n;
+
+u8 at(u8 i) {
+    [4]u8 b
+    return b[i]
+}
+u64 checked(u64 n) {
+    assert(n < 10)
+    return n
+}
+u64 boom(u64 n) {
+    panic("boom")
+    return n
+}
+u64 deep(u64 n) {
+    (0): half(0)
+    _: deep(n - 1) + 1
+}
+u64 catches(u64 n) {
+    a, e := half(n)
+    return e.(nil: a, _: 999)
+}
+safe := catches(0)
+parse([]u8 s): u64, error {
+    if s {
+        "": return bad_input
+        _: return 1
+    }
+}
+nil report(error e) {
+    if e {
+        nil: print("ok")
+        bad_input: print("bad_input")
+        panic.division: print("panic.division")
+        panic.index: print("panic.index")
+        panic.assert: print("panic.assert")
+        panic.raised: print("panic.raised")
+        _: print("other")
+    }
+}
+main(): u8 {
+    -{
+    a, e1 := half(0)
+    report(e1)
+    b, e2 := at(9)
+    report(e2)
+    c, e3 := checked(50)
+    report(e3)
+    d, e4 := boom(1)
+    report(e4)
+    f, e5 := parse("")
+    report(e5)
+    g, e6 := half(5)
+    report(e6)
+    e6.(panic.division: print("no"), nil: print("pipe nil"))
+    }-
+    u64 keep = 7                -- a value the caller holds across a boundary comes back intact
+    h, e7 := deep(50)           -- a panic 50 calls down comes back to this call
+    print(h, keep)
+    report(e7)
+    print(safe)                 -- computed by the compiler, a panic caught there too
+    -{
+    j := u64(0)
+    x, e8 := half(j)
+    report(e8)
+    }-
+    print("not reached")
+    return 0
+}

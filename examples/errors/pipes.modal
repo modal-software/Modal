@@ -1,0 +1,7 @@
+-- pipe stages: each line of main below its first is an error
+print := import("std").io.print
+main(): u8 {
+    u8 c = 50
+    w := c.(48..57: "digit")
+    return 0
+}

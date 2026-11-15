@@ -1,0 +1,9 @@
+-- stages on a call that can fail: each line of main below its first is an error
+bad_input: error
+parse([]u8 s): u64, error { return 1 }
+main(): u8 {
+    a := parse("").(bad_input: 0)
+    b := parse("").(u8: 1, error: 0)
+    c := parse("").(error: "none")
+    return 0
+}
