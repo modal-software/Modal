@@ -1,0 +1,11 @@
+-- panics: bugs, each an error of a number of its own (guards.md §5). A panic stops the program,
+-- unless a call bound with its error, `n, e := f()`, is waiting above it: then the panic comes
+-- back there, as the error e. `panic("why")` raises one (panic.raised).
+--   e.(nil: ..., panic.division: ..., _: ...)
+division: error     -- a division by zero
+index: error        -- an index past the end
+assert: error       -- an assert that is false
+anytype: error      -- an *any that holds another type (T(a))
+unhandled: error    -- an error no line handled (`n, e := f()` with e never read)
+raised: error       -- panic("why")
+stack: error        -- (not raised yet: the stack guard)
