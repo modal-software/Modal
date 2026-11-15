@@ -217,7 +217,7 @@ static void keep_if_small(const MirFunc *f)
     for (size_t i = 0; i < f->n; i++)
     {
         uint8_t op = f->code[i].op;
-        if (op == MIR_CALL || op == MIR_ADDR || op == MIR_ZERO || (op == MIR_RET && f->code[f->n - 1].op != MIR_RET))
+        if (op == MIR_CALL || op == MIR_ADDR || op == MIR_ZERO || op == MIR_MOVE || (op == MIR_RET && f->code[f->n - 1].op != MIR_RET))
         {
             return; // (a return before the end, each arm's, becomes a jump to the end when spliced)
         }
@@ -317,17 +317,25 @@ static void mark_tail_calls(MirFunc *f)
     {
         MirInst in = f->code[i];
         f->code[to++] = in;
-        if (in.op != MIR_CALL || in.sub || !SYM(in.imm)->decl || i + 1 + f->ret_slots >= f->n)
+        if (in.op != MIR_CALL || in.sub || !SYM(in.imm)->decl || i + 1 >= f->n)
         {
             continue;
         }
-        uint32_t r = 0;
-        while (r < f->ret_slots && f->code[i + 1 + r].op == MIR_COPY && f->code[i + 1 + r].d == r &&
+        uint32_t r = 0, after = 0; // the result's slots, and the instructions that copy them
+        const MirInst *mv = &f->code[i + 1];
+        if (mv->op == MIR_MOVE && mv->d == 0 && mv->a == f->frame_size && mv->imm == f->ret_slots &&
+            i + 2 < f->n)
+        {
+            r = f->ret_slots; // a big result: one block copy
+            after = 1;
+        }
+        while (!after && r < f->ret_slots && i + 1 + r < f->n && f->code[i + 1 + r].op == MIR_COPY && f->code[i + 1 + r].d == r &&
                f->code[i + 1 + r].a == f->frame_size + r)
         {
             r++;
         }
-        if (r < f->ret_slots || !returns_at(f, i + 1 + r))
+        after = after ? 1 : r;
+        if (r < f->ret_slots || i + 1 + after >= f->n || !returns_at(f, i + 1 + after))
         {
             continue;
         }
@@ -335,13 +343,13 @@ static void mark_tail_calls(MirFunc *f)
         MirInst *t = &f->code[to - 1];
         t->sub = MIR_CALL_TAIL;
         t->b = params; // the slots to move from the window to the frame's start
-        if (f->code[i + 1 + r].op == MIR_RET)
+        if (f->code[i + 1 + after].op == MIR_RET)
         {
-            i += 1 + r; // the copies of the result and the return are the callee's now
+            i += 1 + after; // the copies of the result and the return are the callee's now
         }
         else
         {
-            i += r; // the copies are the callee's; the labels after stay (other paths reach them)
+            i += after; // the copies are the callee's; the labels after stay (other paths reach them)
         }
     }
     f->n = to;
@@ -352,6 +360,179 @@ static void mark_tail_calls(MirFunc *f)
 // parameters, and the code goes on at a label before the first instruction. No frame is made
 // again and nothing is saved again: in registers, a loop like any other (the native backends'
 // allocator sees the branch back). The new code is in the region of the function being lowered.
+static int inst_writes(const MirInst *in, MirSlot s);
+
+// Does `in` read slot s of its function? (Conservative: a block it covers counts.)
+static int slot_read(const MirFunc *f, const MirInst *in, MirSlot s)
+{
+    switch (in->op)
+    {
+    case MIR_BIN:
+    case MIR_STORE:
+        return in->a == s || in->b == s;
+    case MIR_COPY:
+    case MIR_BINI:
+    case MIR_NEG:
+    case MIR_NOT:
+    case MIR_NORM:
+    case MIR_LOAD:
+    case MIR_JZ:
+    case MIR_JNZ:
+    case MIR_GSTORE:
+    case MIR_TRAP:
+        return in->a == s;
+    case MIR_WRITE:
+        return in->sub != MW_SPACE && in->sub != MW_NL && in->a == s;
+    case MIR_ADDR:
+    case MIR_ZERO:
+    case MIR_MOVE:
+        return s >= in->a && s < in->a + in->imm;
+    case MIR_CALL:
+        return s >= f->frame_size;
+    case MIR_RET:
+        return s < f->ret_slots;
+    default:
+        return 0;
+    }
+}
+
+// A loop's parameter the body never reads (a type given while compiling, which the specialization
+// already knows; an argument passed on unchanged and never used): its next value is not moved in,
+// and what computed it for the window just before the jump goes too. (A clause with a next clause
+// reads every parameter on its miss path, so it keeps them all.)
+static void drop_unread_loop_params(MirFunc *f, MirInst *code, size_t n, uint32_t params, const uint8_t *unread)
+{
+    for (size_t i = 0; i < n; i++)
+    {
+        if (!(MIR_IS_TAIL(&code[i]) && code[i].imm == f->sym))
+        {
+            continue;
+        }
+        for (uint32_t j = 0; j < params; j++)
+        {
+            if (!unread[j])
+            {
+                continue;
+            }
+            MirSlot w = f->frame_size + j; // the window slot the call takes it from
+            for (size_t k = i; k-- > 0;)
+            {
+                const MirInst *in = &code[k];
+                if (in->op == MIR_LABEL || MIR_BRANCHES(in) || MIR_ENDS(in) || slot_read(f, in, w))
+                {
+                    break;
+                }
+                if (in->d == w && inst_writes(in, w))
+                {
+                    code[k].op = MIR__COUNT; // removed below
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// After drop_unread_loop_params: a value nothing reads any more (the constant a dropped window
+// slot was copied from) goes, and in turn what only it read. The function's frame slots only: the
+// window is read by calls, the result by the return, an addressed block through its address.
+static void drop_dead_values(MirFunc *f)
+{
+    uint32_t nslots = f->frame_size;
+    uint32_t *nreads = (uint32_t *)region_push(REGION_MIR, ((nslots + 1) * sizeof(uint32_t) + 7) & ~(size_t)7);
+    memset(nreads, 0, (nslots + 1) * sizeof(uint32_t));
+    for (size_t i = 0; i < f->n; i++)
+    {
+        const MirInst *in = &f->code[i];
+        if (in->op == MIR_ADDR || in->op == MIR_ZERO || in->op == MIR_MOVE)
+        {
+            for (uint64_t k = 0; k < in->imm && in->a + k < nslots; k++)
+            {
+                nreads[in->a + k] = UINT32_MAX / 2; // never dropped
+            }
+            continue;
+        }
+        MirSlot ops[2] = {in->a, in->b};
+        for (int o = 0; o < 2; o++)
+        {
+            if (ops[o] < nslots && (o == 0 || in->op == MIR_BIN || in->op == MIR_STORE) && slot_read(f, in, ops[o]))
+            {
+                nreads[ops[o]]++;
+            }
+        }
+    }
+    for (uint32_t s = 0; s < f->ret_slots && s < nslots; s++)
+    {
+        nreads[s] = UINT32_MAX / 2;
+    }
+    int changed = 1;
+    for (int pass = 0; changed && pass < 8; pass++)
+    {
+        changed = 0;
+        for (size_t i = f->n; i-- > 0;)
+        {
+            MirInst *in = &f->code[i];
+            if (in->op == MIR__COUNT || in->op == MIR_ADDR || in->d >= nslots || nreads[in->d] ||
+                !inst_writes(in, in->d) || (in->op == MIR_LOAD && in->sub == MIR_MEM_DEVICE))
+            {
+                continue;
+            }
+            MirSlot ops[2] = {in->a, in->b};
+            for (int o = 0; o < 2; o++)
+            {
+                if (ops[o] < nslots && (o == 0 || in->op == MIR_BIN) && slot_read(f, in, ops[o]) && nreads[ops[o]])
+                {
+                    nreads[ops[o]]--;
+                }
+            }
+            in->op = MIR__COUNT;
+            changed = 1;
+        }
+    }
+    size_t to = 0;
+    for (size_t i = 0; i < f->n; i++)
+    {
+        if (f->code[i].op != MIR__COUNT)
+        {
+            f->code[to++] = f->code[i];
+        }
+    }
+    f->n = to;
+}
+
+// Does the return at i read slot s as its result? Not when its block writes s first.
+static int ret_reads(const MirFunc *f, size_t i, MirSlot s)
+{
+    if (s >= f->ret_slots)
+    {
+        return 0;
+    }
+    for (size_t k = i; k-- > 0;)
+    {
+        const MirInst *in = &f->code[k];
+        if (in->op == MIR_LABEL && k > 0 && (MIR_ENDS(&f->code[k - 1]) || f->code[k - 1].op == MIR_JUMP))
+        {
+            int target = 0; // reached only by a branch to it: none, and the return is never run
+            for (size_t j = 0; j < f->n && !target; j++)
+            {
+                target = MIR_BRANCHES(&f->code[j]) && f->code[j].imm == in->imm;
+            }
+            if (!target)
+            {
+                return 0;
+            }
+        }
+        if (in->op == MIR_LABEL || MIR_BRANCHES(in) || MIR_ENDS(in) || slot_read(f, in, s))
+        {
+            return 1;
+        }
+        if (inst_writes(in, s))
+        {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static void self_loops(MirFunc *f)
 {
     size_t extra = 0;
@@ -366,6 +547,24 @@ static void self_loops(MirFunc *f)
     {
         return;
     }
+    uint32_t params = 0;
+    for (size_t i = 0; i < f->n; i++)
+    {
+        if (MIR_IS_TAIL(&f->code[i]) && f->code[i].imm == f->sym)
+        {
+            params = f->code[i].b;
+        }
+    }
+    uint8_t *unread = (uint8_t *)region_push(REGION_MIR, (params + 8) & ~(size_t)7); // (whole words: the region does not align)
+    memset(unread, 1, params);
+    for (size_t i = 0; i < f->n; i++)
+    {
+        for (uint32_t j = 0; j < params; j++)
+        {
+            unread[j] &= f->code[i].op == MIR_RET ? !ret_reads(f, i, j) : !slot_read(f, &f->code[i], j);
+        }
+    }
+    drop_unread_loop_params(f, f->code, f->n, params, unread);
     MirInst *code = (MirInst *)region_push(REGION_MIR, (f->n + extra) * sizeof(MirInst));
     uint32_t top = f->nlabels++;
     size_t n = 0;
@@ -373,19 +572,48 @@ static void self_loops(MirFunc *f)
     for (size_t i = 0; i < f->n; i++)
     {
         const MirInst *in = &f->code[i];
+        if (in->op == MIR__COUNT)
+        {
+            continue; // a value only an unread parameter took
+        }
         if (!(MIR_IS_TAIL(in) && in->imm == f->sym))
         {
             code[n++] = *in;
             continue;
         }
-        for (uint32_t j = 0; j < in->b; j++) // ascending: the window is above the parameters
+        uint32_t lo = 0, hi = in->b; // the parameters read again: from lo to hi
+        while (lo < hi && unread[lo])
         {
-            code[n++] = (MirInst){.op = MIR_COPY, .d = j, .a = f->frame_size + j};
+            lo++;
+        }
+        while (hi > lo && unread[hi - 1])
+        {
+            hi--;
+        }
+        if (hi - lo > MOVE_MIN) // a big struct parameter: one block copy (ascending, as below)
+        {
+            code[n++] = (MirInst){.op = MIR_MOVE, .d = lo, .a = f->frame_size + lo, .imm = hi - lo};
+        }
+        for (uint32_t j = lo; j < hi && hi - lo <= MOVE_MIN; j++) // ascending: the window is above the parameters
+        {
+            if (!unread[j])
+            {
+                code[n++] = (MirInst){.op = MIR_COPY, .d = j, .a = f->frame_size + j};
+            }
         }
         code[n++] = (MirInst){.op = MIR_JUMP, .imm = top};
     }
     f->code = code;
     f->n = f->cap = n;
+    int any = 0;
+    for (uint32_t j = 0; j < params; j++)
+    {
+        any |= unread[j];
+    }
+    if (any)
+    {
+        drop_dead_values(f);
+    }
 }
 
 // ---- pattern clauses as one function (the native backends) --------------------------------------
@@ -493,6 +721,7 @@ static void reframe_inst(MirInst *in, uint32_t from, uint32_t to)
     case MIR_NEG:
     case MIR_NOT:
     case MIR_NORM:
+    case MIR_MOVE:
         in->d = reframe(in->d, from, to);
         in->a = reframe(in->a, from, to);
         break;
@@ -2352,6 +2581,14 @@ static void copy_slots(MirSlot dst, MirSlot src, uint32_t k)
     {
         return;
     }
+    if (k > MOVE_MIN) // an array or a big struct: one block copy, not an instruction per slot
+    {
+        MirInst *m = inst(MIR_MOVE);
+        m->d = dst;
+        m->a = src;
+        m->imm = k;
+        return;
+    }
     for (uint32_t i = 0; i < k; i++)
     {
         uint32_t j = dst > src ? k - 1 - i : i;
@@ -2768,9 +3005,9 @@ static MirSlot finish_call(NodeId id, SymId fn, const Inlinable *inline_body, Mi
     {
         return temp();
     }
-    if (is_struct(sema_fn_ret(u, fn)))
+    if (is_struct(sema_fn_ret(u, fn)) || is_array(sema_fn_ret(u, fn)))
     {
-        return SLOT_WIN | 0; // a struct result: the caller copies its slots before any call
+        return SLOT_WIN | 0; // a struct or an array result: the caller copies its slots before any call
     }
     // The result is in the callee's slot 0. It is copied out at once: the next call reuses the
     // window. When this copy is the last instruction, its user can take the value straight.
@@ -3381,14 +3618,50 @@ static MirSlot array_addr(NodeId arr, uint32_t tok)
         a->imm = slots_of(u->types[arr]);
         return a->d;
     }
+    if (n->kind == AST_CALL && is_array(u->types[arr])) // `squares()[1]`: its result, kept in the frame
+    {
+        uint32_t k = slots_of(u->types[arr]);
+        MirSlot blk = SLOT_PERM | L.perm;
+        L.perm += k;
+        copy_slots(blk, lower_call(arr), k);
+        MirInst *a = inst(MIR_ADDR);
+        a->d = temp();
+        a->a = blk;
+        a->imm = k;
+        return a->d;
+    }
     unsupported(tok, "indexing an array that is not a local or a parameter");
     return temp();
 }
 
 // An array local from `src` (`c := a`, `b: [4]u8 = a`): its own copy, a slot at a time (array
 // storage is always whole slots).
+// An array local of this frame held in its own slots (not a reference): where they start.
+static int local_array_slots(NodeId arr, MirSlot *base)
+{
+    const AstNode *n = NODE(L.u, arr);
+    if (n->kind == AST_PAREN_GROUP)
+    {
+        return local_array_slots(n->a, base);
+    }
+    int ref;
+    return n->kind == AST_IDENT && is_array(L.u->types[arr]) && !L.u->refs[arr] &&
+           find_local_ref(token_name(TOK(L.u, n->tok)), base, &ref) && !ref;
+}
+
 static void copy_array_into(NodeId src, MirSlot block, uint32_t k)
 {
+    if (NODE(L.u, src)->kind == AST_CALL && sema_primitive(L.u, src) == PRIM_NONE) // an array a call returns
+    {
+        copy_slots(block, lower_call(src), k); // its slots, in the window: taken at once
+        return;
+    }
+    MirSlot local;
+    if (local_array_slots(src, &local)) // a local's slots: copied as slots (one MIR_MOVE when many)
+    {
+        copy_slots(block, local, k);
+        return;
+    }
     MirSlot from = array_addr(src, NODE(L.u, src)->tok);
     for (uint32_t j = 0; j < k; j++)
     {
@@ -3714,6 +3987,11 @@ static MirSlot lower_field_base(NodeId base, uint32_t tok, int *ok)
     return temp();
 }
 
+static int text_is_len(const Token *t)
+{
+    return t->len == 3 && memcmp(TSTART(t), "len", 3) == 0;
+}
+
 static MirSlot lower_expr(NodeId id)
 {
     Unit *u = L.u;
@@ -3961,6 +4239,16 @@ static MirSlot lower_expr(NodeId id)
         return lower_binop(id);
     case AST_SELECTOR:
     {
+        if (u->types[n->a] == T_STR && text_is_len(TOK(u, n->tok))) // `s.len`: its length word
+        {
+            MirSlot sp = lower_expr(n->a);
+            MirInst *ld = inst(MIR_LOAD);
+            ld->var = MV_U64;
+            ld->d = temp();
+            ld->a = sp;
+            ld->imm = 0;
+            return ld->d;
+        }
         SymId member = u->refs[id];
         int ok;
         NodeId sinit;
@@ -4308,6 +4596,27 @@ static void lower_return(NodeId value)
     if (value && is_struct(L.ret))
     {
         lower_struct_into(value, 0);
+    }
+    else if (value && is_array(L.ret))
+    {
+        // an array result: its slots from slot 0 (a block of its own first: the value may read
+        // the parameters the result goes over)
+        uint32_t k = slots_of(L.ret);
+        MirSlot local;
+        if (local_array_slots(value, &local)) // `return out`: its slots, straight (a move may overlap)
+        {
+            copy_slots(0, local, k);
+        }
+        else if (NODE(L.u, value)->kind == AST_CALL && sema_primitive(L.u, value) == PRIM_NONE)
+        {
+            copy_slots(0, lower_call(value), k); // `return g()`: the window, above the frame (a tail call)
+        }
+        else
+        {
+            MirSlot tmp = temp_n(k);
+            copy_array_into(value, tmp, k);
+            copy_slots(0, tmp, k);
+        }
     }
     else if (value)
     {
@@ -4904,7 +5213,7 @@ static int match_tree(const AstNode *m, int ns, TypeId t, uint32_t miss, uint32_
     }
     uint32_t rest = any >= 0 ? entry[any] : miss;
     uint64_t umax = width == 64 ? ~0ull : (1ull << width) - 1;
-    int64_t min = is_signed ? -(int64_t)(1ull << (width - 1)) : (int64_t)(0 ^ bias);
+    int64_t min = is_signed ? (int64_t)(0ull - (1ull << (width - 1))) : (int64_t)(0 ^ bias); // (not -x: INT64_MIN)
     int64_t max = is_signed ? (int64_t)((1ull << (width - 1)) - 1) : (int64_t)(umax ^ bias);
     Segment seg[2 * TREE_MAX + 1];
     int ns2 = 0, done = 0;
@@ -5157,6 +5466,15 @@ static MirSlot lower_match_as(NodeId id, TypeId want, int returned)
             {
                 miss_unless_equal(subj[k], name, types[k], next);
             }
+            else if ((name = sema_arm_cond(u, pat))) // a condition: to the next arm when false
+            {
+                MirSlot top = L.top;
+                MirSlot cond = lower_as(name, T_BOOL); // (its code first, then the branch on it)
+                MirInst *j = inst(MIR_JZ);
+                j->a = cond;
+                j->imm = next;
+                L.top = top;
+            }
         }
         NodeId res = a->b;
         int kind = NODE(u, res)->kind;
@@ -5232,7 +5550,7 @@ int mir_lower(Unit *u, SymId fn, MirFunc *out)
     L.ret = sema_fn_ret(u, fn);
     L.has_self = SYM(fn)->owner != 0;
     L.fails = sema_fn_fails(fn);
-    L.struct_abi = is_struct(L.ret) || L.fails; // (a result with its error: never inlined, for now)
+    L.struct_abi = is_struct(L.ret) || is_array(L.ret) || L.fails; // (a result with its error: never inlined, for now)
     L.loops = (SYM(fn)->flags & SYM_F_LOOPS) != 0; // it calls itself (the checker saw it)
     L.for_compiler = 0;
     L.handled_call = 0;
@@ -5498,7 +5816,7 @@ uint32_t mir_param_slots(SymId fn)
     for (NodeId p = sema_fn_params(u, fn); p; p = NEXT(u, p))
     {
         TypeId pt = sema_param_type(u, fn, p);
-        k += type_kind(pt) == T_FUNC ? 0 : slots_of(pt); // a function given while compiling: no slot
+        k += type_kind(pt) == T_FUNC ? 0 : param_slots(pt); // a function given while compiling: no slot; an array: its address
     }
     return k;
 }
@@ -5568,7 +5886,7 @@ void mir_print(const MirFunc *f, FILE *out)
     static const char *const ops[MIR__COUNT] = {
         "const", "copy", "addr", "zero", "load", "store", "bin", "bini", "neg",
         "not",   "norm", "label", "jz",  "jnz",  "call",  "ret", "str",  "write", "gload", "gstore",
-        "trap",  "jump", "gaddr", "desc",
+        "trap",  "jump", "gaddr", "desc", "move",
     };
     static const char *const bins[MB__COUNT] = {"add", "sub", "mul", "div", "eq",
                                                 "ne",  "lt",  "le",  "gt",  "ge"};

@@ -24,6 +24,7 @@ typedef struct Parser
     const Token *cond_open; // the `(` that starts an `if`'s value: a grouping, never a function literal
     int if_then;            // > 0 while parsing an `if`'s branch: an `else` after arms is that if's
     int no_literal;         // parsing an `if`'s values: `name {` there is the value then its block
+    int untyped_params;     // a literal's parameters: one with no type is typed by the callee (§61)
 } Parser;
 
 // A list being parsed. Its elements wait on a stage (nested lists stack on it) and are laid out
@@ -99,5 +100,6 @@ NodeId parse_if(Parser *p, int value);             // `if cond branch [else bran
 
 // parse_expr.c
 NodeId parse_expression(Parser *p);
+NodeId parse_condition(Parser *p); // an arm's condition pattern: up to its ':'
 
 #endif // MODAL_V2_PARSER_H

@@ -26,9 +26,11 @@ int type_starts_at(const Token *t)
     case TOK_STAR:
     case TOK_STRUCT:
         return 1;
-    case TOK_LBRACKET: // `[]T`, or `[N]T` with N a number or a constant's name
+    case TOK_LBRACKET: // `[]T`, `[N]T` with N a number or a constant's name, or `[xs.len]T`
         return t[1].kind == TOK_RBRACKET ||
-               ((t[1].kind == TOK_NUMBER || t[1].kind == TOK_IDENTIFIER) && t[2].kind == TOK_RBRACKET);
+               ((t[1].kind == TOK_NUMBER || t[1].kind == TOK_IDENTIFIER) && t[2].kind == TOK_RBRACKET) ||
+               (t[1].kind == TOK_IDENTIFIER && t[2].kind == TOK_DOT && t[3].kind == TOK_IDENTIFIER &&
+                t[4].kind == TOK_RBRACKET);
     default:
         return 0;
     }
@@ -343,7 +345,7 @@ NodeId parse_params(Parser *p, int *has_self)
         list_abort(&params);
         return 0;
     }
-    if (pending >= 0)
+    if (pending >= 0 && !p->untyped_params)
     {
         const Token *name = TOK(u, list_at(&params, (uint32_t)pending)->tok);
         parser_error_at(p, name, "parameter '%.*s' needs a type", name->len, TSTART(name));
@@ -630,6 +632,11 @@ int local_decl_at(const Token *t)
         {
             k += 3;
         }
+        else if (k->kind == TOK_LBRACKET && k[1].kind == TOK_IDENTIFIER && k[2].kind == TOK_DOT &&
+                 k[3].kind == TOK_IDENTIFIER && k[4].kind == TOK_RBRACKET) // [xs.len]T
+        {
+            k += 5;
+        }
         else
         {
             break;
@@ -889,6 +896,28 @@ int parse_declaration(Parser *p, DeclContext ctx, NodeList *into)
         return 0;
     }
     node_list_push(p->unit, into, decl);
+    // `u64 a, b, c`: type first, grouped. A bare name after a comma takes the same type (one
+    // type node, as `a, b: T` shares); a name followed by ':' or '(' starts a member of its own.
+    const AstNode *d = NODE(p->unit, decl);
+    if (d->kind == AST_FIELD_DECL && (d->flags & AST_F_MUT) && !d->b)
+    {
+        NodeId type = d->a;
+        while (p->current->kind == TOK_COMMA && p->current[1].kind == TOK_IDENTIFIER)
+        {
+            const Token *after = &p->current[2];
+            if (!(after->nl || after->kind == TOK_COMMA || after->kind == TOK_RBRACE ||
+                  after->kind == TOK_SEMICOLON || after->kind == TOK_EOF))
+            {
+                break;
+            }
+            parser_advance(p); // ','
+            const Token *name = p->current;
+            parser_advance(p);
+            NodeId field = node_new(p->unit, AST_FIELD_DECL, tok_idx(p, name), type, 0);
+            NODE(p->unit, field)->flags |= AST_F_MUT;
+            node_list_push(p->unit, into, field);
+        }
+    }
     return 1;
 }
 

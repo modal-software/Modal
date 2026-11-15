@@ -274,6 +274,11 @@ int regalloc(const MirFunc *f, int preserved, int scratch, const uint8_t *clobbe
         {
             top = in->a + (uint32_t)in->imm > top ? in->a + (uint32_t)in->imm - 1 : top;
         }
+        if (in->op == MIR_MOVE)
+        {
+            uint32_t hi = (in->d > in->a ? in->d : in->a) + (uint32_t)in->imm - 1;
+            top = hi > top ? hi : top;
+        }
         nslots = top + 1 > nslots ? top + 1 : nslots;
         calls |= in->op == MIR_CALL;
     }
@@ -294,6 +299,14 @@ int regalloc(const MirFunc *f, int preserved, int scratch, const uint8_t *clobbe
             for (uint64_t k = 0; k < in->imm && in->a + k < nslots; k++)
             {
                 ok[in->a + k] = 0;
+            }
+        }
+        if (in->op == MIR_MOVE) // both blocks stay in the frame: the stencil copies them there
+        {
+            for (uint64_t k = 0; k < in->imm; k++)
+            {
+                ok[in->a + k < nslots ? in->a + k : nslots] = 0;
+                ok[in->d + k < nslots ? in->d + k : nslots] = 0;
             }
         }
     }

@@ -100,6 +100,7 @@ struct Unit
     uint8_t provided;    // made by the compiler, not read from disk: import("target")
     uint8_t bound;       // the domain's mod.modal binds this module: it is part of the face
     uint8_t broken;      // did not scan, parse or declare cleanly: later phases skip it
+    uint8_t valued;      // its module-level values were computed (comptime_unit)
     uint8_t cached;      // --cache: its bodies were checked in an earlier run; skipped now
     uint64_t src_hash;   // --cache: the whole file
     uint64_t decl_hash;  // --cache: its declarations only, bodies left out: what others see
@@ -481,6 +482,8 @@ int sema_sizeof(const Unit *u, NodeId call, uint64_t *out);
 // 64 bits, and whether it is negative. 0 if id names no such constant.
 int sema_unsized_value(const Unit *u, NodeId id, uint64_t *bits, int *negative);
 void sema_check(Unit *u);
+void sema_check_decls(Unit *u);  // its declarations (every file's first, context.md §63)
+void sema_check_bodies(Unit *u); // its module-level values, then its bodies, callees first
 void sema_kinds_reset(void); // a fresh compilation: no function facts yet
 // Compile time (sema/comptime.c, docs/comptime.md step 1): module-level initializers the compiler
 // runs. comptime_unit evaluates those of u (after its declarations, before its bodies).
@@ -534,6 +537,7 @@ int sema_pattern_of(Unit *u, NodeId param, SymId owner, Pattern *out, int loud);
 int sema_params_overlap(Unit *u, NodeId a, NodeId b, SymId owner);
 int sema_arm_pattern(Unit *u, NodeId pat, TypeId type, Pattern *out); // an arm's (0: `_`, a run-time name)
 NodeId sema_arm_name(Unit *u, NodeId pat, TypeId type); // a run-time name pattern: its AST_IDENT (else 0)
+NodeId sema_arm_cond(Unit *u, NodeId pat);              // a condition pattern (`k > a.len:`): its expression (else 0)
 // AST_MATCH aux: MATCH_LAST_FREE: the arms above cover every value but the last arm's, so the
 // last needs no test (the compiler proved it).
 #define MATCH_LAST_FREE 1

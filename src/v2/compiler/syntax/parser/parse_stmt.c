@@ -169,6 +169,58 @@ static int pattern_len(const Token *t)
     return k;
 }
 
+// A condition as a pattern (`k > a.len: ...`, `(a > b): ...`): the tokens from t up to a ',', ')'
+// or ':' outside brackets, on one line, with a comparison (or `and` / `or`) outside brackets.
+// Its length in tokens, or 0.
+static int cond_len(const Token *t)
+{
+    int depth = 0, compares = 0;
+    for (int k = 0;; k++)
+    {
+        const Token *x = t + k;
+        if (x->kind == TOK_EOF || (k > 0 && x->nl && depth == 0))
+        {
+            return 0;
+        }
+        if (depth == 0 && (x->kind == TOK_COLON || x->kind == TOK_COMMA || x->kind == TOK_RPAREN))
+        {
+            return compares && k > 0 ? k : 0;
+        }
+        switch (x->kind)
+        {
+        case TOK_LPAREN:
+        case TOK_LBRACKET:
+            depth++;
+            break;
+        case TOK_RPAREN:
+        case TOK_RBRACKET:
+            depth--;
+            break;
+        case TOK_LBRACE:
+        case TOK_RBRACE:
+        case TOK_EQ:
+        case TOK_DEFINE:
+        case TOK_RETURN:
+        case TOK_IF:
+        case TOK_ELSE:
+        case TOK_SEMICOLON:
+            return 0; // a statement, not a condition
+        case TOK_CMP:
+        case TOK_NEQ:
+        case TOK_LT:
+        case TOK_GT:
+        case TOK_LE:
+        case TOK_GE:
+        case TOK_AND:
+        case TOK_OR:
+            compares |= depth == 0;
+            break;
+        default:
+            break;
+        }
+    }
+}
+
 int arm_at(const Token *t)
 {
     if (t->kind == TOK_LPAREN) // (p, p, ...):
@@ -176,10 +228,11 @@ int arm_at(const Token *t)
         const Token *k = t + 1;
         for (;;)
         {
-            int n = pattern_len(k);
+            int n = cond_len(k); // (before a name: `k > 3` starts like the pattern `k`)
+            n = n ? n : pattern_len(k);
             if (!n)
             {
-                return 0;
+                break;
             }
             k += n;
             if (k->kind == TOK_COMMA)
@@ -187,8 +240,17 @@ int arm_at(const Token *t)
                 k++;
                 continue;
             }
-            return k->kind == TOK_RPAREN && k[1].kind == TOK_COLON;
+            if (k->kind == TOK_RPAREN && k[1].kind == TOK_COLON)
+            {
+                return 1;
+            }
+            break;
         }
+    }
+    int c = cond_len(t); // `(a + b) > c: ...`: a condition that starts with a group
+    if (c && t[c].kind == TOK_COLON)
+    {
+        return 1;
     }
     int n = pattern_len(t);
     return n && t[n].kind == TOK_COLON && !(is_name_token(t) && declaration_shape(t));
@@ -198,6 +260,19 @@ static NodeId parse_pattern(Parser *p)
 {
     Unit *u = p->unit;
     const Token *t = p->current;
+    if (cond_len(t)) // a condition: the arm is taken when it is true (`k > a.len: "error"`)
+    {
+        p->paren_depth++; // (one line or not, it ends at the ':')
+        NodeId e = parse_condition(p);
+        p->paren_depth--;
+        if (!e)
+        {
+            return 0;
+        }
+        NodeId n = node_new(u, AST_PATTERN, tok_idx(p, t), e, 0);
+        NODE(u, n)->aux = PAT_COND;
+        return n;
+    }
     if (is_any_token(t))
     {
         parser_advance(p);
@@ -333,7 +408,8 @@ static NodeId parse_arm(Parser *p)
     Unit *u = p->unit;
     const Token *first = p->current;
     NodeList pats = list_begin();
-    int grouped = parser_match(p, TOK_LPAREN);
+    int whole = cond_len(first); // `(a + b) > c: ...`: one condition, not a group of patterns
+    int grouped = !(whole && first[whole].kind == TOK_COLON) && parser_match(p, TOK_LPAREN);
     for (;;)
     {
         NodeId pat = parse_pattern(p);

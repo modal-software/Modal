@@ -1,0 +1,17 @@
+-- Grouped members, type first (context.md §66): `u64 x, y, z` gives each name the type; a name
+-- with ':' starts a member of its own (`u8 tag, b: u16`: tag is a mutable u8, b an immutable u16).
+print := import("std").io.print
+u64 total, count
+p: struct {
+    u64 x, y, z
+    u8 tag, b: u16
+    w: u32
+}
+main(): u8 {
+    q := p{ x: 1, y: 2, z: 3, tag: 4, b: 5, w: 6 }
+    q.y = 20
+    total = q.x + q.y
+    count = 2
+    print(q.x, q.y, q.z, q.tag, q.b, q.w, total, count)
+    return 0
+}

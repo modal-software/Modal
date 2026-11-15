@@ -67,6 +67,12 @@ static NodeId parse_precedence(Parser *p, int prec)
     return left;
 }
 
+// An arm's condition (`k > a.len: ...`): an expression up to the ':' (which may open a block).
+NodeId parse_condition(Parser *p)
+{
+    return parse_precedence(p, PREC_NONE);
+}
+
 NodeId parse_expression(Parser *p)
 {
     NodeId e = parse_precedence(p, PREC_NONE);
@@ -217,7 +223,9 @@ static NodeId parse_fn_literal(Parser *p)
     const Token *open = p->current;
     int has_self = 0, deferred = 0;
     NodeId ret = 0;
+    p->untyped_params++; // `(best, p): ...`: the callee's `function(...)` types them (else the checker says so)
     NodeId params = parse_params(p, &has_self);
+    p->untyped_params--;
     if (p->panic)
     {
         return 0;

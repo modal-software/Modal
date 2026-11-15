@@ -15,6 +15,12 @@ type: struct {
     members: *member, -- the fields, in declaration order (fields of them)
 }
 
+-- T: a type the arguments give (context.md §67). A parameter typed by it, `a: T` or `xs: []T`,
+-- makes the function generic with no `T: type` parameter: each call reads T from the argument
+-- in that place, and the function is made once per type. `T: type` as a parameter stays for a
+-- type no argument has (`zero(T: type): T`, called `zero(u64)`).
+T: type
+
 -- one field of a struct
 member: struct {
     offset: u64,  -- bytes from the start of the struct

@@ -4,7 +4,11 @@ print := import("std").io.print
 type := import("std").type
 map := import("std").map
 fold := import("std").fold
-big: struct { u64 a, u64 b, u64 c, u64 d, u64 e, u64 f, u64 g, u64 h, u64 i, u64 j, u64 k, u64 l, u64 m, u64 n, u64 o, u64 p, u64 q, u64 r, u64 s, u64 t }
+
+big: struct { 
+    u64 a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t
+}
+
 make(u64 v): [20]u64 {
     [20]u64 out
     out[0] = v

@@ -104,7 +104,8 @@ static void cache_fit(void)
 //     a field is reached no other way
 //   - a write is `.x = v`, or `x: v` / `x` in a literal `T{ ... }`; a constant when v is one
 //     number or bool alone
-//   - `T.m(...)` makes a T at zero; `sizeof(T)` and the other queries look at T's layout
+//   - `T.m(...)` makes a T at zero, as `T x` and `[N]T x` do; `sizeof(T)` and the other queries look
+//     at T's layout
 // A field nobody reads is left out of the layout. A field every write gives the same constant
 // (0 also when a T is made at zero) is that constant. Neither for a register block, a struct a
 // type query looks at, or when a domain has implicit self.
@@ -253,6 +254,14 @@ static void scan_facts(const Token *t, size_t n)
                 fact_fit(t[i - 1].match);
                 F.bits[t[i - 1].match] |= FN_ZEROED;
             }
+        }
+        else if (k->kind == TOK_IDENTIFIER && t[i + 1].kind == TOK_IDENTIFIER && !t[i + 1].nl &&
+                 (k->nl || (i > 0 && t[i - 1].kind == TOK_RBRACKET)))
+        {
+            // `person p` (a local, first on its line), `[3]person ps`: a T (or N of them) made at
+            // zero (a reference, `*item it`, makes none)
+            fact_fit(k->match);
+            F.bits[k->match] |= FN_ZEROED;
         }
         else if (k->kind == TOK_IDENTIFIER && t[i + 1].kind == TOK_LBRACE && t[i + 1].off == k->off + k->len &&
                  t[i + 1].match > i + 1) // `T{ ... }`, the brace right after the name: a literal

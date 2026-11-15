@@ -103,9 +103,13 @@ enum
     PAT_ANY = 1u << 5,    // `_`: every value (in an arm)
     PAT_NAME = 1u << 6,   // an existing name (a = its AST_IDENT): equal to its value (in an arm)
     PAT_ENDS = 1u << 7,   // a range with a name at an end (with PAT_RANGE): a = low end, b = high (0: open)
+    PAT_COND = 1u << 8,   // a condition (a = a bool expression, `k > a.len`): the arm is taken when it is true
 };
 
 #define IDENT_NONZERO 1
+// An AST_IDENT naming an immutable parameter of its function (not a local that hides it): its
+// value is the caller's, so an array or a reference in it points outside this frame.
+#define IDENT_PARAM 2
 // An AST_INDEX whose index the checker proved in range (an arm took it): no bounds check.
 #define INDEX_SAFE 1
 

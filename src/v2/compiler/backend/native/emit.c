@@ -339,6 +339,8 @@ static const int st_write[] = {
     [MW_BYTE] = ST_write_byte,
 };
 
+static void a64_imm(int d, uint64_t v);
+
 // A string: its length and bytes are placed in the code, right after the instructions that
 // store their address in slot d; the code jumps over them. No absolute address is written.
 static void emit_string(uint32_t d, const MirString *str)
@@ -349,10 +351,11 @@ static void emit_string(uint32_t d, const MirString *str)
     {
         if (d >= 4096)
         {
-            fatal("a frame is too large");
+            a64_imm(16, (uint64_t)d * 8); // the slot's byte offset, out of reach of `str`'s
         }
-        put32(0x10000000u | (3u << 5) | 9u);               // adr x9, .+12 (immhi:immlo = 3:0)
-        put32(0xf9000000u | (d << 10) | (0u << 5) | 9u);   // str x9, [x0, #d*8]
+        put32(0x10000000u | (3u << 5) | 9u); // adr x9, .+12 (immhi:immlo = 3:0)
+        put32(d < 4096 ? 0xf9000000u | (d << 10) | 9u // str x9, [x0, #d*8]
+                       : 0xf8306809u);                // str x9, [x0, x16]
         put32(0x14000000u | (uint32_t)((4 + padded) / 4)); // b over the data
     }
     else
@@ -742,6 +745,8 @@ static int reads(const MirInst *in, MirSlot s, uint32_t frame_size)
         return s < ret_slots; // the result
     case MIR_ADDR:
         return s >= in->a && s < in->a + in->imm; // its address escapes
+    case MIR_MOVE:
+        return s >= in->a && s < in->a + in->imm;
     default:
         return 0;
     }
@@ -953,6 +958,8 @@ static int clobbers(const MirInst *in)
         return 1;
     case MIR_ZERO:
         return in->imm > 16;
+    case MIR_MOVE:
+        return 1;
     case MIR_BIN:
     case MIR_BINI:
     { // (a division by a constant is a multiplication, in place)
@@ -1025,14 +1032,31 @@ static void a64_imm(int d, uint64_t v)
     }
 }
 
+// A slot past 4095 is out of reach of the scaled offset: its byte offset goes in x16 (x17 when
+// the value is x16) and the access takes a register offset.
 static void a64_ldr_slot(int t, MirSlot s)
 {
-    put32(0xf9400000u | H(s) << 10 | (uint32_t)t); // ldr xt, [x0, #s*8]
+    uint32_t h = H(s);
+    if (h < 4096)
+    {
+        put32(0xf9400000u | h << 10 | (uint32_t)t); // ldr xt, [x0, #s*8]
+        return;
+    }
+    a64_imm(t, (uint64_t)h * 8);
+    put32(0xf8606800u | (uint32_t)t << 16 | (uint32_t)t); // ldr xt, [x0, xt]
 }
 
 static void a64_str_slot(int t, MirSlot s)
 {
-    put32(0xf9000000u | H(s) << 10 | (uint32_t)t); // str xt, [x0, #s*8]
+    uint32_t h = H(s);
+    if (h < 4096)
+    {
+        put32(0xf9000000u | h << 10 | (uint32_t)t); // str xt, [x0, #s*8]
+        return;
+    }
+    int m = t == 16 ? 17 : 16;
+    a64_imm(m, (uint64_t)h * 8);
+    put32(0xf8206800u | (uint32_t)m << 16 | (uint32_t)t); // str xt, [x0, xm]
 }
 
 // The register holding slot s: its own, or `scratch` loaded from the frame.
@@ -2087,7 +2111,7 @@ static void plan_homes(const MirFunc *f)
     for (size_t k = 0; k < f->n && nat.arch->cpu == CPU_X86_64; k++)
     {
         const MirInst *in = &ra.code[k];
-        if (clobbers(in) && in->op != MIR_CALL && in->op != MIR_WRITE && in->op != MIR_ZERO)
+        if (clobbers(in) && in->op != MIR_CALL && in->op != MIR_WRITE && in->op != MIR_ZERO && in->op != MIR_MOVE)
         {
             MirSlot s[3] = {in->d, in->a, in->b};
             for (int i = 0; i < 3; i++)
@@ -2227,6 +2251,9 @@ static void emit_regs(const MirFunc *f)
                 x_op(1, 0, "\x8d", 1, t, XDI, 1, (int32_t)(H(in->a) * 8), 0); // lea t, [rdi + a*8]
                 x_store(t, in->d);
             }
+            break;
+        case MIR_MOVE:
+            emit(H(in->d) > H(in->a) ? ST_move_down : ST_move, H(in->d), H(in->a), in->imm, 0, 0);
             break;
         case MIR_ZERO:
             if (in->imm > 16)
@@ -2569,6 +2596,9 @@ static void emit_stencils(const MirFunc *f)
         case MIR_ZERO:
             emit(ST_zero, in->a, in->imm, 0, 0, 0);
             break;
+        case MIR_MOVE:
+            emit(in->d > in->a ? ST_move_down : ST_move, in->d, in->a, in->imm, 0, 0);
+            break;
         case MIR_LOAD:
             emit(st_load[in->var] + v, in->d, in->a, in->imm, 0, 0);
             break;
@@ -2768,6 +2798,11 @@ static void emit_mir(const MirFunc *f)
         if (in->op == MIR_ZERO || in->op == MIR_ADDR)
         {
             top = in->a + (uint32_t)in->imm > top ? in->a + (uint32_t)in->imm - 1 : top;
+        }
+        if (in->op == MIR_MOVE)
+        {
+            uint32_t hi = (in->d > in->a ? in->d : in->a) + (uint32_t)in->imm - 1;
+            top = hi > top ? hi : top;
         }
         uses = top + 1 > uses ? top + 1 : uses;
     }

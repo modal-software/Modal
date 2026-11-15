@@ -78,7 +78,7 @@ void codegen_start(const struct Backend *backend, void *out_file, const char *pa
 // Code is generated for the entry file, which is always the first unit.
 void codegen_begin(Unit *u)
 {
-    if (codegen.backend && u->id == 0)
+    if (codegen.backend && u->id == 0 && !codegen.begun)
     {
         uint64_t t = cx.timing ? clock_ns() : 0;
         codegen.job.entry = u;

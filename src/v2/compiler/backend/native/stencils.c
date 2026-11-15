@@ -389,6 +389,26 @@ STENCIL(zero) // B slots from A set to 0
     NEXT;
 }
 
+STENCIL(move) // C slots from B to A, from the first (MIR_MOVE where A is below B, or apart)
+{
+    for (u64 i = 0; i < C; i++)
+    {
+        f[A + i] = f[B + i];
+    }
+    NEXT;
+}
+
+STENCIL(move_down) // C slots from B to A, from the last (MIR_MOVE onto an overlap above B)
+{
+    u64 n = C;
+    __asm__("" : "+r"(n)); // a number at run time: no address made of two holes (x86-64)
+    while (n-- > 0)
+    {
+        f[A + n] = f[B + n];
+    }
+    NEXT;
+}
+
 // ---- arithmetic, one variant per type ---------------------------------------------------------
 //
 // A slot holds a value zero-extended (unsigned types) or sign-extended (signed types) to 64

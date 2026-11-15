@@ -37,6 +37,10 @@ typedef struct
     char *mem;
     size_t mem_len, mem_cap;
     NodeId handled; // `n, e := f()`: the call whose result the binding unpacks
+    int tail;       // the statement being written is a void function's last act (a call there: M_TAIL)
+    // An array result is written in the caller's place: the function takes it as `m_ret` (sret).
+    const char *dest; // emit_call: that place for the call being written, or NULL: a temporary
+    NameId result;    // the local the function returns, which lives in m_ret itself (0: none)
     int piece_open; // a piece is being written: started at piece_at
     size_t piece_at;
     char piece_name[96];
@@ -274,6 +278,60 @@ static void emit_res_type(Emit *e, TypeId t)
     }
     PUT(e, "uint64_t e; } ");
     out_res_name(e, t);
+    PUT(e, ";\n");
+}
+
+// C returns no array: a function whose result is `[N]T` returns `m_arr_N { T a[N]; }` (N: the type).
+static int is_array_type(TypeId t)
+{
+    return type_kind(t) == T_ARRAY;
+}
+
+// Is fn's result an array written in the caller's place? (Its C result is void; `m_ret` first.)
+static int returns_array(SymId fn)
+{
+    return fn && !sema_fn_fails(fn) && is_array_type(sema_fn_ret(&cx.units[SYM(fn)->unit], fn));
+}
+
+static uint8_t *arr_emitted;
+static size_t arr_cap;
+
+static void out_arr_name(Emit *e, TypeId t)
+{
+    char name[32];
+    snprintf(name, sizeof(name), "m_arr_%u", (unsigned)t);
+    put(e, name);
+}
+
+static void emit_arr_type(Emit *e, TypeId t)
+{
+    if (t >= arr_cap)
+    {
+        size_t cap = arr_cap ? arr_cap : 64;
+        while (cap <= t)
+        {
+            cap *= 2;
+        }
+        uint8_t *grown = calloc(cap, 1);
+        if (arr_emitted)
+        {
+            memcpy(grown, arr_emitted, arr_cap);
+            free(arr_emitted);
+        }
+        arr_emitted = grown;
+        arr_cap = cap;
+    }
+    if (arr_emitted[t])
+    {
+        return;
+    }
+    arr_emitted[t] = 1;
+    char len[32];
+    PUT(e, "typedef struct { ");
+    out_type(e, type_ref(t), 0);
+    snprintf(len, sizeof(len), " a[%u]; } ", type_len(t));
+    put(e, len);
+    out_arr_name(e, t);
     PUT(e, ";\n");
 }
 
@@ -1009,6 +1067,27 @@ static void emit_call(Emit *e, NodeId id)
     const AstNode *n = NODE(u, id);
     const AstNode *callee = NODE(u, n->a);
     SymId fn = u->refs[id];
+    const char *dest = e->dest; // (taken here: the arguments' own calls have none)
+    e->dest = NULL;
+    char tmp_arr[32];
+    int into = returns_array(fn) && (sema_primitive(u, id) == PRIM_NONE || sema_primitive(u, id) == PRIM_BOUND);
+    if (into && !dest) // a value: a temporary the call writes, then its struct
+    {
+        snprintf(tmp_arr, sizeof(tmp_arr), "m_a%u", (unsigned)id);
+        PUT(e, "({ ");
+        out_arr_name(e, sema_fn_ret(&cx.units[SYM(fn)->unit], fn));
+        put(e, " ");
+        put(e, tmp_arr);
+        PUT(e, "; ");
+        char addr[40];
+        snprintf(addr, sizeof(addr), "&%s", tmp_arr);
+        e->dest = addr;
+        emit_call(e, id);
+        PUT(e, "; ");
+        put(e, tmp_arr);
+        PUT(e, "; })");
+        return;
+    }
     uint64_t desc[4];
     if (sema_typeof_desc(u, id, desc)) // typeof(point): its descriptor
     {
@@ -1124,9 +1203,14 @@ static void emit_call(Emit *e, NodeId id)
         Unit *home = &cx.units[SYM(fn)->unit];
         int i = 0, first = 1;
         char num[24];
+        if (dest)
+        {
+            put(e, dest);
+            first = 0;
+        }
         if (SYM(fn)->owner)
         {
-            PUT(e, "v_");
+            put(e, first ? "v_" : ", v_");
             out_tok(e, callee->tok);
             PUT(e, "__b0");
             first = 0;
@@ -1164,9 +1248,15 @@ static void emit_call(Emit *e, NodeId id)
     out_fn_name(e, fn);
     PUT(e, "(");
     int first = 1;
+    if (dest) // an array result: the place it is written, first
+    {
+        put(e, dest);
+        first = 0;
+    }
 
     if (SYM(fn)->owner) // a method: the receiver is the first C argument
     {
+        put(e, first ? "" : ", ");
         if (callee->kind == AST_SELECTOR)
         {
             TypeId base = u->types[callee->a];
@@ -1362,6 +1452,8 @@ static void emit_bound_args(Emit *e, NodeId define)
 
 static void emit_stmt(Emit *e, NodeId id, TypeId ret);
 static int tail_call(Emit *e, NodeId id);
+static void emit_array_return(Emit *e, NodeId v, TypeId ret);
+static NameId result_local(Unit *u, SymId fn, NodeId body);
 static void emit_tail(Emit *e, NodeId call);
 
 static int c_statement(const Unit *u, NodeId r)
@@ -1540,6 +1632,8 @@ static void emit_match_as(Emit *e, NodeId id, int returned)
     char temps[16][24];
     int ns = 0;
     TypeId ret = e->fn ? sema_fn_ret(&cx.units[SYM(e->fn)->unit], e->fn) : T_VOID;
+    int tail = e->tail && ret == T_VOID && (type == T_VOID || type == T_NONE); // (emit_stmt said it is last)
+    e->tail = 0;
     if (m->a)
     {
         put(e, returned ? "{ " : "({ "); // (put: PUT takes literals only)
@@ -1612,6 +1706,13 @@ static void emit_match_as(Emit *e, NodeId id, int returned)
                 PUT(e, ")");
                 tests++;
             }
+            else if ((name = sema_arm_cond(u, pat))) // a condition: the arm when it is true
+            {
+                put(e, tests ? " && (" : "if ((");
+                emit_as(e, name, T_BOOL);
+                PUT(e, ")");
+                tests++;
+            }
         }
         put(e, tests ? ") {\n" : "{\n");
         NodeId r = a->b;
@@ -1627,6 +1728,10 @@ static void emit_match_as(Emit *e, NodeId id, int returned)
             {
                 out_indent(e);
                 emit_fail_return(e, r, ret);
+            }
+            else if (is_array_type(ret))
+            {
+                emit_array_return(e, r, ret);
             }
             else
             {
@@ -1649,13 +1754,15 @@ static void emit_match_as(Emit *e, NodeId id, int returned)
         }
         else
         {
-            if (!m->a && ret == T_VOID && !c_statement(u, r) && tail_call(e, r))
+            if ((!m->a || tail) && ret == T_VOID && !c_statement(u, r) && tail_call(e, r))
             {
                 emit_tail(e, r);
             }
             else
             {
+                e->tail = tail || (!m->a && ret == T_VOID); // a block there: its last call too
                 emit_stmt(e, r, ret);
+                e->tail = 0;
             }
             if (!m->a && ret == T_VOID) // (a block of a function with a result returns by itself)
             {
@@ -1669,6 +1776,15 @@ static void emit_match_as(Emit *e, NodeId id, int returned)
             snprintf(line, sizeof(line), "} else { m_r%u = (", id);
             put(e, line);
             out_type(e, type, m->tok);
+            PUT(e, ")(");
+            out_subject(e, subj[0]);
+            PUT(e, "); }\n");
+            continue;
+        }
+        if (last && tests && (m->aux & MATCH_PASS) && m->a && returned && ret != T_VOID)
+        {
+            PUT(e, "} else { return ("); // `return x.(5: 1)`: a value no arm takes is the result
+            out_type(e, ret, m->tok);
             PUT(e, ")(");
             out_subject(e, subj[0]);
             PUT(e, "); }\n");
@@ -1835,6 +1951,7 @@ static void emit_expr(Emit *e, NodeId id)
         break;
     case AST_IDENT:
     {
+        uint64_t bound_v;
         SymId s = u->refs[id];
         if (is_self_ident(u, id))
         {
@@ -1866,6 +1983,12 @@ static void emit_expr(Emit *e, NodeId id)
         else if (type == T_NIL)
         {
             PUT(e, "0"); // no reference, or no error
+        }
+        else if (!u->refs[id] && sema_bound_value(u, id, &bound_v))
+        {
+            char num[32]; // `N`: the number this specialization was made for
+            snprintf(num, sizeof(num), "%lluull", (unsigned long long)bound_v);
+            put(e, num);
         }
         else if (!u->refs[id] && e->fn && sema_bound_type(e->fn, token_name(TOK(u, n->tok))) != T_NONE)
         {
@@ -2052,6 +2175,13 @@ static void emit_expr(Emit *e, NodeId id)
     case AST_SELECTOR:
     {
         SymId member = u->refs[id];
+        if (u->types[n->a] == T_STR && TOK(u, n->tok)->len == 3 && memcmp(TSTART(TOK(u, n->tok)), "len", 3) == 0)
+        {
+            PUT(e, "((uint64_t)("); // `s.len`
+            emit_expr(e, n->a);
+            PUT(e, ").len)");
+            break;
+        }
         if (member && SYM(member)->kind == SYM_CONST && emit_unsized(e, id))
         {
             break; // `util.limit`, an unsized constant of another module
@@ -2108,7 +2238,16 @@ static void emit_expr(Emit *e, NodeId id)
         break;
     }
     case AST_CALL:
-        emit_call(e, id);
+        if (is_array_type(u->types[id]) && sema_primitive(u, id) == PRIM_NONE)
+        {
+            PUT(e, "("); // an array a function returns: the array in its struct
+            emit_call(e, id);
+            PUT(e, ").a");
+        }
+        else
+        {
+            emit_call(e, id);
+        }
         break;
     case AST_ASSIGN:
         if (NODE(u, n->a)->kind == AST_SELECTOR && u->refs[n->a] && SYM(u->refs[n->a])->kind == SYM_FIELD &&
@@ -2176,6 +2315,18 @@ static int scalar_type(TypeId t)
     return t == T_VOID || t == T_BOOL || (type_is_int(t) && t != T_INT_LIT);
 }
 
+// An argument that is the caller's own immutable parameter, given on unchanged (`xs`, `out`): an
+// array or a reference in it points into a frame below this one, never into the one a tail call
+// hands over. (A local array, a mutable array parameter's copy, `&local`: this frame; not these.)
+static int passed_on(const Unit *u, NodeId arg)
+{
+    while (arg && NODE(u, arg)->kind == AST_PAREN_GROUP)
+    {
+        arg = NODE(u, arg)->a;
+    }
+    return arg && NODE(u, arg)->kind == AST_IDENT && !u->refs[arg] && (NODE(u, arg)->aux & IDENT_PARAM);
+}
+
 static int tail_call(Emit *e, NodeId id)
 {
     Unit *u = e->u;
@@ -2218,19 +2369,22 @@ static int tail_call(Emit *e, NodeId id)
     }
     Unit *home = &cx.units[SYM(fn)->unit], *mine = &cx.units[SYM(caller)->unit];
     TypeId ret = sema_fn_ret(home, fn);
-    if (ret != sema_fn_ret(mine, caller) || !scalar_type(ret))
+    if (ret != sema_fn_ret(mine, caller) || !(scalar_type(ret) || (returns_array(fn) && !e->result)))
     {
-        return 0;
+        return 0; // (an array: m_ret passed on, unless a local of this frame lives in it)
     }
-    NodeId p = sema_fn_params(home, fn), q = sema_fn_params(mine, caller);
+    NodeId p = sema_fn_params(home, fn), q = sema_fn_params(mine, caller), arg = n->b;
     for (;;)
     {
-        // (the types a specialization is for are not passed: not compared)
-        while (p && sema_bound_type(fn, token_name(TOK(home, NODE(home, p)->tok))) != T_NONE)
+        // (the types a specialization is for, and the functions given, are not passed: not compared)
+        while (p && (sema_bound_type(fn, token_name(TOK(home, NODE(home, p)->tok))) != T_NONE ||
+                     type_kind(sema_param_type(home, fn, p)) == T_FUNC))
         {
             p = NEXT(home, p);
+            arg = arg ? NEXT(u, arg) : 0;
         }
-        while (q && sema_bound_type(caller, token_name(TOK(mine, NODE(mine, q)->tok))) != T_NONE)
+        while (q && (sema_bound_type(caller, token_name(TOK(mine, NODE(mine, q)->tok))) != T_NONE ||
+                     type_kind(sema_param_type(mine, caller, q)) == T_FUNC))
         {
             q = NEXT(mine, q);
         }
@@ -2239,12 +2393,15 @@ static int tail_call(Emit *e, NodeId id)
             break;
         }
         TypeId t = sema_param_type(home, fn, p);
-        if (t != sema_param_type(mine, caller, q) || !scalar_type(t) || t == T_VOID)
+        if (t != sema_param_type(mine, caller, q) || t == T_VOID ||
+            (!scalar_type(t) && !(passed_on(u, arg) && (type_kind(t) == T_ARRAY || type_kind(t) == T_PTR) &&
+                                  !(NODE(home, p)->flags & AST_F_MUT))))
         {
             return 0;
         }
         p = NEXT(home, p);
         q = NEXT(mine, q);
+        arg = arg ? NEXT(u, arg) : 0;
     }
     return !p && !q;
 }
@@ -2254,8 +2411,45 @@ static void emit_tail(Emit *e, NodeId call)
 {
     out_indent(e);
     PUT(e, "M_TAIL ");
+    e->dest = returns_array(e->fn) ? "m_ret" : NULL; // an array: m_ret passed on
     emit_call(e, call);
     PUT(e, ";\n");
+}
+
+// `return v` where the result is an array: v written in the caller's place, m_ret. The local the
+// function returns is there already; a call writes it there itself (a tail call when it can be).
+static void emit_array_return(Emit *e, NodeId v, TypeId ret)
+{
+    Unit *u = e->u;
+    const AstNode *n = NODE(u, v);
+    out_indent(e);
+    if (n->kind == AST_IDENT && e->result && token_name(TOK(u, n->tok)) == e->result)
+    {
+        PUT(e, "return;\n");
+        return;
+    }
+    if (n->kind == AST_CALL && returns_array(u->refs[v]) && type_len(u->types[v]) == type_len(ret) &&
+        (sema_primitive(u, v) == PRIM_NONE || sema_primitive(u, v) == PRIM_BOUND))
+    {
+        if (tail_call(e, v))
+        {
+            PUT(e, "M_TAIL ");
+            e->dest = "m_ret";
+            emit_call(e, v);
+            PUT(e, ";\n");
+            return;
+        }
+        PUT(e, "{ ");
+        e->dest = "m_ret";
+        emit_call(e, v);
+        PUT(e, "; return; }\n");
+        return;
+    }
+    PUT(e, "{ *m_ret = *(");
+    out_arr_name(e, ret);
+    PUT(e, " *)(");
+    emit_expr(e, v);
+    PUT(e, "); return; }\n");
 }
 
 // An array local: its elements packed, at zero or copied from `init`'s (`c := a` is a copy).
@@ -2263,18 +2457,61 @@ static void emit_array_local(Emit *e, NodeId id, TypeId t, NodeId init)
 {
     Unit *u = e->u;
     const AstNode *n = NODE(u, id);
+    int result = e->result && token_name(TOK(u, n->tok)) == e->result; // the one returned: m_ret's
+    int called = init && NODE(u, init)->kind == AST_CALL && returns_array(u->refs[init]) &&
+                 (sema_primitive(u, init) == PRIM_NONE || sema_primitive(u, init) == PRIM_BOUND) &&
+                 type_len(t) == type_len(u->types[init]);
     out_indent(e);
     out_type(e, type_ref(t), n->tok);
-    PUT(e, " v_");
-    out_tok(e, n->tok);
     char len[96];
-    snprintf(len, sizeof(len), "[%u] = {0};\n", type_len(t));
-    put(e, len);
+    if (result)
+    {
+        PUT(e, " *v_");
+        out_tok(e, n->tok);
+        PUT(e, " = m_ret->a;");
+        if (!init)
+        {
+            PUT(e, " *m_ret = (");
+            out_arr_name(e, sema_fn_ret(u, e->fn));
+            PUT(e, "){0};");
+        }
+        PUT(e, "\n");
+    }
+    else
+    {
+        PUT(e, " v_");
+        out_tok(e, n->tok);
+        snprintf(len, sizeof(len), init ? "[%u];\n" : "[%u] = {0};\n", type_len(t)); // (an init writes all)
+        put(e, len);
+    }
     if (!init)
     {
         return;
     }
     out_indent(e);
+    if (called) // an array a function returns: written straight into the local (no copy after)
+    {
+        char dest[160];
+        size_t k = 0;
+        if (result)
+        {
+            k = (size_t)snprintf(dest, sizeof(dest), "m_ret");
+        }
+        else
+        {
+            char name[96];
+            const Token *tk = TOK(u, n->tok);
+            size_t nl = tk->len < sizeof(name) - 1 ? tk->len : sizeof(name) - 1;
+            memcpy(name, TSTART(tk), nl);
+            name[nl] = 0;
+            k = (size_t)snprintf(dest, sizeof(dest), "(m_arr_%u *)v_%s", (unsigned)u->types[init], name);
+        }
+        (void)k;
+        e->dest = dest;
+        emit_call(e, init);
+        PUT(e, ";\n");
+        return;
+    }
     PUT(e, "{ const ");
     out_type(e, type_ref(t), n->tok);
     PUT(e, " *m_s = ");
@@ -2289,6 +2526,8 @@ static void emit_stmt(Emit *e, NodeId id, TypeId ret)
 {
     Unit *u = e->u;
     const AstNode *n = NODE(u, id);
+    int tail = e->tail && ret == T_VOID; // (taken here: nothing inside is last unless said below)
+    e->tail = 0;
 
     switch (n->kind)
     {
@@ -2298,8 +2537,10 @@ static void emit_stmt(Emit *e, NodeId id, TypeId ret)
         e->indent++;
         for (NodeId s = n->a; s; s = NEXT(u, s))
         {
+            e->tail = tail && !NEXT(u, s);
             emit_stmt(e, s, ret);
         }
+        e->tail = 0;
         e->indent--;
         out_indent(e);
         PUT(e, "}\n");
@@ -2503,6 +2744,11 @@ static void emit_stmt(Emit *e, NodeId id, TypeId ret)
             emit_fail_return(e, n->a, ret);
             return;
         }
+        if (n->a && is_array_type(ret))
+        {
+            emit_array_return(e, n->a, ret); // an array: written in the caller's place
+            return;
+        }
         if (n->a && NODE(u, n->a)->kind == AST_UNARY_OP && TOK(u, NODE(u, n->a)->tok)->kind == TOK_AMP &&
             NODE(u, NODE(u, n->a)->a)->kind == AST_STRUCT_LIT) // `return &point{ ... }`: built in self
         {
@@ -2537,6 +2783,11 @@ static void emit_stmt(Emit *e, NodeId id, TypeId ret)
         PUT(e, ";\n");
         return;
     default:
+        if (tail && n->kind == AST_CALL && tail_call(e, id))
+        {
+            emit_tail(e, id); // the last act of a void function, in a block or an arm: a loop's turn
+            return;
+        }
         out_indent(e);
         if (n->kind == AST_CALL && u->types[id] == T_ERROR && u->refs[id] && !sema_fn_fails(u->refs[id]) &&
             e->fn && (sema_fn_fails(e->fn) || ret == T_ERROR))
@@ -2556,7 +2807,9 @@ static void emit_stmt(Emit *e, NodeId id, TypeId ret)
         {
             PUT(e, "(void)"); // a value nothing takes (an arm's, in a statement): computed, dropped
         }
+        e->tail = tail && n->kind == AST_MATCH; // a statement of arms: each arm's last act is the function's
         emit_expr(e, id);
+        e->tail = 0;
         PUT(e, ";\n");
         return;
     }
@@ -2581,6 +2834,10 @@ static void emit_signature(Emit *e, SymId fn)
     {
         out_res_name(e, sema_fn_ret(u, fn)); // the value and its error
     }
+    else if (is_array_type(sema_fn_ret(u, fn)))
+    {
+        PUT(e, "void"); // an array: written in the caller's place, m_ret
+    }
     else
     {
         out_type(e, sema_fn_ret(u, fn), SYM(fn)->tok);
@@ -2588,8 +2845,15 @@ static void emit_signature(Emit *e, SymId fn)
     PUT(e, " ");
     out_fn_name(e, fn);
     PUT(e, "(");
+    if (returns_array(fn))
+    {
+        out_arr_name(e, sema_fn_ret(u, fn));
+        PUT(e, " *m_ret");
+        first = 0;
+    }
     if (SYM(fn)->owner)
     {
+        put(e, first ? "" : ", ");
         out_struct_name(e, SYM(fn)->owner);
         PUT(e, " *self");
         first = 0;
@@ -2690,12 +2954,19 @@ static void emit_clause_test(Emit *e, SymId fn, TypeId ret)
     {
         tail = scalar_type(sema_param_type(u, fn, p));
     }
-    put(e, tail ? "M_TAIL " : ret == T_VOID ? "" : "return ");
+    int into = returns_array(fn); // an array result: the next clause writes it in m_ret too
+    put(e, tail ? "M_TAIL " : ret == T_VOID || into ? "" : "return ");
     out_fn_name(e, next);
     PUT(e, "(");
     first = 1;
+    if (into)
+    {
+        PUT(e, "m_ret");
+        first = 0;
+    }
     if (SYM(fn)->owner)
     {
+        put(e, first ? "" : ", ");
         PUT(e, "self");
         first = 0;
     }
@@ -2706,7 +2977,7 @@ static void emit_clause_test(Emit *e, SymId fn, TypeId ret)
         out_param_name(e, p, index);
         first = 0;
     }
-    put(e, ret == T_VOID && !tail ? ");\n        return;\n    }\n" : ");\n    }\n");
+    put(e, (ret == T_VOID || into) && !tail ? ");\n        return;\n    }\n" : ");\n    }\n");
 }
 
 static void emit_function(Emit *e, SymId fn)
@@ -2747,7 +3018,11 @@ static void emit_function(Emit *e, SymId fn)
     if (n->flags & AST_F_ONELINE)
     {
         NodeId body = fn_body(u, (NodeId)(n - u->nodes.data));
-        if (tail_call(e, body))
+        if (is_array_type(ret) && !sema_fn_fails(fn))
+        {
+            emit_array_return(e, body, ret);
+        }
+        else if (tail_call(e, body))
         {
             emit_tail(e, body);
         }
@@ -2761,6 +3036,7 @@ static void emit_function(Emit *e, SymId fn)
     }
     else
     {
+        e->result = result_local(u, fn, fn_body(u, (NodeId)(n - u->nodes.data)));
         for (NodeId s = NODE(u, fn_body(u, (NodeId)(n - u->nodes.data)))->a; s; s = NEXT(u, s))
         {
             // A void function's last statement, a call of the same prototype: a tail call too.
@@ -2769,12 +3045,107 @@ static void emit_function(Emit *e, SymId fn)
                 emit_tail(e, s);
                 continue;
             }
+            e->tail = !NEXT(u, s) && ret == T_VOID; // a block or arms there: their last calls too
             emit_stmt(e, s, ret);
+            e->tail = 0;
         }
     }
     e->indent = 0;
     e->fn = 0;
+    e->result = 0;
     PUT(e, "}\n\n");
+}
+
+// The local a function returning an array returns (`[N]T out ... return out`): it can live in
+// the caller's place itself when every return is `return out`, it is the only local of that
+// name, no parameter has it, and no arm returns (a body of arms on the parameters).
+typedef struct
+{
+    NameId name;
+    int decls, other;
+} ResultScan;
+
+static void scan_result(const Unit *u, NodeId id, ResultScan *r, int list, int depth)
+{
+    for (; id && depth < 256; id = list ? NEXT(u, id) : 0)
+    {
+        const AstNode *n = NODE(u, id);
+        if (n->kind == AST_FN_LIT)
+        {
+            continue; // a function of its own
+        }
+        if (n->kind == AST_MATCH && !n->a)
+        {
+            r->other = 1; // arms on the parameters: an arm may return
+        }
+        if (n->kind == AST_RETURN)
+        {
+            const AstNode *v = n->a ? NODE(u, n->a) : NULL;
+            NameId name = v && v->kind == AST_IDENT ? token_name(TOK(u, v->tok)) : 0;
+            if (!name || (r->name && r->name != name))
+            {
+                r->other = 1;
+            }
+            r->name = name;
+        }
+        uint8_t mask = n->kind < AST__COUNT ? ast_child_mask[n->kind] : 0;
+        if ((mask & 1) && n->a)
+        {
+            scan_result(u, n->a, r, 1, depth + 1);
+        }
+        if ((mask & 2) && n->b)
+        {
+            scan_result(u, n->b, r, 1, depth + 1);
+        }
+    }
+}
+
+static void count_decls(const Unit *u, NodeId id, ResultScan *r, int list, int depth)
+{
+    for (; id && depth < 256; id = list ? NEXT(u, id) : 0)
+    {
+        const AstNode *n = NODE(u, id);
+        if (n->kind == AST_FN_LIT)
+        {
+            continue;
+        }
+        if ((n->kind == AST_DEFINE || n->kind == AST_FIELD_DECL) && token_name(TOK(u, n->tok)) == r->name)
+        {
+            r->decls += is_array_type(u->types[id]) ? 1 : 2;
+        }
+        uint8_t mask = n->kind < AST__COUNT ? ast_child_mask[n->kind] : 0;
+        if ((mask & 1) && n->a)
+        {
+            count_decls(u, n->a, r, 1, depth + 1);
+        }
+        if ((mask & 2) && n->b)
+        {
+            count_decls(u, n->b, r, 1, depth + 1);
+        }
+    }
+}
+
+static NameId result_local(Unit *u, SymId fn, NodeId body)
+{
+    if (!returns_array(fn) || sema_next_clause(u, fn))
+    {
+        return 0;
+    }
+    ResultScan r = {0};
+    scan_result(u, NODE(u, body)->a, &r, 1, 0);
+    if (r.other || !r.name)
+    {
+        return 0;
+    }
+    for (NodeId p = sema_fn_params(u, fn); p; p = NEXT(u, p))
+    {
+        if (token_name(TOK(u, NODE(u, p)->tok)) == r.name)
+        {
+            return 0;
+        }
+    }
+    count_decls(u, NODE(u, body)->a, &r, 1, 0);
+    return r.decls == 1 ? r.name : 0;
 }
 
 // Is this a function the backend can emit? Module-level `self` functions are not, yet.
@@ -3277,6 +3648,10 @@ static void backend_c_begin(const BackendJob *job)
             {
                 emit_res_type(e, sema_fn_ret(home, fn));
             }
+            if (is_array_type(sema_fn_ret(home, fn)))
+            {
+                emit_arr_type(e, sema_fn_ret(home, fn));
+            }
             piece_begin_fn(e, fn);
             emit_signature(e, fn);
             PUT(e, ";\n");
@@ -3326,6 +3701,10 @@ static void backend_c_declare(const BackendJob *job, SymId fn)
         if (sema_fn_fails(fn))
         {
             emit_res_type(e, sema_fn_ret(e->u, fn));
+        }
+        if (is_array_type(sema_fn_ret(e->u, fn)))
+        {
+            emit_arr_type(e, sema_fn_ret(e->u, fn));
         }
         piece_begin_fn(e, fn);
         emit_signature(e, fn);

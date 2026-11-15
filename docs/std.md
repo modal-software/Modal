@@ -341,7 +341,8 @@ at compile time, so what the program does at run time is known before it runs:
 - `s[i]` on a `[]u8` reads a byte (read only), bounded by its length.
 - **Later modalities** (the owner's list): `[..N]T` (a length from 0 to N, in place), and
   grow-only, shrink-only and grow-and-shrink arrays, which need an allocator (the `arena`
-  context). Not yet: arrays of structs, an array as a result, array literals, slices.
+  context). Built since: arrays of structs (context.md §62), `xs.len` and `xs: []T` parameters,
+  arrays as results, written in the caller's place (§64). Not yet: array literals, slices.
 
 ## 10. Struct literals and visibility by use (built, context.md §36, §37)
 
@@ -491,6 +492,11 @@ n.(0..10: n + 1).(seven()).(print).(_: print("big"))
 - **A stage is partial:** what no arm takes goes on, as the stage's value (it must fit the
   arms' type, or end with `_`), or nothing for a statement. `if value { arms }` stays
   exhaustive.
-- **Cost:** the same AST_MATCH as `if` (tables, searches); a value that goes on is one copy.
+- **A condition is a pattern** (context.md §65): `x.(x > hi: hi)`, `a2.len.((a1.len > a2.len): 0)`,
+  `if n { 0: "none", n < 10: "few", _: "many" }`. Written as a comparison (or `and` / `or`), alone
+  or in parentheses; the arm is taken when it is true. It is tested in its place, first wins, and
+  takes no values the compiler counts: a stage stays partial, a value match still needs `_`.
+- **Cost:** the same AST_MATCH as `if` (tables, searches); a value that goes on is one copy. A
+  match with a condition is tested in order (no search over its arms).
 - **Not yet:** type patterns (`u64:`, `error:`) and error names, with guards.md §5; arms in
   function literals passed to calls (`john.map(x: x.id)`).

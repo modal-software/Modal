@@ -151,7 +151,7 @@ else
     echo "FAIL  unknown backend is rejected"
     fail=1
 fi
-for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms arm_edges arm_search arm_consts clauses_nil arrays fields reflect field_use nested module_structs any types generic fields_each bound pipes errors error_stages panics error_sets arena_errors closures functions struct_arrays generic_loop print_errors struct_errors captures; do
+for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms arm_edges arm_search arm_consts clauses_nil arrays fields reflect field_use nested module_structs any types generic fields_each bound pipes errors error_stages panics error_sets arena_errors closures functions struct_arrays generic_loop print_errors struct_errors captures len lengths map_fold array_moves array_big array_frames array_results fields_grouped conditions; do
     if $BIN --run $EX/run/$prog.modal 2>&1 | cmp -s - $EX/run/$prog.expected; then
         echo "ok    $prog.modal compiles to C and prints the expected output"
     else
@@ -229,7 +229,7 @@ fi
 
 # the native backend (copy-and-patch): same output and exit status as the C backend
 if [ "$(uname -m)" = arm64 ] || [ "$(uname -m)" = aarch64 ]; then
-    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms arm_edges arm_search arm_consts clauses_nil arrays fields reflect field_use nested module_structs any types generic fields_each bound pipes errors error_stages panics error_sets arena_errors closures functions struct_arrays generic_loop print_errors struct_errors captures; do
+    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms arm_edges arm_search arm_consts clauses_nil arrays fields reflect field_use nested module_structs any types generic fields_each bound pipes errors error_stages panics error_sets arena_errors closures functions struct_arrays generic_loop print_errors struct_errors captures len lengths map_fold array_moves array_big array_frames array_results fields_grouped conditions; do
         if $BIN --backend native --run $EX/run/$prog.modal 2>&1 | cmp -s - $EX/run/$prog.expected; then
             echo "ok    $prog.modal compiles to arm64 by copy-and-patch and prints the expected output"
         else
@@ -259,7 +259,7 @@ if [ "$(uname -m)" = arm64 ] || [ "$(uname -m)" = aarch64 ]; then
 fi
 # x86-64: on an x86-64 host, or on Apple Silicon through Rosetta
 if [ "$(uname -m)" = x86_64 ] || arch -x86_64 /usr/bin/true 2>/dev/null; then
-    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms arm_edges arm_search arm_consts clauses_nil arrays fields reflect field_use nested module_structs any types generic fields_each bound pipes errors error_stages panics error_sets arena_errors closures functions struct_arrays generic_loop print_errors struct_errors captures; do
+    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms arm_edges arm_search arm_consts clauses_nil arrays fields reflect field_use nested module_structs any types generic fields_each bound pipes errors error_stages panics error_sets arena_errors closures functions struct_arrays generic_loop print_errors struct_errors captures len lengths map_fold array_moves array_big array_frames array_results fields_grouped conditions; do
         if $BIN --backend x86_64 --run $EX/run/$prog.modal 2>&1 | cmp -s - $EX/run/$prog.expected; then
             echo "ok    $prog.modal compiles to x86-64 by copy-and-patch and prints the expected output"
         else
@@ -290,7 +290,7 @@ for cpu in arm64 x86_64; do
     else
         continue
     fi
-    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms arm_edges arm_search arm_consts clauses_nil arrays fields reflect field_use nested module_structs any types generic fields_each bound pipes errors error_stages panics error_sets arena_errors closures functions struct_arrays generic_loop print_errors struct_errors captures; do
+    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms arm_edges arm_search arm_consts clauses_nil arrays fields reflect field_use nested module_structs any types generic fields_each bound pipes errors error_stages panics error_sets arena_errors closures functions struct_arrays generic_loop print_errors struct_errors captures len lengths map_fold array_moves array_big array_frames array_results fields_grouped conditions; do
         if $BIN --target $cpu-linux -o "$ELF" $EX/run/$prog.modal >/dev/null 2>&1 &&
             $runner "$ELF" 2>&1 | untrap "$ELF.traps" | cmp -s - $EX/run/$prog.expected; then
             echo "ok    $prog.modal as a Linux $cpu ELF prints the expected output"
@@ -476,6 +476,33 @@ else
 fi
 rm -f "$NE_OUT" "$NE_OUT.traps"
 expect_output "errors: a module-level value's call that gives an error stops the compiler" "module_errors.modal:10:.*'b' cannot be computed by the compiler: gets an error from a call" $EX/errors/module_errors.modal
+CO=$EX/errors/conditions.modal
+expect_output "conditions: a value match still needs _ (a condition takes nothing for sure)" "conditions.modal:11:.*not every value is taken" $CO
+expect_output "conditions: not on a call that can fail yet" "conditions.modal:15:.*a condition is not a pattern of a call that can fail yet" $CO
+# A big array costs no code per element (§64): copied in one block, passed on in a loop as its
+# address. Before, a loop over [30000]u64 moved every element back into its parameters each turn.
+AB_OUT=${TMPDIR:-/tmp}/modal-array-big.$$
+if $BIN --backend native -o "$AB_OUT" $EX/run/array_big.modal >/dev/null 2>&1 &&
+    [ "$(wc -c < "$AB_OUT")" -lt 65536 ]; then
+    echo "ok    native: a [30000]u64 through map and fold makes a small program"
+else
+    echo "FAIL  native: a [30000]u64 through map and fold makes a small program ($(wc -c < "$AB_OUT" 2>/dev/null) bytes)"
+    fail=1
+fi
+rm -f "$AB_OUT" "$AB_OUT.traps"
+# An array result is written in the caller's place (§64): C passes it as m_ret, the local
+# returned lives there, and nothing is copied back (no `return *(m_arr_N *)`).
+AR_C=${TMPDIR:-/tmp}/modal-array-results.$$.c
+if $BIN -o "$AR_C" $EX/run/array_results.modal >/dev/null 2>&1 &&
+    grep -q "v_out = m_ret->a" "$AR_C" && grep -q "M_TAIL m_build__1(m_ret" "$AR_C" &&
+    ! grep -q "return \*(m_arr" "$AR_C"; then
+    echo "ok    C: an array result is written in the caller's place"
+else
+    echo "FAIL  C: an array result is written in the caller's place"
+    fail=1
+fi
+rm -f "$AR_C"
+expect_output "order: a function of an imported file is checked before its callers" "main.modal:8:.*'f' is always nil: 'add' can neither fail nor panic" $EX/errors/order_files/main.modal --warn
 SE=$EX/errors/error_sets.modal
 expect_output "error sets: a match on a call's error takes its whole set" "error_sets.modal:18:.*'serve' can also give too_big, panic.division" $SE
 expect_output "error sets: an error that is always nil is said" "error_sets.modal:26:.*'f' is always nil: 'add' can neither fail nor panic" $SE --warn

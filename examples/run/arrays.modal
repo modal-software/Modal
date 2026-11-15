@@ -48,6 +48,9 @@ main(): u8 {
     u64 k = 3
     print(a[k])
     k = 4
-    print(a[k])                              -- out of range: the program stops here
+    print(k.(k >= a.len: 0, _: a[k]))
+    -- out of range: the program stops here
+   
+    print("unreachable")                              
     return 0
 }

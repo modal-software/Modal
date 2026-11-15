@@ -2557,8 +2557,154 @@ The first half of the collections step (for `john.map(x: x.id)`).
   made the literal is released (`literal_specs_waiting`), and one made while a body is checked
   again for the compiler is not queued for the backend (its literal is gone after). An array is
   still not captured. Example run/captures; ASan clean.
+- **Callees first across files** (§58 was within a file): `modules_link` checks every file's
+  declarations first (load order: `sema_check_decls`), then computes the entry's module values and
+  starts the backend, then checks the bodies with a file's imports before it (`unit_order`, a
+  depth-first walk over the imports of its declarations; `sema_check_bodies`). A file a body brings
+  in goes after, in turn. `util.add` from another file is now known to raise nothing (the "always
+  nil" warning) and inlined (100M calls 0.07 s). The cache records the names a file's
+  declarations resolve too (they are checked in a pass of their own). errors/order_files.
 - **`macho.c`:** `LC_DYLD_INFO_ONLY` is 0x80000022 again (an edit had made it 0x80000023, which
   stopped every Mach-O executable from loading: the x86-64 runs, `-o` binaries).
+
+## 64. Collections: `len`
+
+The owner (2026-11-15): pure arrays `[N]T` (fixed), grow-only, shrink-only, and slices (grow and
+shrink); every kind has `len`. First piece:
+- **`xs.len`** (check_selector): an array's, or through `*[N]T`, is its N, a constant folded where it
+  is used (in `sema_typeof_field`, so the checker's constants, the lowering and C all see it: an arm
+  `ps.len: acc` ends a recursion over the elements); a `[]u8`'s is its length word (a load; `.len`
+  of the C string).
+- **Found:** the fields-by-use step (§41) folded a field every write gives one constant even when a
+  value of the struct is made at zero by `[3]person ps` (or a local `person p`): `ps[1].id = 5` made
+  every element's id 5. Those now count as made at zero (layout.c: a struct name then a name, after
+  `]` or first on its line; a reference `*item it` makes none).
+- Example run/len (+ .expected). Tests 456 ok; fuzz 0 differ (scalar, struct); bench unchanged.
+
+Second piece: a length read from the argument, returnable arrays, `map` and `fold` in std.
+- **No length names.** The owner (2026-11-15): no `[N]T` with a free N; a length is read where it
+  is, `xs.len` (as `x: []u8 = "marcos"; x.len`). A parameter `xs: []T` (or `out: *[]T`) with T
+  not u8 takes an array: its length is known while compiling, so the function is made once per
+  length (`length_params`, bound under the name `xs.len`, which a program cannot write, so it never
+  hides one; `length_bound_name` keeps the text, since a name points at its text). In the body and
+  the signature `xs.len` is that constant: `[xs.len]U out`, a result `[xs.len]U`, an arm
+  `xs.len: acc` (`sema_bound_value` reads a selector `xs.len`; the parser takes `[a.b]T` as a type).
+  An old `[N]T` says the length is a literal, a constant, or `xs.len` of a `[]T` parameter.
+  A `[]u8` stays a string (its length a load); taking an array there is for slices (next).
+- **Arrays returned:** a MIR `SLOT_WIN|0` result, `copy_array_into` from a call, `array_addr` of a
+  call; C uses `m_arr_N { T a[N]; }` typedefs, `(call).a`, `return *(m_arr_N *)(x)`.
+- **std/array.modal:** `map(T, U, xs, f): [xs.len]U` (through `map_into`, a recursion that ends
+  with the arm `xs.len: return`) and `fold(T, A, xs, acc, f): A`, written in Modal; std/mod.modal
+  binds `map` and `fold`. A literal's parameters may be untyped, `(best, p): ...`: the callee's
+  `function(...)` types them (`Parser.untyped_params`).
+- **Found:** a specialization of map made map_into's specialization inside it, whose literal
+  belonged to the caller: `literal_specs_waiting` drained it while map's body was the one in the
+  unit's token room, which holds one body ("token array overflow"). Now only a literal's own body
+  (`lit_owner`, set from `Check.body_owner`) drains its specializations.
+- Examples run/lengths and run/map_fold (+ .expected), on C, arm64 and x86-64 (and the Linux ELFs).
+  Tests 464 ok; the failures are examples the owner edited (stale .expected, and arena_errors'
+  line numbers in the test), plus the 3 old ones. Bench unchanged (structs 2868 B, big 24.5 ms).
+
+Third piece: performance of the above. Measured with `[100000]u64` through fill, two maps and a
+fold, 500 times (native arm64: did not finish in 120 s; now 0.2 s. C -O2: 0.03 s, now 0.02 s).
+- **Found (quadratic):** `mir_param_slots` counted an array parameter as all its elements
+  (`slots_of`), while it is passed as its address (`param_slots`, as the frame lays it out): the
+  loop a tail call makes moved N slots back into the parameters on every turn. fold_from over
+  30000 elements: 30055 MIR instructions, 974 KB, 0.51 s; now 56 instructions, 16.7 KB, 0.00 s.
+- **MIR_MOVE** (mir.h): slots d .. d + imm - 1 = slots a .. (memmove). `copy_slots` makes one past
+  MOVE_MIN (16) slots instead of a COPY per slot: an array result (`b := map(...)`, `return out`,
+  `[N]T e = b`) was 2 × N instructions per call site. Stencils `move` / `move_down` (by
+  direction, known while compiling; x86-64 cannot compare two holes); regalloc keeps both blocks
+  in the frame; opt.c reads / kills / fold / dead_stores / fields know it; comptime.c runs it; a
+  spliced body never holds one. `return out` of a local and `c := a` copy its slots straight
+  (no ADDR, which also kept a tail call out); `return g()` of an array copies the window to the
+  result, so `call; move; ret` is a tail call (mark_tail_calls takes the one MOVE).
+- **Loops drop the parameters they never read** (self_loops): `T: type` is 5 slots, passed on each
+  turn although the specialization knows it (20 instructions a turn in map_into). What only fed
+  them goes too (drop_dead_values, read counts); a return whose block writes the result first, or
+  that nothing reaches, reads no parameter. A clause with a next clause reads every parameter on
+  its miss path, so a merged clause keeps them.
+- **known_bounds** (opt.c): a guard `i < N` passed (its `ok` label reached only from it) proves
+  i < N until i is written; a later guard of i against N or more is then a constant true, and
+  fold takes its trap away (`out[i] = f(xs[i])`: one check, not two).
+- **C:** an array local from a call is the call's struct assigned in place (no `= {0}`, no element
+  loop after); one copied from an array is not zeroed first. A tail call may pass an array or a
+  reference on when the argument is the caller's own immutable parameter (`IDENT_PARAM`, set by
+  the checker: not a local that hides it), and a void function's last call inside a block or a
+  statement of arms is one too (`Emit.tail`): map_into, fill and fold_from are `M_TAIL` now. At
+  -O0 (`--run` passes no flags) the benchmark crashed (stack); now 0.68 s.
+- **Found (UB):** the arm tree's signed minimum was `-(int64_t)(1ull << 63)` (arm_search under
+  UBSan); now made unsigned.
+- Examples run/array_moves and run/array_big (+ .expected), on every backend; a test that
+  array_big's native program stays under 64 KB. Tests 472 ok; the failures are the owner's edits
+  (as before, plus arrays.modal, which does not parse while its line 51 is being written); under
+  ASan/UBSan the same. Fuzz 0 differ. Bench unchanged (structs 2868 B, big 24.3 ms).
+- Left: the C emitter's callee still zeroes `out` and returns it by value (`return *(m_arr *)`);
+  a result written in the caller's place (sret) would take one copy and one zeroing away. The
+  arm64 frame cannot hold a string past slot 4096 (emit_string: "a frame is too large"), so a
+  function with a big array and a print fails to compile.
+
+Fourth piece: the two gaps the third left.
+- **arm64 frames past 4096 slots:** a string's address is stored through a register offset
+  (`x16` = the byte offset), and so are `a64_ldr_slot` / `a64_str_slot` (`x17` when the value is
+  x16), whose scaled 12-bit offset was silently overflowing into the next fields for such a slot.
+  Example run/array_frames (+ .expected), every backend.
+- **C: an array result in the caller's place (sret).** A function returning `[N]T` is
+  `void f(m_arr_N *m_ret, ...)`. Its caller passes the local being made (`b := f(...)`:
+  `f((m_arr_N *)v_b, ...)`), or a temporary for a value (`({ m_arr_N m_aK; f(&m_aK, ...); m_aK; }).a`).
+  The local it returns lives in m_ret itself (`T *v_out = m_ret->a; *m_ret = (m_arr_N){0};`)
+  when every return is `return out`, no other local or parameter has that name, and no arm
+  returns (`result_local`); `return out` is then `return;`. `return g(...)` writes g's result
+  there (a tail call when the prototypes match: `M_TAIL g(m_ret, ...)`, so `again` → `build`
+  and `twice` → `one` are jumps); anything else is copied in once (`emit_array_return`, also used
+  by one-line bodies, returning arms and clause tests, which pass m_ret on to the next clause).
+  Nothing can alias m_ret: it is a fresh local, a temporary, or the caller's own m_ret.
+  Map benchmark ([20000]u64, map + fold 20000 times, cc -O2): 0.14 s → 0.10 s.
+- **Found (C):** a one-line function returning an array did not compile
+  (`[3]u16 one(a: []u16): a` was `return (call).a` / `return v_a`); native was right.
+- Example run/array_results (+ .expected) and a test that the C writes in place. Tests 487 ok
+  (the failures as in §64, plus array_moves.modal, which the owner is editing); ASan/UBSan the
+  same; fuzz 0 differ. Bench unchanged (structs 2868 B, big 24.1 ms).
+- **Left, found here:** clauses whose parameter is `xs: []T` are not linked (the last one is
+  not seen as taking every value); on C, an arm match whose value is an array, and `x = f()` of
+  a whole array (native says to assign the elements), are not supported yet; native recursion
+  with big frames overflows the 512 KB value stack (`stack` from mod.modal) and crashes, since
+  there is no stack guard yet (Phase E).
+
+## 65. A condition as a pattern: `x.(x > hi: hi)`
+
+The owner (2026-11-15): a stage holds an expression, and a match is a conditional, so
+`a[k].((k > a.len): "error")` and `a[k].(k > a.len: "error")` are arms.
+- **Parser** (parse_stmt.c `cond_len`): a comparison or `and` / `or` outside brackets, before a
+  ':' (or a ',' / ')' in a group), on one line, is a condition: `PAT_COND`, its expression in `a`
+  (`parse_condition`, which stops at the ':' even when a block follows). It is tried before a
+  name (`k > 3` starts like the pattern `k`) and before a group (`(a + b) > c:` is one condition;
+  `(k > n):` and `(k > n, _):` are groups). Anything else is unchanged (`k + 1:` is no pattern).
+- **Check:** a bool; tested when the program runs, like a run-time name (`runtime`: no coverage,
+  no overlap), so a value match still needs `_`. Not on a call that can fail yet (an error says
+  to take the value and test it in the arm). Never a taken arm decided while compiling.
+- **MIR:** `jz cond, next` in the arm's tests (the search over arms is not used: a pattern not
+  known while compiling keeps the arms in order). **C:** `if ((cond))`.
+- **Found (C):** a stage returned (`return x.(5: 1)`) gave garbage for the values no arm takes:
+  the `else` that passes them on was written only for a stage used as a value. Now
+  `} else { return (T)(m_sN_0); }`; native was right.
+- arrays.modal line 51 parses now; it does not check: `a[k]` is u8 and the arm gives "error",
+  []u8, and a stage's value is one type (§53). And `a[k]` is read before any arm is tried, so its
+  index stops the program there whatever the condition.
+- Examples run/conditions (+ .expected, every backend), errors/conditions. Tests 479 ok (the
+  failures as in §64); fuzz 0 differ.
+
+## 66. Grouped members, type first: `u64 a, b, c`
+
+The owner (2026-11-15): `u64 a, b, c` in a struct declares three u64 members, as `a, b: T` does
+type last.
+- **Parser** (parse_decl.c `parse_declaration`): after a type-first member with no value, each
+  bare name after a comma (followed by a comma, `}`, `;` or the end of its line) is a member of
+  the same type, sharing its type node. A name followed by ':' or '(' starts a member of its own:
+  `u8 tag, b: u16` is a mutable u8 and an immutable u16. The same at module level
+  (`u64 total, count`). Locals still declare one name (the rule in parse_local).
+- Example run/fields_grouped (+ .expected); array_moves.modal (the owner's edit) passes again.
+  Tests 497 ok (the failures as in §64); fuzz 0 differ.
 
 ## Appendix A. The owner's original specification inputs
 

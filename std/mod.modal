@@ -11,6 +11,7 @@ assert := import("./debug").assert
 
 any := import("./any").any
 type := import("./type").type
+T := import("./type").T
 field := import("./type").field
 panic := import("./panic")
 map := import(array).map

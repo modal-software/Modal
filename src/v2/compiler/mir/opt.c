@@ -88,6 +88,8 @@ static int reads(const Opt *o, const MirInst *in, MirSlot s)
         return s >= o->f->frame_size || (s < o->nslots && o->addressed[s]);
     case MIR_RET:
         return s < o->f->ret_slots;
+    case MIR_MOVE:
+        return s >= in->a && s < in->a + in->imm;
     default:
         return 0;
     }
@@ -99,6 +101,10 @@ static int kills(const MirInst *in, MirSlot s)
     if (in->op == MIR_ZERO)
     {
         return s >= in->a && s < in->a + in->imm;
+    }
+    if (in->op == MIR_MOVE) // (a move onto itself in part: the slots it reads stay live first)
+    {
+        return s >= in->d && s < in->d + in->imm && !(s >= in->a && s < in->a + in->imm);
     }
     return produces(in->op) && in->d == s;
 }
@@ -343,6 +349,13 @@ static int fold(Opt *o)
                 forget(o, (MirSlot)(in->a + k));
             }
             break;
+        case MIR_MOVE:
+            nfacts = 0; // it may write slots some address points into
+            for (uint64_t k = 0; k < in->imm; k++)
+            {
+                forget(o, (MirSlot)(in->d + k));
+            }
+            break;
         case MIR_ADDR:
         case MIR_STR:
         case MIR_GLOAD:
@@ -573,7 +586,7 @@ static int dead_stores(Opt *o)
                 changed = 1;
                 break;
             }
-            if (in->op == MIR_LOAD || in->op == MIR_STORE || in->op == MIR_CALL ||
+            if (in->op == MIR_LOAD || in->op == MIR_STORE || in->op == MIR_CALL || in->op == MIR_MOVE ||
                 in->op == MIR_LABEL || MIR_BRANCHES(in) || in->op == MIR_RET ||
                 in->op == MIR_TRAP || in->op == MIR_WRITE || kills(in, st->a) ||
                 (st->a < o->nslots && o->addressed[st->a]))
@@ -696,11 +709,12 @@ static int frame_fields(Opt *o)
                 count[in->d] = (MirSlot)in->imm;
             }
         }
-        else if (in->op == MIR_ZERO)
+        else if (in->op == MIR_ZERO || in->op == MIR_MOVE)
         {
-            for (uint64_t k = 0; k < in->imm && in->a + k < o->nslots; k++)
+            MirSlot to = in->op == MIR_ZERO ? in->a : in->d;
+            for (uint64_t k = 0; k < in->imm && to + k < o->nslots; k++)
             {
-                count[in->a + k] = 0;
+                count[to + k] = 0;
             }
         }
     }
@@ -755,6 +769,133 @@ static int dce(Opt *o)
     return changed;
 }
 
+// ---- bounds ----------------------------------------------------------------------------------
+//
+// An index guard (`t = lt.u64 i, N; jnz t, ok; ...; trap; ok:`) that passed says i < N from `ok`
+// on, while i is not written: `ok` is reached only from it (the other way traps). A later guard of
+// the same i against N or more is then true (`xs[i]` read, `out[i]` written: one check), and fold
+// takes its trap away.
+
+// The constant in slot s at instruction k, if the block writes it with one before k.
+static int const_before(const MirFunc *f, size_t k, MirSlot s, uint64_t *v)
+{
+    while (k-- > 0)
+    {
+        const MirInst *in = &f->code[k];
+        if (in->op == MIR_LABEL || MIR_BRANCHES(in) || in->op == MIR_CALL)
+        {
+            return 0;
+        }
+        if (kills(in, s))
+        {
+            if (in->op != MIR_CONST)
+            {
+                return 0;
+            }
+            *v = in->imm;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Is instruction k `t = lt.u64 i, N` with N known? (Its i and N.)
+static int index_compare(const MirFunc *f, size_t k, MirSlot *i, uint64_t *n)
+{
+    const MirInst *in = &f->code[k];
+    if ((in->op != MIR_BIN && in->op != MIR_BINI) || in->sub != MB_LT || in->var != MV_U64 || in->d == in->a)
+    {
+        return 0;
+    }
+    *i = in->a;
+    if (in->op == MIR_BINI)
+    {
+        *n = in->imm;
+        return 1;
+    }
+    return in->b != in->d && const_before(f, k, in->b, n);
+}
+
+static int known_bounds(Opt *o)
+{
+    MirFunc *f = o->f;
+    int changed = 0;
+    struct
+    {
+        MirSlot i;
+        uint64_t n;
+    } held[MAX_FACTS];
+    int nheld = 0;
+    uint32_t pending_label = UINT32_MAX; // the `ok` of the guard just passed, and what it proves
+    MirSlot pending_i = 0;
+    uint64_t pending_n = 0;
+    for (size_t k = 0; k < f->n; k++)
+    {
+        MirInst *in = &f->code[k];
+        if (in->op == MIR_LABEL)
+        {
+            int keep = in->imm == pending_label && k > 0 && MIR_ENDS(&f->code[k - 1]);
+            int branches = 0; // to this label: only the guard's
+            for (size_t j = 0; j < f->n && keep; j++)
+            {
+                branches += MIR_BRANCHES(&f->code[j]) && f->code[j].imm == in->imm;
+            }
+            keep = keep && branches == 1;
+            if (!keep)
+            {
+                nheld = 0;
+            }
+            else if (nheld < MAX_FACTS)
+            {
+                held[nheld].i = pending_i;
+                held[nheld++].n = pending_n;
+            }
+            pending_label = UINT32_MAX;
+            continue;
+        }
+        MirSlot i;
+        uint64_t n;
+        if (index_compare(f, k, &i, &n))
+        {
+            for (int h = 0; h < nheld; h++)
+            {
+                if (held[h].i == i && held[h].n <= n)
+                {
+                    *in = (MirInst){.op = MIR_CONST, .d = in->d, .imm = 1};
+                    changed = 1;
+                    break;
+                }
+            }
+            if (in->op != MIR_CONST && k + 1 < f->n && f->code[k + 1].op == MIR_JNZ && f->code[k + 1].a == in->d)
+            {
+                pending_label = (uint32_t)f->code[k + 1].imm;
+                pending_i = i;
+                pending_n = n;
+            }
+        }
+        // What this instruction writes is no longer known to be in range.
+        if (in->op == MIR_CALL || in->op == MIR_STORE)
+        {
+            for (int h = 0; h < nheld; h++)
+            {
+                if (in->op == MIR_CALL || (held[h].i < o->nslots && o->addressed[held[h].i]) ||
+                    held[h].i >= f->frame_size)
+                {
+                    held[h--] = held[--nheld];
+                }
+            }
+        }
+        for (int h = 0; h < nheld; h++)
+        {
+            if (kills(in, held[h].i) || (in->op == MIR_MOVE && held[h].i >= in->d && held[h].i < in->d + in->imm))
+            {
+                held[h--] = held[--nheld];
+            }
+        }
+    }
+    return changed;
+}
+
 // ---- the pass ---------------------------------------------------------------------------------
 
 void mir_optimize(MirFunc *f)
@@ -770,6 +911,10 @@ void mir_optimize(MirFunc *f)
         {
             top = (MirSlot)(in->a + in->imm);
         }
+        if (in->op == MIR_MOVE)
+        {
+            top = (MirSlot)((in->d > in->a ? in->d : in->a) + in->imm);
+        }
         nslots = top + 1 > nslots ? top + 1 : nslots;
     }
     if (nslots > (1u << 16) || f->n > (1u << 20))
@@ -784,6 +929,7 @@ void mir_optimize(MirFunc *f)
     {
         int changed = frame_fields(&o);
         mark_addressed(&o);
+        changed |= known_bounds(&o);
         changed |= fold(&o);
         compact(f);
         expand_writes(&o);

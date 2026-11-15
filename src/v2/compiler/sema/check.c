@@ -39,6 +39,11 @@ typedef struct
     uint8_t failed;                 // a type of its signature could not be computed: reported
 } Spec;
 #define SPEC_MAX 4096
+static int resolving_signature; // a parameter's or a result's type: `[N]T` may name a length to bind
+static NodeId length_name_node(const Unit *u, NodeId param);
+static NameId length_bound_name(const Token *param);
+static int is_length_param(SymId fn, int i, NameId name);
+static int is_function_param(SymId fn, int i);
 static Spec specs[SPEC_MAX]; // fixed: a binding points into it while a nested one is made
 static uint32_t nspecs;
 static const Spec *binding; // the specialization whose names resolve_type is reading under
@@ -79,6 +84,7 @@ typedef struct
     int returning_ref;     // checking `return &point{ ... }`: built in self's storage
     int local_ref;         // checking a local's `&point{ ... }`: built in this function's frame
     int fails;             // the function being checked says `, error`: an error may go up
+    SymId body_owner;      // the function whose body (its tokens and nodes) is being checked
     SymId lits[16];        // the literals being checked, outermost first, and each one's first local:
     int lit_base[16];      // a local below a literal's base is one it captures (context.md §60)
     int nlits;
@@ -773,6 +779,17 @@ int sema_typeof_desc(const Unit *u, NodeId call, uint64_t d[4])
 
 int sema_typeof_field(const Unit *u, NodeId sel, uint64_t *out)
 {
+    if (NODE(u, sel)->kind == AST_SELECTOR && text_is(TOK(u, NODE(u, sel)->tok), "len") && u->types &&
+        NODE(u, sel)->a < u->side_cap)
+    {
+        TypeId bt = u->types[NODE(u, sel)->a]; // `xs.len` of an array: its length, a constant
+        bt = type_kind(bt) == T_PTR && type_kind(type_ref(bt)) == T_ARRAY ? type_ref(bt) : bt;
+        if (type_kind(bt) == T_ARRAY)
+        {
+            *out = type_len(bt);
+            return 1;
+        }
+    }
     const AstNode *n = NODE(u, sel);
     if (n->kind != AST_SELECTOR || !u->refs)
     {
@@ -916,7 +933,7 @@ static int exact_value(const Unit *u, NodeId id, Exact *out)
             *out = (Exact)field;
             return 1;
         }
-        if (n->kind == AST_IDENT && sema_bound_value(u, id, &field)) // `i`, made known by a call
+        if ((n->kind == AST_IDENT || n->kind == AST_SELECTOR) && sema_bound_value(u, id, &field)) // `i`, made known by a call
         {
             *out = (Exact)(int64_t)field;
             return 1;
@@ -1166,13 +1183,17 @@ static TypeId resolve_type(Unit *u, NodeId tn, SymId owner, int loud)
                 known = init && exact_value(h, init, &len);
             }
         }
+        if (!known && resolving_signature && NODE(u, n->b)->kind == AST_SELECTOR)
+        {
+            return T_NONE; // `[xs.len]U` in a generic signature: each call binds it
+        }
         if (!known || len < 1 || len > (1 << 24))
         {
             if (loud)
             {
                 diag_at(u, NODE(u, n->b)->tok, "error",
-                        "an array's length is a number known now, from 1 to 16777216 (a literal or a "
-                        "module-level constant)");
+                        "an array's length is a number known now, from 1 to 16777216 (a literal, a "
+                        "module-level constant, or `xs.len` of a parameter `xs: []T`)");
             }
             return T_NONE;
         }
@@ -1311,11 +1332,28 @@ TypeId sema_bound_type(SymId fn, NameId name)
 int sema_bound_value(const Unit *u, NodeId id, uint64_t *out)
 {
     const AstNode *n = NODE(u, id);
-    if (!binding || n->kind != AST_IDENT || (u->refs && u->refs[id]))
+    if (!binding)
     {
         return 0;
     }
-    NameId name = token_name(TOK(u, n->tok));
+    NameId name;
+    if (n->kind == AST_SELECTOR) // `xs.len` of `xs: []T`: the length its argument has (context.md §64)
+    {
+        const AstNode *t = n->a ? NODE(u, n->a) : NULL;
+        if (!t || t->kind != AST_IDENT || TOK(u, n->tok)->len != 3 || memcmp(TSTART(TOK(u, n->tok)), "len", 3) != 0)
+        {
+            return 0;
+        }
+        name = length_bound_name(TOK(u, t->tok));
+    }
+    else if (n->kind != AST_IDENT || (u->refs && u->refs[id]))
+    {
+        return 0;
+    }
+    else
+    {
+        name = token_name(TOK(u, n->tok));
+    }
     for (uint32_t i = 0; i < binding->n; i++)
     {
         if (binding->is_value[i] && binding->names[i] == name)
@@ -1434,7 +1472,9 @@ static TypeId fn_ret_type(Unit *u, SymId fn)
         return t == T_INT_LIT ? T_INT : t == T_NONE ? T_VOID : t;
     }
     const Spec *old = bind_for(fn);
+    resolving_signature++;
     TypeId t = resolve_type(u, fn_ret_node(u, callable), SYM(fn)->owner, 0);
+    resolving_signature--;
     binding = old;
     return t;
 }
@@ -1463,6 +1503,33 @@ static TypeId param_type(Unit *u, NodeId param, SymId owner, int loud)
     if (!NODE(u, param)->a && u->types && param < u->side_cap && u->types[param]) // `x: x * 2`: given by the callee
     {
         return u->types[param];
+    }
+    NodeId slice = length_name_node(u, param);
+    if (slice) // `xs: []T`: an array, of the length the specialization was made for
+    {
+        NameId name = length_bound_name(TOK(u, NODE(u, param)->tok));
+        for (uint32_t b = 0; binding && b < binding->n; b++)
+        {
+            if (binding->is_value[b] == 1 && binding->names[b] == name)
+            {
+                TypeId elem = resolve_type(u, NODE(u, slice)->a, owner, loud);
+                if (elem == T_NONE)
+                {
+                    return T_NONE;
+                }
+                TypeId at = type_array(elem, (uint32_t)binding->values[b]);
+                return NODE(u, NODE(u, param)->a)->kind == AST_TYPE_PTR ? type_make(T_PTR, at) : at;
+            }
+        }
+        return T_NONE; // the generic itself: each call makes its own
+    }
+    if (NODE(u, param)->a && (NODE(u, NODE(u, param)->a)->kind == AST_TYPE_ARRAY ||
+                              NODE(u, NODE(u, param)->a)->kind == AST_TYPE_PTR))
+    {
+        resolving_signature++;
+        TypeId at = resolve_type(u, NODE(u, param)->a, owner, loud);
+        resolving_signature--;
+        return at;
     }
     if (NODE(u, param)->a && NODE(u, NODE(u, param)->a)->kind == AST_TYPE_FUNC)
     {
@@ -1832,6 +1899,14 @@ static NameKind find_name(Check *c, const Token *t, SymId *sym, TypeId *type)
             c->found_nonzero = c->locals[i].nonzero;
             c->found_call = c->locals[i].call;
             return NAME_LOCAL;
+        }
+    }
+    for (uint32_t b = 0; binding && b < binding->n; b++)
+    {
+        if (binding->is_value[b] == 1 && binding->names[b] == name)
+        {
+            *type = T_U64; // `N` of `xs: [N]T`: a number the specialization was made for
+            return NAME_BUILTIN;
         }
     }
     char first = TSTART(t)[0];
@@ -2776,6 +2851,104 @@ static int sig_exprs_name(SymId fn, NameId name)
 
 // The parameters of fn that its signature takes as types (index into its parameter list, after
 // self), and their names. 0: fn is not made once per type.
+// A type variable (context.md §67): a module-level `T: type` with no value (std/type.modal has
+// `T`), seen through an import too. A parameter typed by one makes its function generic, and the
+// call reads the type from the argument in that place: `map(xs: []T, ...)` with `[3]u16` is u16.
+static int type_variable(const Unit *u, NameId name, SymId owner)
+{
+    SymId s = scope_lookup_name(owner ? struct_scope(owner) : u->scope, name);
+    if (getenv("TVDBG")) fprintf(stderr, "tv %.*s s=%u kind=%d\n", (int)name_at(name)->len, name_at(name)->start, s, s ? SYM(s)->kind : -1);
+    for (int hops = 0; s && SYM(s)->kind == SYM_IMPORT && hops < 16; hops++)
+    {
+        s = module_binding_target(s); // (std's mod.modal binds it in turn)
+    }
+    if (getenv("TVDBG") && s) fprintf(stderr, "  -> s=%u kind=%d owner=%u flags=%d decl=%u\n", s, SYM(s)->kind, SYM(s)->owner, SYM(s)->flags, SYM(s)->decl);
+    if (!s || SYM(s)->kind != SYM_FIELD || SYM(s)->owner || (SYM(s)->flags & SYM_F_MUT) || !SYM(s)->decl)
+    {
+        return 0;
+    }
+    const Unit *home = &cx.units[SYM(s)->unit];
+    const AstNode *d = NODE(home, SYM(s)->decl);
+    if (d->kind != AST_FIELD_DECL || d->b || !d->a)
+    {
+        return 0;
+    }
+    const AstNode *t = NODE(home, d->a);
+    return t->kind == AST_TYPE_NAME && !t->aux && text_is(TOK(home, t->tok), "type");
+}
+
+// The type variables a type node names, added to names[k..] once each; the new count.
+static int type_vars_in(const Unit *u, NodeId t, SymId owner, NameId *names, int k, int depth)
+{
+    for (; t && depth < 32 && k < SPEC_MAX_BOUND; depth++)
+    {
+        const AstNode *n = NODE(u, t);
+        if (n->kind == AST_TYPE_FUNC)
+        {
+            for (NodeId q = n->a; q; q = NEXT(u, q))
+            {
+                k = type_vars_in(u, q, owner, names, k, depth + 1);
+            }
+            t = n->b;
+            continue;
+        }
+        if (n->kind == AST_TYPE_NAME)
+        {
+            NameId name = n->aux ? 0 : token_name(TOK(u, n->tok));
+            int seen = 0;
+            for (int j = 0; j < k && !seen; j++)
+            {
+                seen = names[j] == name;
+            }
+            if (name && !seen && prim_type(TOK(u, n->tok)) == T_NONE && type_variable(u, name, owner))
+            {
+                names[k++] = name;
+            }
+            return k;
+        }
+        if (n->kind != AST_TYPE_PTR && n->kind != AST_TYPE_ARRAY && n->kind != AST_TYPE_SLICE)
+        {
+            return k;
+        }
+        t = n->a;
+    }
+    return k;
+}
+
+// The type type variable `name` has in `at`, read where the parameter's type node `t` names it
+// (`[]T` against `[3]u16`: u16), or T_NONE.
+static TypeId infer_type_var(const Unit *u, NodeId t, TypeId at, NameId name)
+{
+    for (int depth = 0; t && at != T_NONE && depth < 32; depth++)
+    {
+        const AstNode *n = NODE(u, t);
+        if (n->kind == AST_TYPE_NAME)
+        {
+            return !n->aux && token_name(TOK(u, n->tok)) == name ? at : T_NONE;
+        }
+        if (n->kind == AST_TYPE_PTR && type_kind(at) == T_PTR)
+        {
+            at = type_ref(at);
+        }
+        else if ((n->kind == AST_TYPE_SLICE || n->kind == AST_TYPE_ARRAY) && type_kind(at) == T_ARRAY)
+        {
+            at = type_ref(at);
+        }
+        else if (n->kind == AST_TYPE_PTR && NODE(u, n->a)->kind == AST_TYPE_SLICE && type_kind(at) == T_ARRAY)
+        {
+            at = type_ref(at); // `out: *[]U` given `&out`: (a reference to) the array
+            t = NODE(u, n->a)->a;
+            continue;
+        }
+        else
+        {
+            return T_NONE;
+        }
+        t = n->a;
+    }
+    return T_NONE;
+}
+
 static int type_params(SymId fn, int *index, NameId *names)
 {
     SymId st = sema_std_type();
@@ -2807,6 +2980,17 @@ static int type_params(SymId fn, int *index, NameId *names)
             index[k] = i;
             names[k++] = name;
         }
+    }
+    // then the type variables its parameters name: no argument of their own (index -1), read
+    // from the arguments at each call
+    int before = k;
+    for (NodeId p = fn_params(u, fn); p && k < SPEC_MAX_BOUND; p = NEXT(u, p))
+    {
+        k = NODE(u, p)->a ? type_vars_in(u, NODE(u, p)->a, SYM(fn)->owner, names, k, 0) : k;
+    }
+    for (int j = before; j < k; j++)
+    {
+        index[j] = -1;
     }
     return k;
 }
@@ -2841,6 +3025,15 @@ static int sig_generic(SymId fn)
         if (pt && pt->kind == AST_TYPE_FUNC)
         {
             return 1; // a function given while compiling
+        }
+        if (length_name_node(u, p))
+        {
+            return 1; // `xs: [N]T`: a length given while compiling
+        }
+        NameId tv[1];
+        if (pt && type_vars_in(u, NODE(u, p)->a, SYM(fn)->owner, tv, 0, 0))
+        {
+            return 1; // `a: T` of std's `T: type`: a type read from the argument
         }
     }
     return 0;
@@ -2945,9 +3138,9 @@ static int passes_compile_time(const Unit *u, SymId fn, const Token *callee, con
             {
                 for (int j = ntypes; j < k; j++)
                 {
-                    if (index[j] == arg)
+                    if (index[j] == arg && !is_length_param(g, index[j], names[j]) && !is_function_param(g, index[j]))
                     {
-                        return 1;
+                        return 1; // (a length takes the argument's type, a function its own rule)
                     }
                 }
             }
@@ -2986,9 +3179,9 @@ static int tree_indexes(const Unit *u, NodeId id, NameId name, int list, int dep
                 }
                 for (int j = ntypes; j < k; j++)
                 {
-                    if (index[j] == arg)
+                    if (index[j] == arg && !is_length_param(g, index[j], names[j]) && !is_function_param(g, index[j]))
                     {
-                        return 1;
+                        return 1; // (a length takes the argument's type, a function its own rule)
                     }
                 }
             }
@@ -3015,6 +3208,10 @@ static int index_params(SymId fn, int *index, NameId *names, int k)
         {
             for (NodeId p = fn_params(u, fn); p && k + added < SPEC_MAX_BOUND; p = NEXT(u, p), i++)
             {
+                if (length_name_node(u, p))
+                {
+                    continue; // `xs: []T`: its length is bound, not xs
+                }
                 NameId name = token_name(TOK(u, NODE(u, p)->tok));
                 TypeId pt = NODE(u, p)->a ? resolve_type(u, NODE(u, p)->a, SYM(fn)->owner, 0) : T_NONE;
                 if (type_is_int(pt) && sig_exprs_name(fn, name))
@@ -3038,6 +3235,10 @@ static int index_params(SymId fn, int *index, NameId *names, int k)
         int added = 0, i = 0;
         for (NodeId p = fn_params(u, fn); body && p && k + added < SPEC_MAX_BOUND; p = NEXT(u, p), i++)
         {
+            if (length_name_node(u, p))
+            {
+                continue; // `xs: []T`: its length is bound, not xs
+            }
             NameId name = token_name(TOK(u, NODE(u, p)->tok));
             tree_fn = fn;
             int hit = tree_indexes(u, body, name, 0, 0);
@@ -3054,6 +3255,10 @@ static int index_params(SymId fn, int *index, NameId *names, int k)
     int added = 0, i = 0;
     for (NodeId p = fn_params(u, fn); p && k + added < SPEC_MAX_BOUND; p = NEXT(u, p), i++)
     {
+        if (length_name_node(u, p))
+        {
+            continue; // `xs: []T`: its length is bound, not xs
+        }
         NameId name = token_name(TOK(u, NODE(u, p)->tok));
         const Token *t = tv.data;
         int used = 0;
@@ -3123,6 +3328,82 @@ static int is_function_param(SymId fn, int i)
     return p && NODE(u, p)->a && NODE(u, NODE(u, p)->a)->kind == AST_TYPE_FUNC;
 }
 
+// The name a parameter's length is bound under, `xs.len`: no name a program can write, so it
+// never hides one.
+static NameId length_bound_name(const Token *param)
+{
+    char text[128];
+    size_t n = param->len < sizeof(text) - 4 ? param->len : sizeof(text) - 4;
+    memcpy(text, TSTART(param), n);
+    memcpy(text + n, ".len", 4);
+    NameId id = name_find(text, n + 4);
+    if (id)
+    {
+        return id;
+    }
+    char *kept = (char *)malloc(n + 4); // a name keeps its text: it lives as long as the names
+    memcpy(kept, text, n + 4);
+    return name_intern(kept, n + 4);
+}
+
+// A parameter whose length its argument gives, `xs: []T` (or `out: *[]T`) with T not u8 (a
+// `[]u8` is a string, its length read at run time): the argument is an array, its length known
+// while compiling, read as `xs.len`; the function is made once per length (context.md §64).
+// Its slice type node, or 0 when it is not one.
+static NodeId length_name_node(const Unit *u, NodeId param)
+{
+    NodeId t = NODE(u, param)->a;
+    if (t && NODE(u, t)->kind == AST_TYPE_PTR)
+    {
+        t = NODE(u, t)->a;
+    }
+    if (!t || NODE(u, t)->kind != AST_TYPE_SLICE)
+    {
+        return 0;
+    }
+    const AstNode *e = NODE(u, NODE(u, t)->a);
+    int is_u8 = e->kind == AST_TYPE_NAME && !e->aux && TOK(u, e->tok)->len == 2 && memcmp(TSTART(TOK(u, e->tok)), "u8", 2) == 0;
+    return is_u8 ? 0 : t;
+}
+
+static int length_params(SymId fn, int *index, NameId *names, int k)
+{
+    Unit *u = &cx.units[SYM(fn)->unit];
+    int added = 0, i = 0;
+    for (NodeId p = fn_params(u, fn); p && k + added < SPEC_MAX_BOUND; p = NEXT(u, p), i++)
+    {
+        NodeId len = length_name_node(u, p);
+        if (!len)
+        {
+            continue;
+        }
+        NameId name = length_bound_name(TOK(u, NODE(u, p)->tok));
+        int seen = 0;
+        for (int j = 0; j < k + added && !seen; j++)
+        {
+            seen = names[j] == name;
+        }
+        if (!seen)
+        {
+            index[k + added] = i;
+            names[k + added] = name;
+            added++;
+        }
+    }
+    return added;
+}
+
+static int is_length_param(SymId fn, int i, NameId name)
+{
+    Unit *u = &cx.units[SYM(fn)->unit];
+    NodeId p = fn_params(u, fn);
+    for (int j = 0; p && j < i; j++)
+    {
+        p = NEXT(u, p);
+    }
+    return p && length_name_node(u, p) && length_bound_name(TOK(u, NODE(u, p)->tok)) == name;
+}
+
 static int compile_params(SymId fn, int *index, NameId *names, int *types_count)
 {
     for (uint32_t g = 0; g < ngenerics; g++)
@@ -3141,6 +3422,7 @@ static int compile_params(SymId fn, int *index, NameId *names, int *types_count)
     {
         k += index_params(fn, index, names, k);
         k += function_params(fn, index, names, k);
+        k += length_params(fn, index, names, k);
     }
     if (k && ngenerics < GENERIC_MAX)
     {
@@ -3174,7 +3456,30 @@ static void check_spec(Spec *sp);
 
 // Is a specialization made for a function literal waiting? (Its literal lives in the body that
 // made it: it must be checked before that body is released.)
-static int literal_specs_waiting(void)
+static SymId *lit_owner;
+static size_t lit_owner_cap;
+
+static void lit_owner_set(SymId lit, SymId owner)
+{
+    if (lit >= lit_owner_cap)
+    {
+        size_t cap = lit_owner_cap ? lit_owner_cap : 256;
+        while (cap <= lit)
+        {
+            cap *= 2;
+        }
+        SymId *grown = (SymId *)realloc(lit_owner, cap * sizeof(SymId));
+        memset(grown + lit_owner_cap, 0, (cap - lit_owner_cap) * sizeof(SymId));
+        lit_owner = grown;
+        lit_owner_cap = cap;
+    }
+    lit_owner[lit] = owner;
+}
+
+// Is a specialization made for a literal of fn's body waiting? (It must be checked before that
+// body is released; one for a literal of another body waits for that one, so two bodies of one
+// file are never in memory together.)
+static int literal_specs_waiting(SymId fn)
 {
     for (uint32_t i = 0; i < nspecs; i++)
     {
@@ -3184,7 +3489,8 @@ static int literal_specs_waiting(void)
         }
         for (uint32_t k = 0; k < specs[i].n; k++)
         {
-            if (specs[i].is_value[k] == 2 && (SYM((SymId)specs[i].values[k])->flags & SYM_F_LITERAL))
+            SymId l = specs[i].is_value[k] == 2 ? (SymId)specs[i].values[k] : 0;
+            if (l && (SYM(l)->flags & SYM_F_LITERAL) && l < lit_owner_cap && lit_owner[l] == fn)
             {
                 return 1;
             }
@@ -3387,7 +3693,7 @@ static void spec_type_exprs(Check *caller, Spec *sp, uint32_t at)
 // The function given to parameter `pi` of fn (`function(T): U`): a function's name, or a literal.
 // A literal with a parameter of no type (`x: x * 2`) takes the signature's types, the type
 // parameters bound as this call binds them, and is checked now, where it is written.
-static SymId function_argument(Check *c, SymId fn, int pi, NodeId a, const NameId *names, const TypeId *types,
+static SymId function_argument(Check *c, SymId fn, int pi, NodeId a, const NameId *names, TypeId *types,
                                int ntypes)
 {
     Unit *u = c->u;
@@ -3473,6 +3779,18 @@ static SymId function_argument(Check *c, SymId fn, int pi, NodeId a, const NameI
         return 0;
     }
     TypeId gr = fn_ret_type(gh, given);
+    if (want_ret == T_NONE && ft->b) // a type variable its result names: the function's result gives it
+    {
+        for (int j = 0; j < ntypes; j++)
+        {
+            TypeId t = types[j] == T_NONE ? infer_type_var(home, ft->b, gr == T_INT_LIT ? T_INT : gr, names[j]) : T_NONE;
+            types[j] = t != T_NONE ? t : types[j];
+        }
+        binding = &tmp;
+        memcpy(tmp.types, types, (size_t)ntypes * sizeof(TypeId));
+        want_ret = resolve_type(home, ft->b, SYM(fn)->owner, 0);
+        binding = old;
+    }
     if (want_ret != T_VOID && !fits(gr, want_ret))
     {
         char x[64], y[64];
@@ -3503,6 +3821,21 @@ static SymId specialize(Check *c, SymId fn, NodeId args, uint32_t at)
         {
             continue; // a function: after the types (its literal is typed by them)
         }
+        if (is_length_param(fn, index[j], names[j])) // `xs: []T`: the argument's length
+        {
+            TypeId at = a ? check_expr(c, a) : T_NONE;
+            at = type_kind(at) == T_PTR ? type_ref(at) : at;
+            if (type_kind(at) != T_ARRAY)
+            {
+                int len;
+                const char *name = symbol_name(fn, &len);
+                diag_at(c->u, a ? NODE(c->u, a)->tok : at, "error", "'%.*s' takes an array here, whose length it reads",
+                        len, name);
+                return 0;
+            }
+            values[j] = type_len(at);
+            continue;
+        }
         uint64_t v;
         if (a)
         {
@@ -3532,14 +3865,47 @@ static SymId specialize(Check *c, SymId fn, NodeId args, uint32_t at)
         }
         values[j] = v;
     }
+    Unit *fhome = &cx.units[SYM(fn)->unit];
     for (int j = 0; j < ntypes; j++)
     {
+        types[j] = T_NONE;
+        if (index[j] < 0) // a type variable: read from every argument whose parameter names it
+        {
+            NodeId a = args, from = 0;
+            for (NodeId p = fn_params(fhome, fn); p && a; p = NEXT(fhome, p), a = NEXT(c->u, a))
+            {
+                if (!NODE(fhome, p)->a || NODE(fhome, NODE(fhome, p)->a)->kind == AST_TYPE_FUNC)
+                {
+                    continue; // a function: typed by the others, then its result gives one (below)
+                }
+                TypeId at = check_expr(c, a);
+                TypeId t = at == T_INT_LIT ? T_NONE : infer_type_var(fhome, NODE(fhome, p)->a, at, names[j]);
+                if (t == T_NONE)
+                {
+                    continue; // (an untyped literal takes the type the others give)
+                }
+                if (types[j] != T_NONE && types[j] != t)
+                {
+                    int len;
+                    char x[64], y[64];
+                    const char *name = symbol_name(fn, &len);
+                    const Name *nm = name_at(names[j]);
+                    diag_at(c->u, NODE(c->u, a)->tok, "error", "'%.*s': %.*s is %s here, but %s from an argument before",
+                            len, name, (int)nm->len, nm->start, type_str(t, x, sizeof(x)),
+                            type_str(types[j], y, sizeof(y)));
+                    (void)from;
+                    return 0;
+                }
+                types[j] = t;
+                from = a;
+            }
+            continue; // (one no argument gives: from a function's result, or an error below)
+        }
         NodeId a = args;
         for (int i = 0; a && i < index[j]; i++)
         {
             a = NEXT(c->u, a);
         }
-        types[j] = T_NONE;
         if (a)
         {
             check_expr(c, a);
@@ -3573,6 +3939,20 @@ static SymId specialize(Check *c, SymId fn, NodeId args, uint32_t at)
             return 0;
         }
         values[j] = given;
+    }
+    for (int j = 0; j < ntypes; j++)
+    {
+        if (types[j] == T_NONE) // a type variable no argument gave
+        {
+            int len;
+            const char *name = symbol_name(fn, &len);
+            const Name *nm = name_at(names[j]);
+            diag_at(c->u, at, "error",
+                    "'%.*s': no argument gives %.*s (an untyped number takes the type the others give): "
+                    "say it, `u64(1)`",
+                    len, name, (int)nm->len, nm->start);
+            return 0;
+        }
     }
     Spec *sp = NULL;
     for (uint32_t i = 0; i < nspecs && !sp; i++)
@@ -4096,6 +4476,11 @@ static TypeId check_selector(Check *c, NodeId id)
     TypeId base = (is_self_node(u, n->a) && c->has_self) ? set_type(c, n->a, self_type(c))
                                                          : check_expr(c, n->a);
     SymId s = struct_of(base);
+    if (text_is(name, "len") && (base == T_STR || type_kind(base) == T_ARRAY ||
+                                 (type_kind(base) == T_PTR && type_kind(type_ref(base)) == T_ARRAY)))
+    {
+        return T_U64; // every collection's length (an array's: a constant)
+    }
 
     if (s)
     {
@@ -4730,7 +5115,7 @@ static NodeId static_arm(Check *c, NodeId id, const TypeId *types, const NodeId 
             {
                 continue;
             }
-            if (!is_known[k] || types[k] == T_STR)
+            if (!is_known[k] || types[k] == T_STR || (pn->aux & PAT_COND))
             {
                 return 0;
             }
@@ -4861,6 +5246,12 @@ static TypeId check_error_match(Check *c, NodeId id)
             continue;
         }
         const AstNode *pn = NODE(u, pat);
+        if (pn->aux & PAT_COND)
+        {
+            diag_at(u, pn->tok, "error", "a condition is not a pattern of a call that can fail yet: take the "
+                                         "value (`u64: ...`) and test it inside the arm");
+            continue;
+        }
         if ((pn->aux & PAT_NAME) && pn->a && NODE(u, pn->a)->kind == AST_SELECTOR)
         {
             check_expr(c, pn->a); // `panic.division`
@@ -5049,6 +5440,18 @@ static TypeId check_match(Check *c, NodeId id)
             const AstNode *pn = NODE(u, pat);
             if (np >= ns || (pn->aux & PAT_ANY))
             {
+                continue;
+            }
+            if (pn->aux & PAT_COND)
+            {
+                char x[64];
+                TypeId ct = check_expr(c, pn->a);
+                if (ct != T_BOOL && ct != T_NONE)
+                {
+                    diag_at(u, pn->tok, "error", "a condition as a pattern is a bool; this one is %s",
+                            type_str(ct, x, sizeof(x)));
+                }
+                runtime++; // tested when the program runs, in its place: it takes no values the compiler counts
                 continue;
             }
             if (pn->aux & PAT_NAME)
@@ -5473,6 +5876,11 @@ static void check_callable(Check *c, NodeId fn, SymId owner, SymId sym)
     }
     c->literal = kind == AST_FN_LIT ? sym : 0;
     c->fn_base = c->nlocals;
+    SymId saved_body_owner = c->body_owner;
+    if (kind != AST_FN_LIT)
+    {
+        c->body_owner = sym;
+    }
     int pushed_lit = kind == AST_FN_LIT && c->nlits < 16;
     if (pushed_lit)
     {
@@ -5565,7 +5973,8 @@ static void check_callable(Check *c, NodeId fn, SymId owner, SymId sym)
             codegen_function(u, sym);
         }
     }
-    if (kind != AST_FN_LIT && !capture_mir && literal_specs_waiting())
+    c->body_owner = saved_body_owner;
+    if (kind != AST_FN_LIT && !capture_mir && literal_specs_waiting(sym))
     {
         // a specialization made for a literal of this body (`apply(u64, 5, x: x * limit)`) is
         // checked now, while the literal's nodes are here: once the body is released they are gone
@@ -5734,6 +6143,14 @@ static TypeId check_expr(Check *c, NodeId id)
         if (kind == NAME_LOCAL && c->found_nonzero)
         {
             NODE(u, id)->aux |= IDENT_NONZERO; // the arm's test proved it: no divisor guard
+        }
+        if (kind == NAME_LOCAL)
+        {
+            Local *l = local_named(c, id);
+            if (l && l->param && !l->mut && !l->frame)
+            {
+                NODE(u, id)->aux |= IDENT_PARAM; // what the caller gave, unchanged (a tail call passes it on)
+            }
         }
         if (kind == NAME_MISSING)
         {
@@ -6221,6 +6638,7 @@ static TypeId check_expr(Check *c, NodeId id)
             break;
         }
         SymId lit = symbol_new(u, SYM_METHOD, SYM_F_LITERAL, name_tok, 0, id);
+        lit_owner_set(lit, c->body_owner); // the body that holds it: released after its specializations
         u->refs[id] = lit;
         type = type_make(T_FUNC, lit);
         int bare = 0; // a pattern alone as a parameter: typed by the first call, checked then
@@ -6807,7 +7225,7 @@ int sema_params_overlap(Unit *u, NodeId a, NodeId b, SymId owner)
 int sema_arm_pattern(Unit *u, NodeId pat, TypeId type, Pattern *out)
 {
     const AstNode *pn = NODE(u, pat);
-    if (pn->kind != AST_PATTERN || (pn->aux & PAT_ANY))
+    if (pn->kind != AST_PATTERN || (pn->aux & (PAT_ANY | PAT_COND)))
     {
         return 0;
     }
@@ -6821,6 +7239,12 @@ int sema_arm_pattern(Unit *u, NodeId pat, TypeId type, Pattern *out)
         return ends_pattern(u, pn, type, out, 0);
     }
     return pattern_from(u, pn, type, out, 0);
+}
+
+NodeId sema_arm_cond(Unit *u, NodeId pat)
+{
+    const AstNode *pn = NODE(u, pat);
+    return pn->kind == AST_PATTERN && (pn->aux & PAT_COND) ? pn->a : 0;
 }
 
 NodeId sema_arm_name(Unit *u, NodeId pat, TypeId type)
@@ -7216,7 +7640,7 @@ static uint32_t check_order(Unit *u, NodeId **out)
     return o.nout;
 }
 
-void sema_check(Unit *u)
+void sema_check_decls(Unit *u)
 {
     // One type and one resolved declaration per node (8 bytes), which is all a backend
     // reads. They cover the declarations now and grow to fit the largest body later.
@@ -7227,38 +7651,45 @@ void sema_check(Unit *u)
     memset(&c, 0, offsetof(Check, locals)); // the locals array needs no clearing
     c.u = u;
     c.implicit_self = domain_config_bool(u->domain, "implicit_self", 0);
-
-    for (int functions = 0; functions < 2; functions++)
+    for (NodeId d = NODE(u, u->root)->a; d; d = NEXT(u, d))
     {
-        if (functions)
-        {
-            if (!u->errors)
-            {
-                comptime_unit(u); // its declarations are checked: the compiler computes what it must
-            }
-            codegen_begin(u); // everything a signature can mention is checked by now
-        }
-        if (!functions)
-        {
-            for (NodeId d = NODE(u, u->root)->a; d; d = NEXT(u, d))
-            {
-                c.nlocals = 0;
-                c.block_base = 0;
-                check_decl(&c, d, u->scope, 0, functions);
-            }
-            continue;
-        }
-        NodeId *order;
-        uint32_t n = check_order(u, &order); // the bodies: callees first
-        for (uint32_t i = 0; i < n; i++)
-        {
-            c.nlocals = 0;
-            c.block_base = 0;
-            check_decl(&c, order[i], u->scope, 0, functions);
-            sema_drain_specs(); // the specializations its body made, now that it is done
-        }
-        free(order);
+        c.nlocals = 0;
+        c.block_base = 0;
+        check_decl(&c, d, u->scope, 0, 0);
     }
+}
+
+void sema_check_bodies(Unit *u)
+{
+    Check c;
+    memset(&c, 0, offsetof(Check, locals));
+    c.u = u;
+    c.implicit_self = domain_config_bool(u->domain, "implicit_self", 0);
+    if (!u->valued)
+    {
+        u->valued = 1;
+        if (!u->errors)
+        {
+            comptime_unit(u); // its declarations are checked: the compiler computes what it must
+        }
+    }
+    codegen_begin(u); // everything a signature can mention is checked by now
+    NodeId *order;
+    uint32_t n = check_order(u, &order); // the bodies: callees first
+    for (uint32_t i = 0; i < n; i++)
+    {
+        c.nlocals = 0;
+        c.block_base = 0;
+        check_decl(&c, order[i], u->scope, 0, 1);
+        sema_drain_specs(); // the specializations its body made, now that it is done
+    }
+    free(order);
+}
+
+void sema_check(Unit *u)
+{
+    sema_check_decls(u);
+    sema_check_bodies(u);
 }
 
 // The compiler is about to run fn: its body is checked again, without reports (it is checked

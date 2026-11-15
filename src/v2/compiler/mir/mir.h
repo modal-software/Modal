@@ -55,12 +55,17 @@ typedef enum
                 // which self_loops makes a loop)
     MIR_GADDR,  // d = the address of module-level slot imm: data that holds addresses (descriptors)
     MIR_DESC,   // d = the address of the descriptor of type imm, in the compiler (comptime.c)
+    MIR_MOVE,   // slots d .. d + imm - 1 = slots a .. a + imm - 1 (as memmove: they may overlap);
+                // an array or a struct of many slots, in one instruction (copy_slots)
     MIR__COUNT,
 } MirOp;
 
 // LOAD / STORE `sub`: a device register (a field placed with `@`). It is done exactly as written,
 // in its order: never forwarded, merged or removed, and nothing is moved across it.
 #define MIR_MEM_DEVICE 1
+
+// Above this many slots a copy is one MIR_MOVE (a block copy) instead of a MIR_COPY per slot.
+#define MOVE_MIN 16
 
 // MIR_TRAP `sub`: one part of a message (`trap(a, b)` writes a, then b, then ends). It ends no
 // block; only the final trap (sub 0) does.

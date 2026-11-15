@@ -1237,40 +1237,136 @@ void module_body_nodes(Unit *u, NodeId from)
     module_check_paths(u, from, (NodeId)u->nodes.size);
 }
 
+// Files in checking order: the ones a file imports before it (a depth-first walk over the imports
+// of its declarations; a cycle keeps the order files were loaded in).
+static void unit_order(uint16_t i, uint16_t n, uint8_t *state, uint16_t *order, uint16_t *norder)
+{
+    if (state[i])
+    {
+        return;
+    }
+    state[i] = 1;
+    const Unit *u = &cx.units[i];
+    if (!u->broken && u->root)
+    {
+        for (NodeId d = NODE(u, u->root)->a; d; d = NEXT(u, d))
+        {
+            const AstNode *dn = NODE(u, d);
+            NodeId imp = dn->kind == AST_DEFINE ? ast_import_root(u, dn->a) : 0;
+            uint16_t to = imp && NODE(u, imp)->aux ? (uint16_t)(NODE(u, imp)->aux - 1) : (uint16_t)0xffff;
+            if (to < n && to != i)
+            {
+                unit_order(to, n, state, order, norder);
+            }
+        }
+    }
+    order[(*norder)++] = i;
+}
+
 void modules_link(void)
 {
     sema_kinds_reset();
     comptime_reset();
     link_new_units();
 
-    // Each file: the module paths of its declarations, then its bodies one at a time.
-    for (uint16_t i = 0; i < cx.nunits; i++)
+    // Every file's declarations first (load order), the entry's module values and the backend's
+    // start, then the bodies: a file a file imports before it, so a function of another file is
+    // checked (what it can raise is known, it is lowered: inlined if small) before its callers
+    // (context.md §63). Files a body brings in while checked go after, as they come.
+    uint16_t first = cx.nunits;
+    uint8_t *skip = (uint8_t *)calloc(first + 1, 1);
+    uint16_t *order = (uint16_t *)malloc((first + 1) * sizeof(uint16_t));
+    uint8_t *state = (uint8_t *)calloc(first + 1, 1);
+    uint32_t *decl_names = (uint32_t *)calloc(first + 1, sizeof(uint32_t)); // what its declarations
+    uint32_t *decl_calls = (uint32_t *)calloc(first + 1, sizeof(uint32_t)); // resolved (the cache's count)
+    for (uint16_t i = 0; i < first; i++)
     {
         Unit *u = &cx.units[i];
         if (u->broken)
         {
             sema_syntax_only(u); // still report the syntax errors inside its bodies
+            skip[i] = 1;
             continue;
         }
         uint64_t t = clock_ns();
         module_check_paths(u, 1, (NodeId)u->nodes.size);
         t = phase_end(PHASE_LINK, t);
-
         if (cache_lookup(u))
         {
             phase_end(PHASE_CHECK, t);
-            continue; // unchanged, and so were the declarations it can see: checked before
+            skip[i] = 1; // unchanged, and so were the declarations it can see: checked before
+            continue;
         }
-
+        uint32_t n0 = cx.names_resolved, c0 = cx.calls_resolved;
+        sema_check_decls(u);
+        decl_names[i] = cx.names_resolved - n0;
+        decl_calls[i] = cx.calls_resolved - c0;
+        phase_end(PHASE_CHECK, t);
+    }
+    if (first && !skip[0])
+    {
+        Unit *entry = &cx.units[0];
+        entry->valued = 1;
+        if (!entry->errors)
+        {
+            comptime_unit(entry); // C writes its module values at the start
+        }
+        codegen_begin(entry);
+    }
+    uint16_t norder = 0;
+    for (uint16_t i = 0; i < first; i++)
+    {
+        unit_order(i, first, state, order, &norder);
+    }
+    for (uint16_t k = 0; k < norder; k++)
+    {
+        uint16_t i = order[k];
+        if (skip[i])
+        {
+            continue;
+        }
+        Unit *u = &cx.units[i];
+        uint64_t t = clock_ns();
+        uint64_t inside = cx.phase_ns[PHASE_PARSE] + cx.phase_ns[PHASE_EMIT];
+        uint32_t names = cx.names_resolved, calls = cx.calls_resolved;
+        uint16_t units = cx.nunits;
+        sema_check_bodies(u);
+        if (!u->errors && cx.nunits == units) // clean, and no body brought in another file
+        {
+            cache_record(u, cx.names_resolved - names + decl_names[i], cx.calls_resolved - calls + decl_calls[i]);
+        }
+        cx.phase_ns[PHASE_CHECK] +=
+            clock_ns() - t - (cx.phase_ns[PHASE_PARSE] + cx.phase_ns[PHASE_EMIT] - inside);
+    }
+    free(skip);
+    free(order);
+    free(state);
+    free(decl_names);
+    free(decl_calls);
+    for (uint16_t i = first; i < cx.nunits; i++) // brought in by a body: in turn
+    {
+        Unit *u = &cx.units[i];
+        if (u->broken)
+        {
+            sema_syntax_only(u);
+            continue;
+        }
+        uint64_t t = clock_ns();
+        module_check_paths(u, 1, (NodeId)u->nodes.size);
+        t = phase_end(PHASE_LINK, t);
+        if (cache_lookup(u))
+        {
+            phase_end(PHASE_CHECK, t);
+            continue;
+        }
         uint64_t inside = cx.phase_ns[PHASE_PARSE] + cx.phase_ns[PHASE_EMIT];
         uint32_t names = cx.names_resolved, calls = cx.calls_resolved;
         uint16_t units = cx.nunits;
         sema_check(u);
-        if (!u->errors && cx.nunits == units) // clean, and no body brought in another file
+        if (!u->errors && cx.nunits == units)
         {
             cache_record(u, cx.names_resolved - names, cx.calls_resolved - calls);
         }
-        // bodies parsed and emitted during the check are accounted to their own phases
         cx.phase_ns[PHASE_CHECK] +=
             clock_ns() - t - (cx.phase_ns[PHASE_PARSE] + cx.phase_ns[PHASE_EMIT] - inside);
     }
