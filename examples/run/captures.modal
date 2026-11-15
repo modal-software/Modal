@@ -27,13 +27,15 @@ point: struct { i32 x, i32 y }
 main(): u8 {
     u64 base = 100
     p := point{ x: 3, y: 4 }
+
     outer := (a: u64): u64 {
         inner := (b: u64): b + base
         return inner(a) + 1
     }
     print(outer(5))
-    sum := (): i32 { return p.x + p.y }
-    print(sum())
+
+    sum := (): i32 (p.x + p.y)
+    print("aa:", sum())
     deep := (k: i32): i32 {
         mid := (m: i32): i32 {
             low := (z: i32): z * p.x
