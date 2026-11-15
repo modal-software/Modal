@@ -79,6 +79,9 @@ typedef struct
     int returning_ref;     // checking `return &point{ ... }`: built in self's storage
     int local_ref;         // checking a local's `&point{ ... }`: built in this function's frame
     int fails;             // the function being checked says `, error`: an error may go up
+    SymId lits[16];        // the literals being checked, outermost first, and each one's first local:
+    int lit_base[16];      // a local below a literal's base is one it captures (context.md §60)
+    int nlits;
     NodeId handled;        // the call `n, e := f()` binds: its error is the second name's
     NodeId guard;          // and that call, a boundary: its panics come back to it
     Local locals[MAX_LOCALS];
@@ -337,6 +340,29 @@ int sema_error_set(SymId fn, uint8_t *panics, const uint64_t **ids, uint32_t *n,
     *ids = buf;
     *any = (cl_flags[fn] & EF_ANY) != 0;
     return (cl_flags[fn] & 4) != 0;
+}
+
+// Every error a program can name: std's panics and the program's own (`bad_input: error`), for
+// print(e). Returns how many (at most cap).
+uint32_t sema_errors_list(uint64_t *ids, uint32_t cap)
+{
+    uint32_t n = 0;
+    for (uint64_t k = PANIC_DIVISION; k <= PANIC_STACK && n < cap; k++)
+    {
+        ids[n++] = k;
+    }
+    for (SymId s = 1; s < cx.syms.size && n < cap; s++)
+    {
+        uint64_t v;
+        if (SYM(s)->kind == SYM_CONST && !SYM(s)->owner && SYM(s)->decl &&
+            NODE(&cx.units[SYM(s)->unit], SYM(s)->decl)->kind == AST_FIELD_DECL &&
+            sema_value_type(&cx.units[SYM(s)->unit], s) == T_ERROR && sema_comptime_value(s, &v) &&
+            v >= ERROR_FIRST)
+        {
+            ids[n++] = v;
+        }
+    }
+    return n;
 }
 
 // An error's name, for a message or --sig: `bad_input`, or `panic.division`.
@@ -1244,6 +1270,44 @@ static const Spec *spec_of(SymId fn)
     return NULL;
 }
 
+// The functions a specialization was made for (its `function(...)` parameters), in order.
+uint32_t sema_spec_functions(SymId fn, SymId *out, uint32_t cap)
+{
+    const Spec *sp = fn ? spec_of(fn) : NULL;
+    uint32_t n = 0;
+    for (uint32_t i = 0; sp && i < sp->n && n < cap; i++)
+    {
+        if (sp->is_value[i] == 2)
+        {
+            out[n++] = (SymId)sp->values[i];
+        }
+    }
+    return n;
+}
+
+// The name a specialization keeps a capture of literal `lit` under: its own, so no local of the
+// specialization meets it.
+NameId sema_capture_name(SymId lit, NameId name)
+{
+    const Name *nm = name_at(name);
+    char *text = (char *)arena_alloc(nm->len + 24);
+    int n = snprintf(text, nm->len + 24, "m_cap%u_%.*s", (unsigned)lit, (int)nm->len, nm->start);
+    return name_intern(text, (size_t)n);
+}
+
+TypeId sema_bound_type(SymId fn, NameId name)
+{
+    const Spec *sp = fn ? spec_of(fn) : NULL;
+    for (uint32_t i = 0; sp && i < sp->n; i++)
+    {
+        if (!sp->is_value[i] && sp->names[i] == name)
+        {
+            return sp->types[i];
+        }
+    }
+    return T_NONE;
+}
+
 int sema_bound_value(const Unit *u, NodeId id, uint64_t *out)
 {
     const AstNode *n = NODE(u, id);
@@ -1581,12 +1645,13 @@ static void note_capture(Check *c, const Token *t, const Local *l)
         }
     }
     TypeId ty = l->type;
-    int one = type_is_int(ty) || ty == T_BOOL || ty == T_STR || ty == T_ERROR || type_kind(ty) == T_PTR;
+    int one = type_is_int(ty) || ty == T_BOOL || ty == T_STR || ty == T_ERROR || type_kind(ty) == T_PTR ||
+              type_kind(ty) == T_STRUCT; // a struct: its value, copied at each call
     if (!one)
     {
         char x[64];
-        diag_tok(c->u, t, "error", "a literal reads '%.*s' of the function around it, a %s: only a number, a "
-                 "bool, a []u8, an error or a reference can be read so yet (pass it as a parameter)",
+        diag_tok(c->u, t, "error", "a literal reads '%.*s' of the function around it, a %s: a number, a bool, a "
+                 "[]u8, an error, a reference or a struct can be read so, an array not yet (pass it as a parameter)",
                  t->len, TSTART(t), type_str(ty, x, sizeof(x)));
         return;
     }
@@ -1749,8 +1814,19 @@ static NameKind find_name(Check *c, const Token *t, SymId *sym, TypeId *type)
         {
             if (c->literal && i < c->fn_base)
             {
-                SYM(c->literal)->flags |= SYM_F_CAPTURES; // a closure
-                note_capture(c, t, &c->locals[i]);
+                // a closure: every literal between this one and the local's own function reads it
+                // (an outer one passes it on to the inner one's calls)
+                SymId inner = c->literal;
+                for (int j = 0; j < c->nlits; j++)
+                {
+                    if (i < c->lit_base[j])
+                    {
+                        c->literal = c->lits[j];
+                        SYM(c->lits[j])->flags |= SYM_F_CAPTURES;
+                        note_capture(c, t, &c->locals[i]);
+                    }
+                }
+                c->literal = inner;
             }
             *type = c->locals[i].type;
             c->found_nonzero = c->locals[i].nonzero;
@@ -3096,6 +3172,27 @@ static uint32_t generic_body_token(SymId fn)
 
 static void check_spec(Spec *sp);
 
+// Is a specialization made for a function literal waiting? (Its literal lives in the body that
+// made it: it must be checked before that body is released.)
+static int literal_specs_waiting(void)
+{
+    for (uint32_t i = 0; i < nspecs; i++)
+    {
+        if (!specs[i].queued || specs[i].generated || specs[i].failed)
+        {
+            continue;
+        }
+        for (uint32_t k = 0; k < specs[i].n; k++)
+        {
+            if (specs[i].is_value[k] == 2 && (SYM((SymId)specs[i].values[k])->flags & SYM_F_LITERAL))
+            {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 // The specializations made while checking, each checked (and generated) in its turn.
 void sema_drain_specs(void)
 {
@@ -3332,16 +3429,8 @@ static SymId function_argument(Check *c, SymId fn, int pi, NodeId a, const NameI
         }
         TypeId t = check_expr(c, a);
         given = type_kind(t) == T_FUNC ? type_ref(t) : 0;
-        Capture caps[1];
-        if (given && sema_captures(given, caps, 1))
-        {
-            const Name *nm = name_at(caps[0].name);
-            diag_at(u, an->tok, "error",
-                    "a literal given to '%.*s' reads '%.*s' of the function around it: that is not supported yet "
-                    "(give it as an argument)",
-                    len, name, (int)nm->len, nm->start);
-            return 0;
-        }
+        // (a literal that reads locals of the caller: the specialization takes them, see
+        // sema_spec_functions; every call to it passes them)
     }
     else if (an->kind == AST_IDENT)
     {
@@ -3532,10 +3621,12 @@ static SymId specialize(Check *c, SymId fn, NodeId args, uint32_t at)
         sp->fn = symbol_new(home, SYM_METHOD, SYM(fn)->flags, SYM(fn)->tok, SYM(fn)->owner, SYM(fn)->decl);
     }
     uint32_t at_index = (uint32_t)(sp - specs);
-    if (!specs[at_index].generated && !specs[at_index].queued)
+    if (!specs[at_index].generated && !specs[at_index].queued && !capture_mir)
     {
         // checked in its turn, when no body is being checked (sema_drain_specs): a body checked
         // inside another would need room for both. The backend declares it now (C: a prototype).
+        // (One made while a body is checked again for the compiler is for the compiler only: it
+        // lowers it when it runs it, and the program has the one made in the body's own turn.)
         specs[at_index].queued = 1;
         codegen_declare(specs[at_index].fn);
     }
@@ -5382,6 +5473,12 @@ static void check_callable(Check *c, NodeId fn, SymId owner, SymId sym)
     }
     c->literal = kind == AST_FN_LIT ? sym : 0;
     c->fn_base = c->nlocals;
+    int pushed_lit = kind == AST_FN_LIT && c->nlits < 16;
+    if (pushed_lit)
+    {
+        c->lits[c->nlits] = sym;
+        c->lit_base[c->nlits++] = c->nlocals;
+    }
 
     c->owner = owner;
     c->has_self = (flags & AST_F_SELF) ? 1 : (kind == AST_FN_LIT && saved_self);
@@ -5443,6 +5540,10 @@ static void check_callable(Check *c, NodeId fn, SymId owner, SymId sym)
     }
 
     c->literal = saved_literal;
+    if (pushed_lit)
+    {
+        c->nlits--;
+    }
     c->fn = saved_fn;
     c->fn_base = saved_fn_base;
     c->owner = saved_owner;
@@ -5463,6 +5564,12 @@ static void check_callable(Check *c, NodeId fn, SymId owner, SymId sym)
         {
             codegen_function(u, sym);
         }
+    }
+    if (kind != AST_FN_LIT && !capture_mir && literal_specs_waiting())
+    {
+        // a specialization made for a literal of this body (`apply(u64, 5, x: x * limit)`) is
+        // checked now, while the literal's nodes are here: once the body is released they are gone
+        sema_drain_specs();
     }
     if (flags & AST_F_LAZY)
     {

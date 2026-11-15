@@ -449,6 +449,9 @@ int comptime_fold_notes(SymId fn, uint32_t *budget);
 int sema_is_any(SymId strct);
 int sema_is_generic(SymId fn);   // made once per type (docs/comptime.md §3.2): never generated itself
 int sema_spec_index(SymId fn);   // a specialization's number (1 on), or 0
+TypeId sema_bound_type(SymId fn, NameId name); // in specialization fn, the type `name: type` is bound to (or T_NONE)
+uint32_t sema_spec_functions(SymId fn, SymId *out, uint32_t cap); // the functions a specialization is for
+NameId sema_capture_name(SymId lit, NameId name); // a specialization's own name for a capture of lit
 void sema_drain_specs(void);     // check the specializations waiting for their turn
 int sema_capturing(void);        // lowering a function for the compiler to run (comptime.c)
 int comptime_type_value(Unit *u, NodeId expr, TypeId *out); // the type a `type` value names, now
@@ -555,6 +558,7 @@ int sema_fn_fails(SymId fn); // the result says `, error`
 // it reaches was checked (the set is whole).
 int sema_error_set(SymId fn, uint8_t *panics, const uint64_t **ids, uint32_t *n, int *any);
 int sema_error_name(uint64_t id, char *buf, size_t cap); // `bad_input`, `panic.division`
+uint32_t sema_errors_list(uint64_t *ids, uint32_t cap);  // every error the program can name (print(e))
 void sema_errors_finish(void); // every body is checked: `if e` on a call's error against its set
 // A function literal's captures (context.md §60): locals of the function around it that it reads,
 // passed by every call after its declared arguments.

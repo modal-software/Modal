@@ -884,6 +884,44 @@ static void emit_output(Emit *e, NodeId args, int newline, SymId sink)
             PUT(e, ")), ");
             continue;
         }
+        if (t == T_ERROR) // print(e): its name, or `error N`
+        {
+            static uint64_t ids[512];
+            uint32_t ne = sema_errors_list(ids, 512);
+            char line[160], var[32];
+            snprintf(var, sizeof(var), "m_e%u", (unsigned)a);
+            PUT(e, "({ uint64_t ");
+            put(e, var);
+            PUT(e, " = ");
+            emit_expr(e, a);
+            PUT(e, "; ");
+            for (uint32_t i = 0; i <= ne; i++)
+            {
+                uint64_t id = i ? ids[i - 1] : 0;
+                char name[80];
+                if (id)
+                {
+                    sema_error_name(id, name, sizeof(name));
+                }
+                else
+                {
+                    snprintf(name, sizeof(name), "nil");
+                }
+                snprintf(line, sizeof(line), "if (%s == %lluull) ", var, (unsigned long long)id);
+                put(e, line);
+                OPEN("str");
+                PUT(e, "M_STR(");
+                put_c_bytes(e, (const uint8_t *)name, strlen(name));
+                PUT(e, ")); else ");
+            }
+            PUT(e, "{ ");
+            OPEN("str");
+            PUT(e, "M_STR(\"error \")); ");
+            OPEN("uint");
+            put(e, var);
+            PUT(e, "); } (void)0; }), ");
+            continue;
+        }
         if (t == T_STR)
         {
             OPEN("str");
@@ -1084,19 +1122,29 @@ static void emit_call(Emit *e, NodeId id)
         out_fn_name(e, fn);
         PUT(e, "(");
         Unit *home = &cx.units[SYM(fn)->unit];
-        int k = SYM(fn)->owner ? 1 : 0;
-        for (NodeId p = sema_fn_params(home, fn); p; p = NEXT(home, p))
+        int i = 0, first = 1;
+        char num[24];
+        if (SYM(fn)->owner)
         {
-            k++;
+            PUT(e, "v_");
+            out_tok(e, callee->tok);
+            PUT(e, "__b0");
+            first = 0;
+            i = 1;
         }
-        for (int i = 0; i < k; i++)
+        for (NodeId p = sema_fn_params(home, fn); p; p = NEXT(home, p), i++)
         {
-            char num[24];
-            put(e, i ? ", " : "");
+            if (type_kind(sema_param_type(home, fn, p)) == T_FUNC ||
+                sema_bound_type(fn, token_name(TOK(home, NODE(home, p)->tok))) != T_NONE)
+            {
+                continue; // known while compiling: not passed
+            }
+            put(e, first ? "" : ", ");
             PUT(e, "v_");
             out_tok(e, callee->tok);
             snprintf(num, sizeof(num), "__b%d", i);
             put(e, num);
+            first = 0;
         }
         PUT(e, ")");
         return;
@@ -1144,22 +1192,46 @@ static void emit_call(Emit *e, NodeId id)
     NodeId param = sema_fn_params(home, fn);
     for (NodeId a = n->b; a && param; a = NEXT(u, a), param = NEXT(home, param))
     {
-        if (type_kind(sema_param_type(home, fn, param)) == T_FUNC)
+        if (type_kind(sema_param_type(home, fn, param)) == T_FUNC ||
+            sema_bound_type(fn, token_name(TOK(home, NODE(home, param)->tok))) != T_NONE)
         {
-            continue; // the function given: the specialization names it
+            continue; // the function given, or the type a specialization is for: it names them itself
         }
         put(e, first ? "" : ", ");
         emit_as(e, a, sema_param_type(home, fn, param));
         first = 0;
     }
-    Capture caps[64]; // a literal's captures: the caller's locals of those names
-    uint32_t nc = sema_captures(fn, caps, 64);
-    for (uint32_t i = 0; i < nc; i++)
     {
-        const Name *nm = name_at(caps[i].name);
-        put(e, first ? "v_" : ", v_");
-        put_n(e, nm->start, nm->len);
-        first = 0;
+        // a literal's captures: the caller's locals of those names (in a specialization made for
+        // that literal, its own copies); then those of the literals a specialization is for
+        Capture caps[64];
+        SymId mine[16];
+        uint32_t nm_ = e->fn ? sema_spec_functions(e->fn, mine, 16) : 0;
+        SymId lits[17];
+        uint32_t nl = 0;
+        lits[nl++] = fn;
+        SymId given[16];
+        uint32_t ng = sema_spec_functions(fn, given, 16);
+        for (uint32_t g = 0; g < ng && nl < 17; g++)
+        {
+            lits[nl++] = given[g];
+        }
+        for (uint32_t l = 0; l < nl; l++)
+        {
+            int kept = 0;
+            for (uint32_t m = 0; m < nm_ && !kept; m++)
+            {
+                kept = mine[m] == lits[l];
+            }
+            uint32_t nc = sema_captures(lits[l], caps, 64);
+            for (uint32_t i = 0; i < nc; i++)
+            {
+                const Name *nm = name_at(kept ? sema_capture_name(lits[l], caps[i].name) : caps[i].name);
+                put(e, first ? "v_" : ", v_");
+                put_n(e, nm->start, nm->len);
+                first = 0;
+            }
+        }
     }
     PUT(e, ")");
     if (wrap)
@@ -1273,6 +1345,10 @@ static void emit_bound_args(Emit *e, NodeId define)
     for (NodeId a = call->b; a && param; a = NEXT(u, a), param = NEXT(home, param), i++)
     {
         TypeId pt = sema_param_type(home, fn, param);
+        if (type_kind(pt) == T_FUNC || sema_bound_type(fn, token_name(TOK(home, NODE(home, param)->tok))) != T_NONE)
+        {
+            continue; // known while compiling: not passed
+        }
         out_indent(e);
         out_type(e, pt, n->tok);
         PUT(e, " v_");
@@ -1791,6 +1867,10 @@ static void emit_expr(Emit *e, NodeId id)
         {
             PUT(e, "0"); // no reference, or no error
         }
+        else if (!u->refs[id] && e->fn && sema_bound_type(e->fn, token_name(TOK(u, n->tok))) != T_NONE)
+        {
+            out_desc_value(e, sema_bound_type(e->fn, token_name(TOK(u, n->tok)))); // `T`, as this one is for
+        }
         else
         {
             PUT(e, "v_");
@@ -1977,6 +2057,13 @@ static void emit_expr(Emit *e, NodeId id)
             break; // `util.limit`, an unsized constant of another module
         }
         uint64_t known;
+        if (member && SYM(member)->kind == SYM_CONST && u->types[id] == T_ERROR && sema_comptime_value(member, &known))
+        {
+            char num[32]; // `panic.index`: a module's error, its number
+            snprintf(num, sizeof(num), "%lluull", (unsigned long long)known);
+            put(e, num);
+            break;
+        }
         if (sema_typeof_field(u, id, &known)) // `typeof(point).size`
         {
             char num[32];
@@ -2110,6 +2197,18 @@ static int tail_call(Emit *e, NodeId id)
     {
         return 0; // a literal's captures are parameters the other does not have
     }
+    SymId given[16];
+    for (int side = 0; side < 2; side++)
+    {
+        uint32_t ng = sema_spec_functions(side ? caller : fn, given, 16);
+        for (uint32_t g = 0; g < ng; g++)
+        {
+            if (sema_captures(given[g], caps, 1))
+            {
+                return 0; // (the same for a specialization that passes them on)
+            }
+        }
+    }
     if (callee_node->kind != AST_IDENT || TOK(u, callee_node->tok)->kind == TOK_WRITE || !fn ||
         SYM(fn)->kind != SYM_METHOD || !SYM(fn)->decl || SYM(fn)->owner || SYM(caller)->owner ||
         sema_is_std_print(u, u->refs[n->a]) || sema_std_member(u, u->refs[n->a]) == STD_SYS_PUT ||
@@ -2124,13 +2223,28 @@ static int tail_call(Emit *e, NodeId id)
         return 0;
     }
     NodeId p = sema_fn_params(home, fn), q = sema_fn_params(mine, caller);
-    for (; p && q; p = NEXT(home, p), q = NEXT(mine, q))
+    for (;;)
     {
+        // (the types a specialization is for are not passed: not compared)
+        while (p && sema_bound_type(fn, token_name(TOK(home, NODE(home, p)->tok))) != T_NONE)
+        {
+            p = NEXT(home, p);
+        }
+        while (q && sema_bound_type(caller, token_name(TOK(mine, NODE(mine, q)->tok))) != T_NONE)
+        {
+            q = NEXT(mine, q);
+        }
+        if (!p || !q)
+        {
+            break;
+        }
         TypeId t = sema_param_type(home, fn, p);
         if (t != sema_param_type(mine, caller, q) || !scalar_type(t) || t == T_VOID)
         {
             return 0;
         }
+        p = NEXT(home, p);
+        q = NEXT(mine, q);
     }
     return !p && !q;
 }
@@ -2484,9 +2598,9 @@ static void emit_signature(Emit *e, SymId fn)
     for (NodeId p = sema_fn_params(u, fn); p; p = NEXT(u, p), index++)
     {
         TypeId pt = sema_param_type(u, fn, p);
-        if (type_kind(pt) == T_FUNC)
+        if (type_kind(pt) == T_FUNC || sema_bound_type(fn, token_name(TOK(u, NODE(u, p)->tok))) != T_NONE)
         {
-            continue; // `f: function(...)`: known while compiling, not passed
+            continue; // `f: function(...)`, `T: type` in a specialization: known while compiling, not passed
         }
         put(e, first ? "" : ", ");
         if (type_kind(pt) == T_ARRAY) // by its address; a mutable one is copied in (emit_function)
@@ -2517,6 +2631,21 @@ static void emit_signature(Emit *e, SymId fn)
         PUT(e, " v_");
         put_n(e, nm->start, nm->len);
         first = 0;
+    }
+    SymId given[16]; // a specialization made for literals that read their callers' locals: those too
+    uint32_t ng = sema_spec_functions(fn, given, 16);
+    for (uint32_t g = 0; g < ng; g++)
+    {
+        uint32_t gc = sema_captures(given[g], caps, 64);
+        for (uint32_t i = 0; i < gc; i++)
+        {
+            put(e, first ? "" : ", ");
+            out_type(e, caps[i].type, 0);
+            const Name *nm = name_at(sema_capture_name(given[g], caps[i].name));
+            PUT(e, " v_");
+            put_n(e, nm->start, nm->len);
+            first = 0;
+        }
     }
     put(e, first ? "void)" : ")");
 }
@@ -3133,6 +3262,15 @@ static void backend_c_begin(const BackendJob *job)
             continue;
         }
         e->u = home;
+        NodeId fd = SYM(fn)->decl ? (NODE(home, SYM(fn)->decl)->kind == AST_DEFINE ? NODE(home, SYM(fn)->decl)->a
+                                                                               : SYM(fn)->decl)
+                                  : 0;
+        if (fd && NODE(home, fd)->kind == AST_FN_LIT && (NODE(home, fd)->flags & AST_F_ONELINE) &&
+            !fn_ret_node(home, fd))
+        {
+            e->u = u;
+            continue; // `max := (a, b: u8): ...`: its result is known once checked; it is written before its callers
+        }
         if (emittable(e, fn, 1))
         {
             if (sema_fn_fails(fn))

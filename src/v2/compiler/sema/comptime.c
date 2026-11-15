@@ -799,6 +799,10 @@ static int run(Vm *vm, SymId sym, const CtFunc *f, size_t fp)
             {
                 return stop(vm, sym, "divides by zero");
             }
+            if (in->imm == PANIC_UNHANDLED && len >= 5 && memcmp(text, "gets ", 5) == 0)
+            {
+                return stopf(vm, 0, "%.*s", len, text); // an error with nowhere to go (a module-level value)
+            }
             return stopf(vm, sym, "fails at %.*s", len, text);
         }
         default:

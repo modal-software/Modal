@@ -1839,6 +1839,7 @@ static void sink_number(MirSlot v, int is_signed);
 static void sink_bool(MirSlot v);
 
 // out.<kind>(value) through the shared routine.
+static void miss_if(uint8_t op, int v, MirSlot slot, uint64_t k, uint32_t miss);
 static void sink_value(int kind, MirSlot v)
 {
     SymId h = sink_helper(kind);
@@ -2050,6 +2051,59 @@ static int constant_text(NodeId a)
     return 0;
 }
 
+// print(e): a compare per error the program can name, each writing its name; one it cannot
+// name (an id from elsewhere) is `error N`. The names are in the program only because it prints
+// an error (G4: no name reaches a binary unless the program writes it).
+static void write_text(const char *text)
+{
+    MirSlot str = string_slot((const uint8_t *)text, strlen(text));
+    if (sink_put)
+    {
+        sink_value(SINK_STR, str);
+        return;
+    }
+    MirInst *w = inst(MIR_WRITE);
+    w->sub = MW_STR;
+    w->a = str;
+}
+
+static void write_error(MirSlot e)
+{
+    static uint64_t ids[512];
+    uint32_t n = sema_errors_list(ids, 512);
+    uint32_t end = new_label();
+    for (uint32_t i = 0; i <= n; i++)
+    {
+        uint64_t id = i ? ids[i - 1] : 0;
+        char name[80];
+        if (id)
+        {
+            sema_error_name(id, name, sizeof(name));
+        }
+        else
+        {
+            snprintf(name, sizeof(name), "nil");
+        }
+        uint32_t next = new_label();
+        miss_if(MB_NE, MV_U64, e, id, next);
+        write_text(name);
+        inst(MIR_JUMP)->imm = end;
+        place_label(next);
+    }
+    write_text("error ");
+    if (sink_put)
+    {
+        sink_value(SINK_UINT, e);
+    }
+    else
+    {
+        MirInst *w = inst(MIR_WRITE);
+        w->sub = MW_UINT;
+        w->a = e;
+    }
+    place_label(end);
+}
+
 static MirSlot lower_output(NodeId args, int newline, SymId put)
 {
     Unit *u = L.u;
@@ -2080,6 +2134,13 @@ static MirSlot lower_output(NodeId args, int newline, SymId put)
             flush_pending(); // the call may write too: the text before it goes out first
         }
         MirSlot s = lower_expr(a);
+        if (t == T_ERROR) // print(e): its name (nil, bad_input, panic.division), or `error N`
+        {
+            flush_pending();
+            write_error(s);
+            L.top = top;
+            continue;
+        }
         uint8_t sub;
         if (t == T_STR)
         {
@@ -2666,8 +2727,12 @@ static MirSlot finish_call(NodeId id, SymId fn, const Inlinable *inline_body, Mi
         }
         call->sub = MIR_CALL_GUARD;
         call->var = (uint8_t)(k << 1 | (sema_fn_fails(fn) ? 1u : 0u)); // (no slot field: passes rename those)
-        MirSlot val = temp(), err = temp();
-        if (k)
+        MirSlot val = k > 1 ? temp_n(k) : temp(), err = temp();
+        if (k > 1)
+        {
+            copy_slots(val, SLOT_WIN | 0, k); // a struct value: its slots
+        }
+        else if (k)
         {
             into(SLOT_WIN | 0, val);
         }
@@ -2679,8 +2744,12 @@ static MirSlot finish_call(NodeId id, SymId fn, const Inlinable *inline_body, Mi
     {
         TypeId rt = sema_fn_ret(u, fn);
         uint32_t k = rt == T_VOID ? 0 : slots_of(rt);
-        MirSlot val = temp(), err = temp();
-        if (k)
+        MirSlot val = k > 1 ? temp_n(k) : temp(), err = temp();
+        if (k > 1)
+        {
+            copy_slots(val, SLOT_WIN | 0, k); // a struct value: its slots
+        }
+        else if (k)
         {
             into(SLOT_WIN | 0, val);
         }
@@ -2818,6 +2887,46 @@ static MirSlot lower_bound_call(NodeId id)
         }
     }
     return finish_call(id, fn, inline_body, args, argk, argw, na);
+}
+
+// What a call to fn passes after its arguments, and under which name the caller has each: a
+// literal's captures (the caller's own name, or, in a specialization made for that literal, the
+// name it keeps them under), then those of the literals a specialization fn was made for.
+typedef struct
+{
+    NameId name;
+    TypeId type;
+} CaptureFrom;
+
+static uint32_t captures_passed(SymId fn, Capture *caps, CaptureFrom *out, uint32_t cap)
+{
+    uint32_t n = 0;
+    SymId mine[16]; // the literals the function being lowered was made for
+    uint32_t nm = sema_spec_functions(L.f->sym, mine, 16);
+    SymId lits[17];
+    uint32_t nl = 0;
+    lits[nl++] = fn;
+    SymId given[16];
+    uint32_t ng = sema_spec_functions(fn, given, 16);
+    for (uint32_t g = 0; g < ng && nl < 17; g++)
+    {
+        lits[nl++] = given[g];
+    }
+    for (uint32_t l = 0; l < nl; l++)
+    {
+        int kept = 0; // this caller keeps the literal's captures under its own names
+        for (uint32_t m = 0; m < nm && !kept; m++)
+        {
+            kept = mine[m] == lits[l];
+        }
+        uint32_t c = sema_captures(lits[l], caps, 64);
+        for (uint32_t i = 0; i < c && n < cap; i++)
+        {
+            out[n].name = kept ? sema_capture_name(lits[l], caps[i].name) : caps[i].name;
+            out[n++].type = caps[i].type;
+        }
+    }
+    return n;
 }
 
 static MirSlot lower_call(NodeId id)
@@ -3085,16 +3194,32 @@ static MirSlot lower_call(NodeId id)
         nargs++;
     }
     {
-        Capture caps[64]; // a literal's captures: the caller's locals of those names, after the arguments
-        uint32_t nc = sema_captures(fn, caps, 64);
+        // a literal's captures, after the arguments: the caller's locals of those names (in a
+        // specialization made for that literal, its own copies); then, for a specialization made
+        // for literals that read their callers' locals, those
+        Capture caps[64];
+        CaptureFrom from_caps[96];
+        uint32_t nc = captures_passed(fn, caps, from_caps, 96);
         for (uint32_t i = 0; i < nc && nargs < 256; i++)
         {
             MirSlot from;
             int ref;
-            if (!find_local_ref(caps[i].name, &from, &ref) || ref)
+            if (!find_local_ref(from_caps[i].name, &from, &ref) || ref)
             {
                 unsupported(callee->tok, "a literal that reads a local this call cannot see");
                 break;
+            }
+            uint32_t ck = slots_of(from_caps[i].type);
+            if (ck > 1) // a struct: its slots, copied
+            {
+                MirSlot b = inline_body ? temp_n(ck) : (SLOT_WIN | win);
+                copy_slots(b, from, ck);
+                args[nargs] = b;
+                argk[nargs] = ck;
+                argw[nargs] = win;
+                win += ck;
+                nargs++;
+                continue;
             }
             MirSlot r = temp();
             into(from, r);
@@ -4067,7 +4192,20 @@ static void error_up(MirSlot err)
 {
     if (!L.fails && L.ret != T_ERROR)
     {
-        return; // (the checker allowed it nowhere else)
+        // nowhere to go up to: a module-level value, which the compiler computes; an error there
+        // stops it (`'b' cannot be computed by the compiler: ... gives an error`)
+        uint32_t ok = new_label();
+        MirInst *j = inst(MIR_JZ);
+        j->a = err;
+        j->imm = ok;
+        const char *text = "gets an error from a call, and nothing here handles it (at module level there is no `, e`)\n";
+        MirSlot msg = string_slot((const uint8_t *)text, strlen(text));
+        MirInst *tr = inst(MIR_TRAP);
+        tr->a = msg;
+        tr->imm = PANIC_UNHANDLED;
+        L.f->strings[L.f->nstrings - 1].panic = (uint8_t)tr->imm;
+        place_label(ok);
+        return;
     }
     uint32_t ok = new_label();
     MirInst *j = inst(MIR_JZ);
@@ -4105,7 +4243,11 @@ static void lower_return(NodeId value)
         }
         else
         {
-            if (value)
+            if (value && is_struct(L.ret))
+            {
+                lower_struct_into(value, 0); // a struct value: its slots, then no error
+            }
+            else if (value)
             {
                 into(lower_as(value, L.ret), 0);
             }
@@ -4202,12 +4344,13 @@ static void lower_stmt(NodeId id)
         if (n->b) // `n, e := f()`: the value and the error (guards.md §5)
         {
             TypeId vt = u->types[id];
-            if (is_struct(vt) || is_array(vt))
+            if (is_array(vt))
             {
-                unsupported(n->tok, "a struct or array value with its error");
+                unsupported(n->tok, "an array value with its error");
                 return;
             }
-            MirSlot vs = temp(), es = temp();
+            uint32_t vk = is_struct(vt) ? slots_of(vt) : 1;
+            MirSlot vs = vk > 1 ? temp_n(vk) : temp(), es = temp();
             NodeId saved = L.handled_call, saved_guard = L.guard_call;
             L.handled_call = n->a;
             L.guard_call = NODE(u, n->a)->kind == AST_CALL && !raises_nothing(u->refs[n->a]) ? n->a : 0;
@@ -4233,7 +4376,11 @@ static void lower_stmt(NodeId id)
             MirSlot v = lower_expr(n->a);
             L.handled_call = saved;
             L.guard_call = saved_guard;
-            if (vt != T_VOID && vt != T_NONE)
+            if (vk > 1)
+            {
+                copy_slots(vs, v, vk); // a struct value: its slots
+            }
+            else if (vt != T_VOID && vt != T_NONE)
             {
                 into(v, vs);
             }
@@ -4247,7 +4394,7 @@ static void lower_stmt(NodeId id)
                 copy_fields(arena_at, 0, snapshot, 0, arena_st); // an error: the arena as it was
                 place_label(kept);
             }
-            push_local(token_name(TOK(u, n->tok)), vs);
+            push_local_n(token_name(TOK(u, n->tok)), vs, vk);
             push_local(token_name(TOK(u, n->b)), es);
             if (n->aux & DEFINE_UNREAD) // no line reads e: an error that reaches it stops the program
             {
@@ -4271,7 +4418,7 @@ static void lower_stmt(NodeId id)
                 L.f->strings[L.f->nstrings - 1].panic = (uint8_t)tr->imm; // (its message: made just before)
                 place_label(ok);
             }
-            L.top = top + 2;
+            L.top = top + vk + 1;
             return;
         }
         if (NODE(u, n->a)->kind == AST_FN_LIT)
@@ -5140,7 +5287,19 @@ int mir_lower(Unit *u, SymId fn, MirFunc *out)
         uint32_t nc = sema_captures(fn, caps, 64);
         for (uint32_t i = 0; i < nc; i++)
         {
-            push_local(caps[i].name, temp());
+            uint32_t ck = slots_of(caps[i].type); // a struct: its slots
+            push_local_n(caps[i].name, ck > 1 ? temp_n(ck) : temp(), ck);
+        }
+        SymId given[16]; // a specialization for literals that read their callers' locals: those, too
+        uint32_t ng = sema_spec_functions(fn, given, 16);
+        for (uint32_t g = 0; g < ng; g++)
+        {
+            uint32_t gc = sema_captures(given[g], caps, 64);
+            for (uint32_t i = 0; i < gc; i++)
+            {
+                uint32_t ck = slots_of(caps[i].type);
+                push_local_n(sema_capture_name(given[g], caps[i].name), ck > 1 ? temp_n(ck) : temp(), ck);
+            }
         }
     }
     uint32_t params_end = L.top;
@@ -5320,7 +5479,22 @@ uint32_t mir_param_slots(SymId fn)
 {
     Unit *u = &cx.units[SYM(fn)->unit];
     Capture caps[64];
-    uint32_t k = (SYM(fn)->owner != 0) + sema_captures(fn, caps, 64); // a literal's captures: one slot each
+    uint32_t k = SYM(fn)->owner != 0;
+    uint32_t ncap = sema_captures(fn, caps, 64); // a literal's captures, after its parameters
+    for (uint32_t i = 0; i < ncap; i++)
+    {
+        k += slots_of(caps[i].type);
+    }
+    SymId given[16];
+    uint32_t ng = sema_spec_functions(fn, given, 16);
+    for (uint32_t g = 0; g < ng; g++)
+    {
+        uint32_t gc = sema_captures(given[g], caps, 64);
+        for (uint32_t i = 0; i < gc; i++)
+        {
+            k += slots_of(caps[i].type);
+        }
+    }
     for (NodeId p = sema_fn_params(u, fn); p; p = NEXT(u, p))
     {
         TypeId pt = sema_param_type(u, fn, p);
@@ -5361,6 +5535,8 @@ int mir_lower_expr(Unit *u, NodeId expr, TypeId type, SymId fn, MirFunc *out)
     L.struct_abi = 1; // never kept for inlining
     L.loops = 0;
     L.for_compiler = 1;
+    L.fails = 0; // (an error with nowhere to go stops the compiler: error_up)
+    L.handled_call = L.guard_call = 0;
     *out = (MirFunc){.u = u, .sym = fn, .returns = 1, .ret_slots = slots_of(type), .label = "(compile time)"};
     if (type == T_VOID) // a statement (`assert(...)`, a call): run for what it checks
     {

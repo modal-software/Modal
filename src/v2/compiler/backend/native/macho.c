@@ -46,8 +46,8 @@ static void sha_block_portable(uint32_t *hs, const uint8_t *p)
     uint32_t w[64];
     for (int i = 0; i < 16; i++)
     {
-        w[i] = (uint32_t)p[4 * i] << 24 | (uint32_t)p[4 * i + 1] << 16 | (uint32_t)p[4 * i + 2] << 8 |
-               p[4 * i + 3];
+        w[i] = (uint32_t)p[4 * i] << 24 | (uint32_t)p[4 * i + 1] << 16 |
+               (uint32_t)p[4 * i + 2] << 8 | p[4 * i + 3];
     }
     for (int i = 16; i < 64; i++)
     {
@@ -59,7 +59,8 @@ static void sha_block_portable(uint32_t *hs, const uint8_t *p)
     uint32_t e = hs[4], f = hs[5], g = hs[6], h = hs[7];
     for (int i = 0; i < 64; i++)
     {
-        uint32_t t1 = h + (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) + ((e & f) ^ (~e & g)) + sha_k[i] + w[i];
+        uint32_t t1 =
+            h + (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) + ((e & f) ^ (~e & g)) + sha_k[i] + w[i];
         uint32_t t2 = (rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) + ((a & b) ^ (a & c) ^ (b & c));
         h = g;
         g = f;
@@ -118,8 +119,8 @@ __attribute__((target("sha2"))) static void sha_blocks_arm(uint32_t *h, const ui
             a1 = vsha256h2q_u32(a1, t, wk);
             if (i < 12) // the next four message words
             {
-                m[i & 3] = vsha256su1q_u32(vsha256su0q_u32(m[i & 3], m[(i + 1) & 3]), m[(i + 2) & 3],
-                                           m[(i + 3) & 3]);
+                m[i & 3] = vsha256su1q_u32(vsha256su0q_u32(m[i & 3], m[(i + 1) & 3]),
+                                           m[(i + 2) & 3], m[(i + 3) & 3]);
             }
         }
         s0 = vaddq_u32(s0, a0);
@@ -194,7 +195,8 @@ static void sha256(const uint8_t *data, size_t len, uint8_t out[32])
     }
 }
 
-// ---- a growable byte buffer ------------------------------------------------------------------------
+// ---- a growable byte buffer
+// ------------------------------------------------------------------------
 //
 // Its memory beyond `len` is always zero, so padding is skipped over, not written (skip_to).
 // The executable is sized before it is written and allocated once (Buf with that capacity).
@@ -354,7 +356,8 @@ static void segment(Buf *b, const char *name, uint64_t vmaddr, uint64_t vmsize, 
 }
 
 static void section(Buf *b, const char *sect, const char *seg, uint64_t addr, uint64_t size,
-                    uint32_t offset, uint32_t align, uint32_t reloff, uint32_t nreloc, uint32_t flags)
+                    uint32_t offset, uint32_t align, uint32_t reloff, uint32_t nreloc,
+                    uint32_t flags)
 {
     name16(b, sect);
     name16(b, seg);
@@ -380,7 +383,8 @@ static void build_version(Buf *b)
     le(b, 0, 4);
 }
 
-// ---- executable -----------------------------------------------------------------------------------
+// ---- executable
+// -----------------------------------------------------------------------------------
 
 #define BASE 0x100000000ull
 #define SIG_PAGE 4096u
@@ -460,7 +464,7 @@ int macho_write_executable(FILE *out, MachoCpu cpu, const uint8_t *code, size_t 
     le(&b, 0xfeedfacf, 4);
     le(&b, arm ? 0x0100000c : 0x01000007, 4); // CPU_TYPE_ARM64 / CPU_TYPE_X86_64
     le(&b, arm ? 0 : 3, 4);                   // CPU_SUBTYPE_ARM64_ALL / CPU_SUBTYPE_X86_64_ALL
-    le(&b, 2, 4); // MH_EXECUTE
+    le(&b, 2, 4);                             // MH_EXECUTE
     le(&b, ncmds, 4);
     le(&b, cmds, 4);
     le(&b, 0x00200085, 4); // MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_PIE
@@ -558,7 +562,8 @@ int macho_write_executable(FILE *out, MachoCpu cpu, const uint8_t *code, size_t 
         }
         else
         {
-            set32(b.p + text_off + calls[i].at, (uint32_t)(int32_t)((int64_t)target - (int64_t)(calls[i].at + 4)));
+            set32(b.p + text_off + calls[i].at,
+                  (uint32_t)(int32_t)((int64_t)target - (int64_t)(calls[i].at + 4)));
         }
     }
     for (size_t i = 0; i < nimports && !arm; i++)
@@ -575,10 +580,13 @@ int macho_write_executable(FILE *out, MachoCpu cpu, const uint8_t *code, size_t 
         uint64_t slot = BASE + data_off + 8 * i;
         int64_t pages = (int64_t)(slot >> 12) - (int64_t)(pc >> 12);
         uint32_t lo = (uint32_t)(slot & 0xfff);
-        le(&b, 0x90000000u | (((uint32_t)pages & 3u) << 29) | ((((uint32_t)pages >> 2) & 0x7ffffu) << 5) | 16u,
-           4);                                                // adrp x16, slot@page
-        le(&b, 0xf9400000u | ((lo / 8) << 10) | (16u << 5) | 16u, 4); // ldr x16, [x16, slot@pageoff]
-        le(&b, 0xd61f0200u, 4);                               // br x16
+        le(&b,
+           0x90000000u | (((uint32_t)pages & 3u) << 29) |
+               ((((uint32_t)pages >> 2) & 0x7ffffu) << 5) | 16u,
+           4); // adrp x16, slot@page
+        le(&b, 0xf9400000u | ((lo / 8) << 10) | (16u << 5) | 16u,
+           4);                  // ldr x16, [x16, slot@pageoff]
+        le(&b, 0xd61f0200u, 4); // br x16
     }
     size_t text_end = b.len; // from here to link_off: zero padding
     skip_to(&b, link_off);   // __TEXT is padded to its page; __DATA has no file bytes
@@ -597,25 +605,25 @@ int macho_write_executable(FILE *out, MachoCpu cpu, const uint8_t *code, size_t 
     be(&b, 20, 4);
     be(&b, 0xfade0c02, 4); // CSMAGIC_CODEDIRECTORY
     be(&b, cd_size, 4);
-    be(&b, 0x20400, 4);                    // version: with exec segment fields
-    be(&b, 0x20002, 4);                    // CS_ADHOC | CS_LINKER_SIGNED
-    be(&b, cd_header + ident_len, 4);      // hashOffset
-    be(&b, cd_header, 4);                  // identOffset
-    be(&b, 0, 4);                          // nSpecialSlots
-    be(&b, ncode, 4);                      // nCodeSlots
-    be(&b, code_limit, 4);                 // codeLimit
-    be(&b, 32, 1);                         // hashSize
-    be(&b, 2, 1);                          // hashType: SHA-256
-    be(&b, 0, 1);                          // platform
-    be(&b, 12, 1);                         // pageSize: 2^12
-    be(&b, 0, 4);                          // spare2
-    be(&b, 0, 4);                          // scatterOffset
-    be(&b, 0, 4);                          // teamOffset
-    be(&b, 0, 4);                          // spare3
-    be(&b, 0, 8);                          // codeLimit64
-    be(&b, 0, 8);                          // execSegBase
-    be(&b, text_seg, 8);                   // execSegLimit
-    be(&b, 1, 8);                          // CS_EXECSEG_MAIN_BINARY
+    be(&b, 0x20400, 4);               // version: with exec segment fields
+    be(&b, 0x20002, 4);               // CS_ADHOC | CS_LINKER_SIGNED
+    be(&b, cd_header + ident_len, 4); // hashOffset
+    be(&b, cd_header, 4);             // identOffset
+    be(&b, 0, 4);                     // nSpecialSlots
+    be(&b, ncode, 4);                 // nCodeSlots
+    be(&b, code_limit, 4);            // codeLimit
+    be(&b, 32, 1);                    // hashSize
+    be(&b, 2, 1);                     // hashType: SHA-256
+    be(&b, 0, 1);                     // platform
+    be(&b, 12, 1);                    // pageSize: 2^12
+    be(&b, 0, 4);                     // spare2
+    be(&b, 0, 4);                     // scatterOffset
+    be(&b, 0, 4);                     // teamOffset
+    be(&b, 0, 4);                     // spare3
+    be(&b, 0, 8);                     // codeLimit64
+    be(&b, 0, 8);                     // execSegBase
+    be(&b, text_seg, 8);              // execSegLimit
+    be(&b, 1, 8);                     // CS_EXECSEG_MAIN_BINARY
     bytes(&b, ident, ident_len);
     for (size_t i = 0; i < ncode; i++)
     {
