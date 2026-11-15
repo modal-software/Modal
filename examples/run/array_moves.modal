@@ -1,0 +1,39 @@
+-- Array copies and results (collections, context.md §64): `b := f()`, `[N]T e = b`, `return out`,
+-- `return g()` and map/fold over 20 slots, each one block copy (MIR_MOVE), not one per element.
+print := import("std").io.print
+type := import("std").type
+map := import("std").map
+fold := import("std").fold
+big: struct { u64 a, u64 b, u64 c, u64 d, u64 e, u64 f, u64 g, u64 h, u64 i, u64 j, u64 k, u64 l, u64 m, u64 n, u64 o, u64 p, u64 q, u64 r, u64 s, u64 t }
+make(u64 v): [20]u64 {
+    [20]u64 out
+    out[0] = v
+    out[19] = v * 2
+    out[10] = v + 5
+    return out
+}
+again(u64 v): [20]u64 {
+    return make(v + 1)
+}
+u64 walk(T: type, x: big, u64 i, u64 acc) {
+    return if i { 5: acc + x.t, _: walk(T, x, i + 1, acc + x.a + i) }
+}
+u64 spin(T: type, U: type, u64 i, u64 acc) {
+    return if i { 0: acc, _: spin(T, U, i - 1, acc + i) }
+}
+main(): u8 {
+    a := make(3)
+    [20]u64 d = a
+    d[0] = 100
+    print(a[0], a[10], a[19], d[0], d[19])
+    b := again(7)
+    print(b[0], b[10], b[19])
+    [20]u64 e = b
+    e[19] = 1
+    print(e[19], b[19], e.len)
+    x := big{ a: 2, b: 0, c: 0, d: 0, e: 0, f: 0, g: 0, h: 0, i: 0, j: 0, k: 0, l: 0, m: 0, n: 0, o: 0, p: 0, q: 0, r: 0, s: 0, t: 9 }
+    print(walk(u64, x, 0, 0), spin(u8, u64, 10, 0))
+    ys := map(u64, u64, b, v: v * 3)
+    print(ys[0], ys[10], ys[19], fold(u64, u64, ys, 1, (s, v): s + v))
+    return 0
+}

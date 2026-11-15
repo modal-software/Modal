@@ -1,0 +1,2 @@
+-- checked before main.modal, which imports it: what add can raise is known there
+u64 add(u64 a, u64 b) { return a + b }
