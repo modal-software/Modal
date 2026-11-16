@@ -1178,6 +1178,7 @@ static void link_new_units(void)
             }
         }
         discover_imports(u, 1, (NodeId)u->nodes.size);
+        u->module_imports = u->nimports;
         if (u->is_manifest && !u->broken)
         {
             read_manifest(u);
@@ -1371,4 +1372,434 @@ void modules_link(void)
             clock_ns() - t - (cx.phase_ns[PHASE_PARSE] + cx.phase_ns[PHASE_EMIT] - inside);
     }
     sema_errors_finish(); // the errors each function can give are known now
+}
+
+// ---- what the program can reach, from its text (development.md §9.4.2) ------------------------
+//
+// Native generated every function and dropped those the entry does not reach at the end (shake):
+// a function nobody calls cost its lowering, optimizing and emitting. Callees are generated
+// first, before their callers are checked, so the call graph is not known yet when a callee's
+// turn comes. This is found once, before the first function is generated, from the text alone.
+// The entry file is generated whole (a program's own file holds little it does not use, and
+// reading its bodies cost 7% of the compile of a file whose functions are all used): what it
+// reaches in other files is what its imports bind. A binding of a module makes that file whole
+// too; a binding of a declaration reaches it, and from there every name a reached declaration's
+// text holds reaches every declaration of that name (a function, a constant, a struct and all its
+// methods, a binding and what it names). A name in a comment or a string reaches too: it can only
+// keep more, never less, than the calls do. An `import(` in a whole file's body turns it all off.
+static uint8_t *reach;      // per symbol: 1 reached (0 past reach_n: not known, so reached)
+static uint8_t *reach_whole; // per unit: every function of it is generated
+static size_t reach_n;      // symbols when it was found
+static uint16_t reach_units; // units when it was found: a later unit turns it off
+static int reach_state;     // 0 not found yet, 1 found, 2 off (everything is generated)
+
+typedef struct
+{
+    uint32_t *start; // per top-level declaration of a unit, in source order: its first byte
+    uint32_t *tok;   // and its first module-level token
+    uint32_t n;
+    uint8_t *scanned;
+} DeclRanges;
+
+static int cmp_u32(const void *a, const void *b)
+{
+    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+// A symbol's declaration: the index of the top-level declaration whose text holds its name.
+static uint32_t decl_index(const DeclRanges *r, uint32_t off)
+{
+    uint32_t lo = 0, hi = r->n;
+    while (hi - lo > 1)
+    {
+        uint32_t mid = (lo + hi) / 2;
+        if (r->start[mid] <= off)
+        {
+            lo = mid;
+        }
+        else
+        {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+// A unit's declarations and their first tokens (the module-level ones, in order: a body being
+// checked appends its own after them, so they stop where an offset goes back).
+static void decl_ranges(DeclRanges *r, uint16_t i)
+{
+    Unit *u = &cx.units[i];
+    uint32_t count = 0;
+    for (NodeId d = NODE(u, u->root)->a; d; d = NEXT(u, d))
+    {
+        count++;
+    }
+    r->start = malloc((count + 1) * sizeof(uint32_t));
+    r->tok = malloc((count + 2) * sizeof(uint32_t));
+    r->scanned = calloc(count + 1, 1);
+    r->start[0] = 0; // text before the first declaration belongs to it
+    uint32_t k = 1;
+    for (NodeId d = NODE(u, u->root)->a; d; d = NEXT(u, d))
+    {
+        r->start[k++] = (uint32_t)(TSTART(TOK(u, NODE(u, d)->tok)) - u->src);
+    }
+    qsort(r->start + 1, count, sizeof(uint32_t), cmp_u32);
+    r->n = count + 1;
+    size_t ntok = 0;
+    while (ntok < u->tokens.size && (ntok == 0 || u->tokens.data[ntok].off >= u->tokens.data[ntok - 1].off))
+    {
+        ntok++;
+    }
+    size_t t = 0;
+    for (uint32_t d = 0; d < r->n; d++)
+    {
+        while (t < ntok && (uint32_t)(TSTART(&u->tokens.data[t]) - u->src) < r->start[d])
+        {
+            t++;
+        }
+        r->tok[d] = (uint32_t)t;
+    }
+    r->tok[r->n] = (uint32_t)ntok;
+}
+
+// A cheap filter in front of name_find for a body's names: most (`return`, a parameter) name no
+// declaration. Two bits per declared name, from its length and three of its bytes.
+#define REACH_FILTER_BITS (1u << 18)
+static uint32_t reach_filter_hash(const char *p, uint32_t n)
+{
+    uint32_t h = n * 0x9e3779b1u;
+    h ^= (uint8_t)p[0] * 0x85ebca6bu;
+    h ^= (uint8_t)p[n - 1] * 0xc2b2ae35u;
+    h ^= (uint8_t)p[n / 2] * 0x27d4eb2fu;
+    return h ^ (h >> 15);
+}
+
+// How many times a file's text holds the word `import` outside a `--` comment or a string on its
+// line (memchr for its first byte; the line is read from its start). A `-{ }-` block over several
+// lines is still counted: that can only turn pruning off, never miss an import.
+static uint32_t text_imports(const char *src, size_t len)
+{
+    const char *p = src, *end = src + len;
+    uint32_t n = 0;
+    while (p + 6 <= end && (p = memchr(p, 'i', (size_t)(end - p - 5))) != NULL)
+    {
+        const char *at = p++;
+        if (memcmp(at, "import", 6) != 0 ||
+            (at > src && (at[-1] == '_' || ((unsigned char)at[-1] | 32) - 'a' < 26u || (unsigned char)at[-1] - '0' < 10u)))
+        {
+            continue;
+        }
+        const char *line = at;
+        while (line > src && line[-1] != '\n')
+        {
+            line--;
+        }
+        int in_string = 0, comment = 0;
+        for (const char *c = line; c < at && !comment; c++)
+        {
+            if (in_string)
+            {
+                c += *c == '\\' && c + 1 < at;
+                in_string = *c != '"';
+            }
+            else if (*c == '"')
+            {
+                in_string = 1;
+            }
+            else if (c[0] == '-' && c + 1 < at && c[1] == '-')
+            {
+                comment = 1;
+            }
+        }
+        n += !comment && !in_string;
+        p = at + 6;
+    }
+    return n;
+}
+
+static void reach_compute(void)
+{
+    reach_state = 2;
+    SymId main_fn = cx.nunits ? scope_find(cx.units[0].scope, "main", 4) : 0;
+    if (cx.eager || !main_fn || SYM(main_fn)->kind != SYM_METHOD)
+    {
+        return; // no entry to start from (or bodies parsed with their file): everything
+    }
+    for (uint16_t i = 0; i < cx.nunits; i++)
+    {
+        if (!cx.units[i].src || cx.units[i].broken)
+        {
+            return;
+        }
+    }
+    size_t n = cx.syms.size;
+    // symbols by name (a list per NameId), and methods by their struct
+    SymId *by_name = calloc(cx.nnames + 1, sizeof(SymId));
+    SymId *next_name = calloc(n, sizeof(SymId));
+    SymId *by_owner = calloc(n, sizeof(SymId));
+    SymId *next_owner = calloc(n, sizeof(SymId));
+    SymId *imports_of = calloc(cx.nunits, sizeof(SymId)); // per unit: its bindings
+    SymId *next_import = calloc(n, sizeof(SymId));
+
+    uint64_t *filter = calloc(REACH_FILTER_BITS / 64, sizeof(uint64_t));
+    uint64_t *declared = calloc(cx.nnames / 64 + 1, sizeof(uint64_t)); // per NameId: a declaration has it
+
+    for (SymId s = 1; s < n; s++)
+    {
+        const Symbol *sym = SYM(s);
+        if (sym->kind == SYM_FIELD || sym->kind == SYM_NONE || (sym->flags & SYM_F_LITERAL) || !sym->decl)
+        {
+            continue;
+        }
+        if (sym->kind == SYM_IMPORT && sym->unit < cx.nunits)
+        {
+            next_import[s] = imports_of[sym->unit];
+            imports_of[sym->unit] = s;
+        }
+        if (sym->unit == 0)
+        {
+            continue; // the entry: whole, and no other file names its declarations
+        }
+        NameId nm = cx.sym_names[s];
+        if (nm && nm <= cx.nnames)
+        {
+            if (!by_name[nm])
+            {
+                const Name *name = name_at(nm);
+                if (name->len)
+                {
+                    uint32_t h = reach_filter_hash(name->start, (uint32_t)name->len);
+                    filter[(h % REACH_FILTER_BITS) / 64] |= 1ull << (h % 64);
+                    h = h * 0x2545f491u;
+                    filter[(h % REACH_FILTER_BITS) / 64] |= 1ull << (h % 64);
+                }
+            }
+            next_name[s] = by_name[nm];
+            by_name[nm] = s;
+            declared[nm / 64] |= 1ull << (nm % 64);
+        }
+        if (sym->kind == SYM_METHOD && sym->owner && sym->owner < n)
+        {
+            next_owner[s] = by_owner[sym->owner];
+            by_owner[sym->owner] = s;
+        }
+    }
+    DeclRanges *ranges = calloc(cx.nunits, sizeof(DeclRanges)); // per unit, made when first read
+    reach = realloc(reach, n);
+    memset(reach, 0, n);
+    reach_whole = realloc(reach_whole, cx.nunits);
+    memset(reach_whole, 0, cx.nunits);
+    reach_n = n;
+    reach_units = cx.nunits;
+    SymId *work = malloc(n * sizeof(SymId));
+    size_t nwork = 0;
+    int off = 0; // an import inside a body: a file may come in later, calling anything
+#define REACH(s)                                                                                       \
+    do                                                                                                 \
+    {                                                                                                  \
+        SymId r_ = (s);                                                                                \
+        if (r_ && r_ < n && !reach[r_])                                                                \
+        {                                                                                              \
+            reach[r_] = 1;                                                                             \
+            work[nwork++] = r_;                                                                        \
+        }                                                                                              \
+    } while (0)
+#define REACH_NAME(nm)                                                                                 \
+    do                                                                                                 \
+    {                                                                                                  \
+        NameId n_ = (nm);                                                                              \
+        for (SymId t_ = n_ && n_ <= cx.nnames ? by_name[n_] : 0; t_; t_ = next_name[t_])               \
+        {                                                                                              \
+            REACH(t_);                                                                                 \
+        }                                                                                              \
+    } while (0)
+    // a whole file: its bindings are what it reaches elsewhere; an `import(` in a body is not seen
+    // by them, so it turns pruning off
+#define WHOLE(ui)                                                                                      \
+    do                                                                                                 \
+    {                                                                                                  \
+        uint16_t w_ = (ui);                                                                            \
+        if (w_ < cx.nunits && !reach_whole[w_])                                                        \
+        {                                                                                              \
+            reach_whole[w_] = 1;                                                                       \
+            Unit *wu_ = &cx.units[w_];                                                                 \
+            off |= text_imports(wu_->src, wu_->len) != wu_->module_imports; /* one in a body, or a comment */ \
+            for (SymId b_ = imports_of[w_]; b_; b_ = next_import[b_])                                  \
+            {                                                                                          \
+                REACH(b_);                                                                             \
+            }                                                                                          \
+        }                                                                                              \
+    } while (0)
+    WHOLE(0);
+    int partial = 0; // a file that is not whole has a function: something may be dropped
+    for (SymId f = 1; f < n && !partial; f++)
+    {
+        partial = SYM(f)->kind == SYM_METHOD && SYM(f)->unit < cx.nunits && !reach_whole[SYM(f)->unit] &&
+                  !cx.units[SYM(f)->unit].is_manifest;
+    }
+    off |= !partial;
+    while (nwork && !off)
+    {
+        SymId s = work[--nwork];
+        const Symbol *sym = SYM(s);
+        if (sym->kind == SYM_STRUCT) // its methods, called by name or by the compiler (`out.put`)
+        {
+            for (SymId m = by_owner[s]; m; m = next_owner[m])
+            {
+                REACH(m);
+            }
+        }
+        if (sym->kind == SYM_IMPORT)
+        {
+            SymId target = module_binding_target(s);
+            if (target)
+            {
+                REACH(target);
+            }
+            else // a module (`util := import("util")`), or a path into one: that file, whole
+            {
+                Unit *owner = &cx.units[sym->unit];
+                const AstNode *decl = NODE(owner, sym->decl);
+                Target t = decl->kind == AST_DEFINE ? chain_eval(owner, decl->a, CHAIN_SILENT, 0) : (Target){0};
+                if (t.known && t.unit)
+                {
+                    WHOLE(t.unit->id);
+                }
+            }
+            continue;
+        }
+        if (sym->kind == SYM_METHOD)
+        {
+            for (SymId o = sym->next_overload; o; o = SYM(o)->next_overload)
+            {
+                REACH(o); // its clauses and overloads: one name
+            }
+        }
+        if (sym->unit < cx.nunits && reach_whole[sym->unit])
+        {
+            continue; // generated with its file: what it reaches elsewhere, its file's bindings say
+        }
+        Unit *u = &cx.units[sym->unit];
+        DeclRanges *r = &ranges[sym->unit];
+        if (!r->start)
+        {
+            decl_ranges(r, sym->unit);
+        }
+        uint32_t at = decl_index(r, (uint32_t)(TSTART(TOK(u, sym->tok)) - u->src));
+        if (r->scanned[at])
+        {
+            continue;
+        }
+        r->scanned[at] = 1;
+        for (uint32_t k = r->tok[at]; k < r->tok[at + 1]; k++)
+        {
+            const Token *tk = &u->tokens.data[k];
+            if (tk->kind == TOK_IDENTIFIER) // a signature or a one-line body: named by the scanner
+            {
+                NameId nm = tk->match ? (NameId)tk->match : name_find(TSTART(tk), tk->len);
+                if (nm <= cx.nnames && (declared[nm / 64] >> (nm % 64) & 1))
+                {
+                    REACH_NAME(nm);
+                }
+                continue;
+            }
+            if (tk->kind != TOK_BODY)
+            {
+                continue;
+            }
+            const char *text = TSTART(tk);
+            uint32_t end = tk->len;
+            for (uint32_t i = 0; i < end;)
+            {
+                unsigned char ch = (unsigned char)text[i];
+                if (!(ch == '_' || (ch | 32) - 'a' < 26u))
+                {
+                    i++;
+                    continue;
+                }
+                uint32_t b = i;
+                while (i < end && (text[i] == '_' || ((unsigned char)text[i] | 32) - 'a' < 26u ||
+                                   (unsigned char)text[i] - '0' < 10u))
+                {
+                    i++;
+                }
+                uint32_t len = i - b;
+                if (len == 6 && memcmp(text + b, "import", 6) == 0)
+                {
+                    off = 1;
+                    break;
+                }
+                uint32_t h = reach_filter_hash(text + b, len);
+                uint32_t h2 = h * 0x2545f491u;
+                if (!(filter[(h % REACH_FILTER_BITS) / 64] >> (h % 64) & 1) ||
+                    !(filter[(h2 % REACH_FILTER_BITS) / 64] >> (h2 % 64) & 1))
+                {
+                    continue; // names no declaration
+                }
+                REACH_NAME(name_find(text + b, len));
+            }
+        }
+    }
+#undef WHOLE
+#undef REACH_NAME
+#undef REACH
+    for (uint16_t i = 0; i < cx.nunits; i++)
+    {
+        free(ranges[i].start);
+        free(ranges[i].tok);
+        free(ranges[i].scanned);
+    }
+    free(ranges);
+    free(work);
+    free(by_name);
+    free(next_name);
+    free(by_owner);
+    free(next_owner);
+    free(filter);
+    free(declared);
+    free(imports_of);
+    free(next_import);
+
+    reach_state = off ? 2 : 1;
+}
+
+int module_reachable(SymId fn)
+{
+    if (!reach_state)
+    {
+        reach_compute();
+    }
+    if (reach_state != 1 || cx.nunits != reach_units)
+    {
+        return 1;
+    }
+    if (fn < reach_n && reach_whole[SYM(fn)->unit])
+    {
+        return 1; // its file is generated whole (the entry's always is): the common case, first
+    }
+    SymId of = sema_spec_generic(fn);
+    if (of)
+    {
+        fn = of; // a specialization: reached when its generic is
+    }
+    if (fn >= reach_n || (SYM(fn)->flags & SYM_F_LITERAL))
+    {
+        return 1; // made after (the compiler's routines), or a literal: generated in its body's turn
+    }
+    return reach[fn] || (SYM(fn)->unit < reach_units && reach_whole[SYM(fn)->unit]);
+}
+
+void module_reachable_reset(void)
+{
+    reach_state = 0;
+}
+
+void module_reachable_prepare(void) // before any body is checked: the units hold only their own tokens
+{
+    if (!reach_state)
+    {
+        reach_compute();
+    }
 }

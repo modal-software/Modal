@@ -36,6 +36,7 @@ enum
     SYM_F_LITERAL = 1u << 2,
     SYM_F_CAPTURES = 1u << 3, // a literal that reads a local of the function around it
     SYM_F_LOOPS = 1u << 4,    // a function that calls itself (any clause of it): a loop, or a recursion
+    SYM_F_SPEC = 1u << 5,     // a specialization (check.c's specs): spec_of reads its table only then
 };
 
 typedef struct Symbol

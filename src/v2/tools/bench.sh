@@ -33,6 +33,44 @@ awk 'BEGIN {
     print "}"
 }' > "$W/big.modal"
 
+# reached.modal: big with every function reached (main calls the end of each chain with a value
+# known only when the program runs). Since context.md §70 a function main cannot reach is not
+# generated, so big's emit no longer generates its 54,000 functions; this one does.
+awk 'BEGIN {
+    print "print := import(\"std\").io.print"
+    print "u64 seed = 1"
+    for (i = 0; i < 54000; i++) {
+        printf "f%d(a: u64, b: u64): u64 {\n", i
+        if (i % 100 == 0) printf "    return (a + b) * 3 - a\n"
+        else printf "    return f%d(b, a + %d) + 1\n", i - 1, i % 7
+        print "}"
+    }
+    print "main(): u8 {"
+    print "    u64 t = 0"
+    for (c = 99; c < 54000; c += 100) printf "    t = t + f%d(seed, 2)\n", c
+    print "    print(\"all\", t)"
+    print "    return 0"
+    print "}"
+}' > "$W/reached.modal"
+
+# specs.modal: functions made once per type at scale (context.md §69). 100 struct types, 40
+# generic functions each made for all 100 (4,000 specializations), and 20,000 callers. `big`
+# makes none, so it cannot see a cost that grows with them.
+awk 'BEGIN {
+    print "print := import(\"std\").io.print"
+    print "type := import(\"std\").type"
+    for (i = 0; i < 100; i++) printf "s%d: struct { u64 a, u64 b }\n", i
+    for (g = 0; g < 40; g++) printf "first%d(T: type, a: *T, b: *T): u64 { return a.a + b.b }\n", g
+    for (j = 0; j < 20000; j++) {
+        printf "g%d(n: u64): u64 {\n    x := s%d{ a: n, b: 2 }\n", j, j % 100
+        printf "    return first%d(s%d, &x, &x)\n}\n", int(j / 100) % 40, j % 100
+    }
+    print "main(): u8 {"
+    print "    print(\"specs\", g0(1), g19999(2))"
+    print "    return 0"
+    print "}"
+}' > "$W/specs.modal"
+
 # best of $N of the `--time` line for a phase, of a full compile to an executable
 phase_best() { # phase file
     i=0
@@ -59,11 +97,11 @@ done
 echo "| program | check warm | emit | -o | exec | --run | code B | file B | RAM B | memory used / taken KB | RSS MB | faults |"
 echo "|---|---|---|---|---|---|---|---|---|---|---|---|"
 for f in examples/secret.modal examples/run/hello.modal examples/run/output.modal \
-    examples/run/structs.modal examples/run/patterns.modal "$W/big.modal"; do
+    examples/run/structs.modal examples/run/patterns.modal "$W/big.modal" "$W/reached.modal" "$W/specs.modal"; do
     name=$(basename "$f" .modal)
     reps=200
     runs=$N
-    [ "$name" = big ] && reps=20 && runs=$(( N < 10 ? N : 10 ))
+    { [ "$name" = big ] || [ "$name" = reached ] || [ "$name" = specs ]; } && reps=20 && runs=$(( N < 10 ? N : 10 ))
     if ! $BIN --backend native -o "$W/ok-$name" "$f" >/dev/null 2>&1; then
         echo "| $name | does not compile: $($BIN "$f" 2>&1 | grep -m1 error | cut -c1-90) |"
         continue

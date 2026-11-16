@@ -17,7 +17,23 @@
 #include "v2/compiler/mir/mir.h"
 #include <string.h>
 
-#define MAX_LOCALS 512
+// A function's locals: no limit (512 was fatal). Two pools, grown as needed: one for a lowering
+// and one for a lowering nested in it (mir_nest_begin), whose L is a copy that must not write
+// over the caller's.
+typedef struct
+{
+    NameId name;
+    MirSlot slot;
+    uint8_t ref; // the slot holds the address of the value (an array parameter); LOCAL_FIELDS
+} LowerLocal;
+
+typedef struct LocalSlot
+{
+    NameId name; // 0: empty
+    uint32_t at; // 1 + the index of the latest local of the name; 0: none
+} LocalSlot;
+static LowerLocal *local_pool[2];
+static uint32_t local_pool_cap[2];
 #define MAX_TRACKED 8192 // slots whose "is a local" bit is kept; beyond, results are copied
 
 #define SLOT_PERM 0x80000000u // constructor values: perm_base + k
@@ -30,12 +46,11 @@ typedef struct
     MirFunc *f;
     int errors;
     uint32_t top, max_top, perm;
-    struct
-    {
-        NameId name;
-        MirSlot slot;
-        uint8_t ref; // the slot holds the address of the value (an array parameter); LOCAL_FIELDS
-    } locals[MAX_LOCALS];
+    LowerLocal *locals; // local_pool[pool], or NULL until the first local
+    struct LocalSlot *lmap; // past LOCALS_BY_WALK locals: name -> latest local (local_index)
+    uint32_t lmap_cap, lmap_used;
+    uint32_t locals_cap;
+    int pool;
     int nlocals;
     NodeId rest_of, rest; // the statement being lowered in a block, and the ones after it
     int has_self;   // slot 0 holds self (a reference)
@@ -217,7 +232,7 @@ static void keep_if_small(const MirFunc *f)
     for (size_t i = 0; i < f->n; i++)
     {
         uint8_t op = f->code[i].op;
-        if (op == MIR_CALL || op == MIR_ADDR || op == MIR_ZERO || op == MIR_MOVE || (op == MIR_RET && f->code[f->n - 1].op != MIR_RET))
+        if (op == MIR_CALL || op == MIR_ADDR || op == MIR_ZERO || op == MIR_MOVE || op == MIR_LOADN || (op == MIR_RET && f->code[f->n - 1].op != MIR_RET))
         {
             return; // (a return before the end, each arm's, becomes a jump to the end when spliced)
         }
@@ -387,6 +402,8 @@ static int slot_read(const MirFunc *f, const MirInst *in, MirSlot s)
     case MIR_ZERO:
     case MIR_MOVE:
         return s >= in->a && s < in->a + in->imm;
+    case MIR_LOADN:
+        return in->a == s;
     case MIR_CALL:
         return s >= f->frame_size;
     case MIR_RET:
@@ -443,6 +460,18 @@ static void drop_dead_values(MirFunc *f)
     for (size_t i = 0; i < f->n; i++)
     {
         const MirInst *in = &f->code[i];
+        if (in->op == MIR_LOADN)
+        {
+            for (uint64_t k = 0; k < in->imm && in->d + k < nslots; k++)
+            {
+                nreads[in->d + k] = UINT32_MAX / 2; // never dropped (the block it writes)
+            }
+            if (in->a < nslots)
+            {
+                nreads[in->a] = UINT32_MAX / 2;
+            }
+            continue;
+        }
         if (in->op == MIR_ADDR || in->op == MIR_ZERO || in->op == MIR_MOVE)
         {
             for (uint64_t k = 0; k < in->imm && in->a + k < nslots; k++)
@@ -722,6 +751,7 @@ static void reframe_inst(MirInst *in, uint32_t from, uint32_t to)
     case MIR_NOT:
     case MIR_NORM:
     case MIR_MOVE:
+    case MIR_LOADN:
         in->d = reframe(in->d, from, to);
         in->a = reframe(in->a, from, to);
         break;
@@ -1108,17 +1138,30 @@ static void push_local(NameId name, MirSlot slot)
     push_local_n(name, slot, 1);
 }
 
+static uint32_t *lower_entry(NameId name, int add);
+
 static void push_local_n(NameId name, MirSlot slot, uint32_t k)
 {
-    if (L.nlocals == MAX_LOCALS)
+    if ((uint32_t)L.nlocals >= L.locals_cap)
     {
-        fprintf(stderr, "fatal: too many locals in one function\n");
-        exit(2);
+        int p = L.pool;
+        if ((uint32_t)L.nlocals >= local_pool_cap[p])
+        {
+            uint32_t cap = local_pool_cap[p] ? local_pool_cap[p] * 2 : 256;
+            local_pool[p] = (LowerLocal *)realloc(local_pool[p], cap * sizeof(LowerLocal));
+            local_pool_cap[p] = cap;
+        }
+        L.locals = local_pool[p];
+        L.locals_cap = local_pool_cap[p];
     }
     L.locals[L.nlocals].name = name;
     L.locals[L.nlocals].slot = slot;
     L.locals[L.nlocals].ref = 0;
     L.nlocals++;
+    if (L.lmap)
+    {
+        *lower_entry(name, 1) = (uint32_t)L.nlocals;
+    }
     for (uint32_t j = 0; j < k; j++)
     {
         if (slot + j < MAX_TRACKED)
@@ -1128,31 +1171,120 @@ static void push_local_n(NameId name, MirSlot slot, uint32_t k)
     }
 }
 
-static int find_local_ref(NameId name, MirSlot *slot, int *ref)
+// The latest local of a name, as in check.c's local_find: past LOCALS_BY_WALK locals through a
+// map (NameId -> 1 + index), so n locals cost n lookups, not n² steps. An entry is exact for what
+// was pushed since the map was made; one a block that ended took is found again by the walk.
+// A nested lowering (mir_nest_begin) starts without the map, and its own is dropped with it.
+#define LOCALS_BY_WALK 32
+
+static uint32_t *lower_entry(NameId name, int add);
+
+static void lower_map_make(uint32_t cap)
 {
-    for (int i = L.nlocals - 1; i >= 0; i--)
+    LocalSlot *old = L.lmap;
+    uint32_t old_cap = L.lmap_cap;
+    L.lmap = (LocalSlot *)arena_alloc((size_t)cap * sizeof(LocalSlot));
+    memset(L.lmap, 0, (size_t)cap * sizeof(LocalSlot));
+    L.lmap_cap = cap;
+    L.lmap_used = 0;
+    for (uint32_t i = 0; i < old_cap; i++)
     {
-        if (L.locals[i].name == name)
+        if (old[i].name)
         {
-            *slot = L.locals[i].slot;
-            *ref = L.locals[i].ref;
-            return 1;
+            *lower_entry(old[i].name, 1) = old[i].at;
         }
     }
-    return 0;
+}
+
+static uint32_t *lower_entry(NameId name, int add)
+{
+    uint32_t mask = L.lmap_cap - 1, i = (name * 0x9e3779b1u) & mask;
+    while (L.lmap[i].name)
+    {
+        if (L.lmap[i].name == name)
+        {
+            return &L.lmap[i].at;
+        }
+        i = (i + 1) & mask;
+    }
+    if (!add)
+    {
+        return NULL;
+    }
+    if ((L.lmap_used + 1) * 2 > L.lmap_cap)
+    {
+        lower_map_make(L.lmap_cap * 2);
+        return lower_entry(name, 1);
+    }
+    L.lmap_used++;
+    L.lmap[i] = (LocalSlot){name, 0};
+    return &L.lmap[i].at;
+}
+
+static int lower_walk(NameId name)
+{
+    int i = L.nlocals - 1;
+    while (i >= 0 && L.locals[i].name != name)
+    {
+        i--;
+    }
+    return i;
+}
+
+static int local_index(NameId name) // the index in L.locals, or -1
+{
+    if (!L.lmap)
+    {
+        if (L.nlocals <= LOCALS_BY_WALK)
+        {
+            return lower_walk(name);
+        }
+        uint32_t cap = 256;
+        while (cap < (uint32_t)L.nlocals * 4)
+        {
+            cap *= 2;
+        }
+        lower_map_make(cap);
+        for (int i = 0; i < L.nlocals; i++)
+        {
+            *lower_entry(L.locals[i].name, 1) = (uint32_t)i + 1;
+        }
+    }
+    uint32_t *at = lower_entry(name, 0);
+    if (!at)
+    {
+        return -1;
+    }
+    if (*at && *at <= (uint32_t)L.nlocals && L.locals[*at - 1].name == name)
+    {
+        return (int)*at - 1;
+    }
+    int i = *at ? lower_walk(name) : -1;
+    *at = (uint32_t)(i + 1);
+    return i;
+}
+
+static int find_local_ref(NameId name, MirSlot *slot, int *ref)
+{
+    int i = local_index(name);
+    if (i < 0)
+    {
+        return 0;
+    }
+    *slot = L.locals[i].slot;
+    *ref = L.locals[i].ref;
+    return 1;
 }
 
 static int find_local(NameId name, MirSlot *slot)
 {
-    for (int i = L.nlocals - 1; i >= 0; i--)
+    int i = local_index(name);
+    if (i < 0)
     {
-        if (L.locals[i].name == name)
-        {
-            *slot = L.locals[i].slot;
-            return 1;
-        }
+        return 0;
     }
-    return 0;
+    *slot = L.locals[i].slot;
+    return 1;
 }
 
 // ---- variants: the C types of the C backend's output ------------------------------------------
@@ -2032,8 +2164,9 @@ enum
     SINK_UINT,
     SINK_INT,
     SINK_BOOL,
+    SINK_ERROR, // print(e): the error's name (write_error), once per program past ERRORS_INLINE
 };
-static const char *const sink_labels[] = {"out.string", "out.unsigned", "out.signed", "out.bool"};
+static const char *const sink_labels[] = {"out.string", "out.unsigned", "out.signed", "out.bool", "out.error"};
 
 #define MAX_SINK_HELPERS 256
 typedef struct
@@ -2087,6 +2220,7 @@ static void sink_value(int kind, MirSlot v)
 }
 
 static void finish_frame(MirFunc *out);
+static void write_error_names(MirSlot e);
 
 int mir_next_helper(MirFunc *out)
 {
@@ -2114,7 +2248,14 @@ int mir_next_helper(MirFunc *out)
         sink_slot = 0;
         sink_put = put;
         int kind = sink_helpers[i].kind;
-        kind == SINK_STR ? sink_string(1) : kind == SINK_BOOL ? sink_bool(1) : sink_number(1, kind == SINK_INT);
+        if (kind == SINK_ERROR)
+        {
+            write_error_names(1);
+        }
+        else
+        {
+            kind == SINK_STR ? sink_string(1) : kind == SINK_BOOL ? sink_bool(1) : sink_number(1, kind == SINK_INT);
+        }
         sink_put = 0;
         inst(MIR_RET);
         finish_frame(out);
@@ -2296,10 +2437,15 @@ static void write_text(const char *text)
     w->a = str;
 }
 
-static void write_error(MirSlot e)
+// print(e): the error's name, or `error N`. A test per error the program can name, so past
+// ERRORS_INLINE of them the tests are a routine made once per program (and per `put`), called
+// from each print: inline, prints x errors labels filled a function's 4096 (100 x 100 did not
+// compile on native). The compiler's own runs keep them inline (the interpreter has no routines).
+#define ERRORS_INLINE 8
+static void write_error_names(MirSlot e)
 {
-    static uint64_t ids[512];
-    uint32_t n = sema_errors_list(ids, 512);
+    uint32_t n;
+    const uint64_t *ids = sema_errors(&n);
     uint32_t end = new_label();
     for (uint32_t i = 0; i <= n; i++)
     {
@@ -2331,6 +2477,29 @@ static void write_error(MirSlot e)
         w->a = e;
     }
     place_label(end);
+}
+
+static void write_error(MirSlot e)
+{
+    uint32_t n;
+    sema_errors(&n);
+    SymId h = n > ERRORS_INLINE && !L.for_compiler && !sema_capturing() ? sink_helper(SINK_ERROR) : 0;
+    if (!h)
+    {
+        write_error_names(e);
+        return;
+    }
+    flush_pending(); // the text before it goes out first
+    if (sink_put)
+    {
+        MirInst *c = inst(MIR_COPY);
+        c->d = SLOT_WIN | 0;
+        c->a = sink_slot;
+    }
+    MirInst *c = inst(MIR_COPY);
+    c->d = SLOT_WIN | 1;
+    c->a = e;
+    inst(MIR_CALL)->imm = h;
 }
 
 static MirSlot lower_output(NodeId args, int newline, SymId put)
@@ -4179,9 +4348,8 @@ static MirSlot lower_expr(NodeId id)
         {
             // &n of a number local: its slot, which is memory from now on (LOCAL_BOXED)
             NameId name = token_name(TOK(u, NODE(u, n->a)->tok));
-            for (int i = L.nlocals - 1; i >= 0; i--)
+            for (int i = local_index(name); i >= 0; i = -1)
             {
-                if (L.locals[i].name == name)
                 {
                     if (L.locals[i].ref == 0)
                     {
@@ -5654,14 +5822,10 @@ int mir_lower(Unit *u, SymId fn, MirFunc *out)
         }
         uint32_t k = slots_of(pt);
         MirSlot block = temp_n(k);
-        for (uint32_t j = 0; j < k; j++)
-        {
-            MirInst *ld = inst(MIR_LOAD);
-            ld->var = MV_U64;
-            ld->d = block + j;
-            ld->a = from;
-            ld->imm = 8 * j;
-        }
+        MirInst *ld = inst(MIR_LOADN); // one block copy, not a load per element
+        ld->d = block;
+        ld->a = from;
+        ld->imm = k;
         push_local_n(name, block, k);
     }
 
@@ -5760,6 +5924,11 @@ int mir_nest_begin(void)
     }
     nest_base = region_end(REGION_MIR);
     saved_L = L;
+    L.pool = 1; // its own locals: saved_L's stay where they are
+    L.locals = NULL;
+    L.locals_cap = 0;
+    L.lmap = NULL; // and its own map
+    L.lmap_cap = L.lmap_used = 0;
     return 1;
 }
 
@@ -5886,7 +6055,7 @@ void mir_print(const MirFunc *f, FILE *out)
     static const char *const ops[MIR__COUNT] = {
         "const", "copy", "addr", "zero", "load", "store", "bin", "bini", "neg",
         "not",   "norm", "label", "jz",  "jnz",  "call",  "ret", "str",  "write", "gload", "gstore",
-        "trap",  "jump", "gaddr", "desc", "move",
+        "trap",  "jump", "gaddr", "desc", "move", "loadn",
     };
     static const char *const bins[MB__COUNT] = {"add", "sub", "mul", "div", "eq",
                                                 "ne",  "lt",  "le",  "gt",  "ge"};

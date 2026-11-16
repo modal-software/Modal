@@ -141,6 +141,10 @@ max(T: type, a: T, b: T): T { ... }    -- T is compile time: its type is `type`
 big := max(u64, x, y)                  -- one copy of max for u64, made once and kept
 ```
 
+A type variable (context.md §67) says the same with no parameter: `T: type` declared once at
+module level (std/type.modal has `T`), then `max(a: T, b: T): T` reads T from the arguments,
+`big := max(x, y)`. The parameter form stays for a type no argument has.
+
 Every distinct set of compile-time arguments gets one specialization. Specializations are
 cached and shared (p.md B5), so `max(u64, ...)` used ten times is one function.
 

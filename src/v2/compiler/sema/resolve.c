@@ -157,6 +157,185 @@ static int same_types(const Unit *u, NodeId pa, NodeId pb)
     return pa == pb;
 }
 
+// ---- the clause index ---------------------------------------------------------------------------
+//
+// One open-addressing table per unit, built while its declarations are read, and only for names
+// defined more than once. Each group of definitions (the first one's SymId) has a tail entry
+// (where the next definition hangs), one entry per signature (types and patterns) and one per
+// catch-all (types, no patterns). A hash match is confirmed with the exact comparison.
+
+enum
+{
+    CLAUSE_TAIL = 1,
+    CLAUSE_SIG,
+    CLAUSE_CATCHALL,
+};
+
+typedef struct
+{
+    SymId first; // 0: empty
+    uint32_t key;
+    SymId sym;
+    uint32_t kind;
+} ClauseEntry;
+
+static ClauseEntry *clauses;
+static uint32_t clauses_cap, clauses_used;
+
+static uint32_t mix32(uint32_t h, uint32_t v)
+{
+    h ^= v + 0x9e3779b9u + (h << 6) + (h >> 2);
+    return h;
+}
+
+// Follows type_equal: what it calls equal hashes equal.
+static uint32_t type_hash(const Unit *u, NodeId a)
+{
+    uint32_t h = 0x811c9dc5u;
+    while (a)
+    {
+        const AstNode *x = NODE(u, a);
+        h = mix32(h, x->kind);
+        if (x->kind == AST_TYPE_NAME)
+        {
+            const Token *f = TOK(u, x->tok), *l = TOK(u, x->tok + 2u * x->aux);
+            size_t n = (size_t)((TSTART(l) + l->len) - TSTART(f));
+            return mix32(h, (uint32_t)hash_bytes(TSTART(f), n, 0));
+        }
+        if (x->kind == AST_TYPE_STRUCT)
+        {
+            return mix32(h, a);
+        }
+        a = x->a;
+    }
+    return h;
+}
+
+static NodeId skip_self(const Unit *u, NodeId param);
+
+// The parameter types (self aside) and, with `patterns`, what same_pattern compares.
+static uint32_t signature_hash(const Unit *u, NodeId params, int patterns)
+{
+    uint32_t h = 0;
+    for (NodeId p = skip_self(u, params); p; p = NEXT(u, p))
+    {
+        const AstNode *n = NODE(u, p);
+        h = mix32(h, type_hash(u, n->a));
+        if (!patterns)
+        {
+            continue;
+        }
+        if (!(n->flags & AST_F_PATTERN))
+        {
+            h = mix32(h, 1);
+            continue;
+        }
+        h = mix32(h, n->aux);
+        uint32_t span = (n->aux & PAT_RANGE) ? ((n->aux & PAT_OPEN) ? 2 : (n->aux & PAT_NEG_HI) ? 4 : 3) : 1;
+        for (uint32_t k = 0; k < span; k++)
+        {
+            const Token *t = TOK(u, n->tok + k);
+            h = mix32(h, (uint32_t)hash_bytes(TSTART(t), t->len, 0));
+        }
+    }
+    return h;
+}
+
+static uint32_t clause_slot(SymId first, uint32_t key, uint32_t kind)
+{
+    return mix32(mix32(first * 0x9e3779b1u, key), kind) & (clauses_cap - 1);
+}
+
+static void clause_put(SymId first, uint32_t key, uint32_t kind, SymId sym);
+
+static void clauses_grow(void)
+{
+    ClauseEntry *old = clauses;
+    uint32_t old_cap = clauses_cap;
+    clauses_cap = old_cap ? old_cap * 2 : 256;
+    clauses = (ClauseEntry *)arena_alloc((size_t)clauses_cap * sizeof(ClauseEntry));
+    memset(clauses, 0, (size_t)clauses_cap * sizeof(ClauseEntry));
+    clauses_used = 0;
+    for (uint32_t i = 0; i < old_cap; i++)
+    {
+        if (old[i].first)
+        {
+            clause_put(old[i].first, old[i].key, old[i].kind, old[i].sym);
+        }
+    }
+}
+
+static void clause_put(SymId first, uint32_t key, uint32_t kind, SymId sym)
+{
+    if ((clauses_used + 1) * 2 > clauses_cap)
+    {
+        clauses_grow();
+    }
+    uint32_t i = clause_slot(first, key, kind);
+    while (clauses[i].first)
+    {
+        i = (i + 1) & (clauses_cap - 1);
+    }
+    clauses[i] = (ClauseEntry){first, key, sym, kind};
+    clauses_used++;
+}
+
+static int same_signature(const Unit *u, NodeId pa, NodeId pb);
+static int same_types(const Unit *u, NodeId pa, NodeId pb);
+static int has_patterns(const Unit *u, NodeId params);
+
+// The definition of group `first` with this signature (CLAUSE_SIG) or this catch-all
+// (CLAUSE_CATCHALL), or 0.
+static SymId clause_find(const Unit *u, uint32_t kind, SymId first, uint32_t key, NodeId params)
+{
+    for (uint32_t i = clause_slot(first, key, kind); clauses[i].first; i = (i + 1) & (clauses_cap - 1))
+    {
+        const ClauseEntry *e = &clauses[i];
+        if (e->first != first || e->key != key || e->kind != kind)
+        {
+            continue;
+        }
+        NodeId theirs = sema_callable_params(u, SYM(e->sym)->decl);
+        if (kind == CLAUSE_SIG ? same_signature(u, theirs, params) : same_types(u, theirs, params))
+        {
+            return e->sym;
+        }
+    }
+    return 0;
+}
+
+static SymId *clause_tail(SymId first)
+{
+    for (uint32_t i = clause_slot(first, first, CLAUSE_TAIL); clauses[i].first; i = (i + 1) & (clauses_cap - 1))
+    {
+        if (clauses[i].first == first && clauses[i].kind == CLAUSE_TAIL)
+        {
+            return &clauses[i].sym;
+        }
+    }
+    return NULL; // clause_index_first put it there
+}
+
+static void clause_index_add(const Unit *u, SymId first, SymId sym, NodeId params)
+{
+    clause_put(first, signature_hash(u, params, 1), CLAUSE_SIG, sym);
+    if (!has_patterns(u, params))
+    {
+        clause_put(first, signature_hash(u, params, 0), CLAUSE_CATCHALL, sym);
+    }
+}
+
+// A group enters the index when its second definition is read.
+static void clause_index_first(const Unit *u, SymId first)
+{
+    if (clauses_cap && clause_tail(first))
+    {
+        return;
+    }
+    clause_put(first, first, CLAUSE_TAIL, first);
+    clause_index_add(u, first, first, sema_callable_params(u, SYM(first)->decl));
+}
+
 // ---- declarations ----------------------------------------------------------------------------
 
 static void declare_value(Unit *u, Scope *scope, SymId owner, SymKind kind, uint8_t flags,
@@ -208,30 +387,32 @@ static void declare_callable(Unit *u, Scope *scope, SymId owner, uint32_t tok, N
     }
 
     // Clauses: definitions with as many parameters are tried in order, so one without
-    // patterns catches everything and must come last.
+    // patterns catches everything and must come last. The group's index answers "the same
+    // signature?" and "a catch-all of these types?" by hash, so n clauses cost n, not n².
     NodeId mine = sema_callable_params(u, decl);
-    SymId last = first;
-    for (SymId s = first; s; s = SYM(s)->next_overload)
+    clause_index_first(u, first);
+    uint32_t sig = signature_hash(u, mine, 1), types = signature_hash(u, mine, 0);
+    SymId s = clause_find(u, CLAUSE_SIG, first, sig, mine);
+    if (s)
     {
-        NodeId theirs = sema_callable_params(u, SYM(s)->decl);
-        if (same_signature(u, theirs, mine))
-        {
-            redeclared(u, tok, s,
-                       has_patterns(u, mine) ? " with the same patterns" : " with the same parameter types");
-            return;
-        }
-        if (same_types(u, theirs, mine) && !has_patterns(u, theirs))
-        {
-            redeclared(u, tok, s,
-                       ": that definition takes every value, so this clause would never run. Clauses "
-                       "are tried in order: put the ones with patterns first");
-            return;
-        }
-        last = s;
+        redeclared(u, tok, s,
+                   has_patterns(u, mine) ? " with the same patterns" : " with the same parameter types");
+        return;
+    }
+    s = clause_find(u, CLAUSE_CATCHALL, first, types, mine);
+    if (s)
+    {
+        redeclared(u, tok, s,
+                   ": that definition takes every value, so this clause would never run. Clauses "
+                   "are tried in order: put the ones with patterns first");
+        return;
     }
     // Later overloads hang off the first one; only the first sits in the hash bucket.
     SymId added = symbol_new(u, SYM_METHOD, flags, tok, owner, decl);
-    SYM(last)->next_overload = added;
+    SymId *tail = clause_tail(first);
+    SYM(*tail)->next_overload = added;
+    *tail = added;
+    clause_index_add(u, first, added, mine);
 }
 
 // Where does a top-level callable live? Returns the scope and sets *owner, or NULL on error.
@@ -404,8 +585,48 @@ static void declare_struct(Unit *u, Scope *scope, SymId owner, NodeId decl)
     }
 }
 
+typedef struct
+{
+    uint32_t key; // the parameter types' hash; then, for a span, its column
+    uint32_t pos; // order of definition in the chain
+} ClauseKey;
+
+typedef struct
+{
+    uint64_t lo, hi;  // order keys (sema_pattern_span); a string: its bytes' hash in lo, length in hi
+    uint32_t col;     // the parameter holding the clause's only pattern; strings: | 1u << 31
+    uint32_t pos;
+    uint32_t tok;     // a string's literal
+} ClauseSpan;
+
+typedef struct
+{
+    uint32_t later, earlier; // positions
+} ClausePair;
+
+static SymId *chain_syms;
+static size_t chain_cap;
+static ClauseKey *chain_keys;
+static size_t keys_cap;
+static ClauseSpan *chain_spans;
+static size_t spans_cap;
+static ClausePair *chain_pairs;
+static size_t pairs_cap, pairs_n;
+
+static void clause_last(Unit *u, SymId s);
+static void clause_chain(Unit *u, SymId head, uint8_t *seen, SymId first_sym);
+
 void sema_declare(Unit *u)
 {
+    // the clause index and the chain buffers live in the arena, which a new compilation empties
+    clauses = NULL;
+    clauses_cap = clauses_used = 0;
+    chain_syms = NULL;
+    chain_keys = NULL;
+    chain_spans = NULL;
+    chain_pairs = NULL;
+    chain_cap = keys_cap = spans_cap = pairs_cap = 0;
+    SymId first_sym = (SymId)cx.syms.size;
     u->scope = scope_new(NULL, 0, bucket_count(u, NODE(u, u->root)->a, SCOPE_MODULE_BUCKETS));
 
     // Pass 1: structs, so that `name(self: T)` can attach to a T declared further down.
@@ -457,79 +678,272 @@ void sema_declare(Unit *u)
     }
 
     // Every group of clauses ends with one that takes every value: a call always finds one.
-    for (SymId s = 1; s < cx.syms.size; s++)
+    // Each chain of definitions is read once (its first one has the lowest SymId), so the
+    // check costs what the clauses cost, with n log n sorts in place of pairs.
+    uint32_t count = (uint32_t)cx.syms.size - first_sym;
+    uint8_t *seen = NULL;
+    for (SymId s = first_sym; s < cx.syms.size; s++)
     {
         const Symbol *sym = SYM(s);
         if (sym->unit != u->id || sym->kind != SYM_METHOD || !(sym->flags & SYM_F_MUT))
         {
             continue;
         }
-        NodeId params = sema_callable_params(u, sym->decl);
-        if (!has_patterns(u, params))
+        if (!sym->next_overload)
+        {
+            if (seen && (seen[(s - first_sym) >> 3] >> ((s - first_sym) & 7) & 1))
+            {
+                continue; // the last of a chain read already
+            }
+            clause_last(u, s); // a definition alone
+            continue;
+        }
+        if (seen && (seen[(s - first_sym) >> 3] >> ((s - first_sym) & 7) & 1))
         {
             continue;
         }
-        int n = arity(u, params), later = 0;
-        for (SymId t = sym->next_overload; t; t = SYM(t)->next_overload)
+        if (!seen)
         {
-            NodeId theirs = sema_callable_params(u, SYM(t)->decl);
-            if (!same_types(u, theirs, params))
+            seen = (uint8_t *)arena_alloc((count + 7) / 8);
+            memset(seen, 0, (count + 7) / 8);
+        }
+        clause_chain(u, s, seen, first_sym);
+    }
+}
+
+// ---- the clause groups ---------------------------------------------------------------------------
+
+// The last definition of a group: with patterns, no clause after it takes the other values.
+static void clause_last(Unit *u, SymId s)
+{
+    const Symbol *sym = SYM(s);
+    NodeId params = sema_callable_params(u, sym->decl);
+    if (!has_patterns(u, params))
+    {
+        return;
+    }
+    int n = arity(u, params);
+    // A clause set with no result may leave values to nobody (the call does nothing for them):
+    // a warning, as for arms. One that gives a value takes them all.
+    NodeId ret = fn_ret_node(u, sym->decl);
+    const Token *rt = ret ? TOK(u, NODE(u, ret)->tok) : NULL;
+    int nil = !ret || (rt->len == 3 && memcmp(TSTART(rt), "nil", 3) == 0);
+    const Token *name = TOK(u, sym->tok);
+    if (nil)
+    {
+        diag_at(u, sym->tok, "warning",
+                "'%.*s' with %d argument%s: no clause takes the other values, so a call with one does "
+                "nothing (`nil %.*s(T n) {}` last says so)",
+                name->len, TSTART(name), n, n == 1 ? "" : "s", name->len, TSTART(name));
+    }
+    else
+    {
+        diag_at(u, sym->tok, "error",
+                "'%.*s' with %d argument%s has clauses with patterns but none after them that "
+                "takes every value: add one last, e.g. `T %.*s(T n): ...`",
+                name->len, TSTART(name), n, n == 1 ? "" : "s", name->len, TSTART(name));
+    }
+}
+
+static int key_order(const void *x, const void *y)
+{
+    const ClauseKey *a = x, *b = y;
+    return a->key != b->key ? (a->key < b->key ? -1 : 1) : (a->pos > b->pos) - (a->pos < b->pos);
+}
+
+static int span_order(const void *x, const void *y)
+{
+    const ClauseSpan *a = x, *b = y;
+    if (a->col != b->col)
+    {
+        return a->col < b->col ? -1 : 1;
+    }
+    if (a->lo != b->lo)
+    {
+        return a->lo < b->lo ? -1 : 1;
+    }
+    if (a->hi != b->hi && (a->col >> 31))
+    {
+        return a->hi < b->hi ? -1 : 1;
+    }
+    return (a->pos > b->pos) - (a->pos < b->pos);
+}
+
+static int pair_order(const void *x, const void *y)
+{
+    const ClausePair *a = x, *b = y;
+    return a->later != b->later ? (a->later < b->later ? -1 : 1)
+                                : (a->earlier > b->earlier) - (a->earlier < b->earlier);
+}
+
+static void pair_add(uint32_t p, uint32_t q)
+{
+    if (pairs_n == pairs_cap)
+    {
+        chain_pairs = (ClausePair *)arena_grow(chain_pairs, sizeof(ClausePair), &pairs_cap);
+    }
+    chain_pairs[pairs_n++] = p > q ? (ClausePair){p, q} : (ClausePair){q, p};
+}
+
+static int same_string(const Unit *u, uint32_t a, uint32_t b)
+{
+    static uint8_t x[4096], y[4096];
+    size_t nx = sema_pattern_text(u, a, x, sizeof(x)), ny = sema_pattern_text(u, b, y, sizeof(y));
+    return nx == ny && memcmp(x, y, nx < sizeof(x) ? nx : sizeof(x)) == 0;
+}
+
+// Clauses take disjoint values, as arms do (std.md §8): the order decides nothing but where the
+// catch-all goes, so a value two clauses with patterns both take is an error. As for arms, the
+// check is on one column: both clauses have their only pattern in the same parameter. With
+// patterns in several places the first that matches wins. `group` holds positions in the chain.
+static void clause_group(Unit *u, const ClauseKey *group, uint32_t n)
+{
+    size_t spans = 0;
+    for (uint32_t i = 0; i < n; i++)
+    {
+        const Symbol *sym = SYM(chain_syms[group[i].pos]);
+        NodeId params = sema_callable_params(u, sym->decl);
+        uint32_t col = 0, k = 0, patterns = 0;
+        NodeId only = 0;
+        for (NodeId x = params; x; x = NEXT(u, x), k++)
+        {
+            if (NODE(u, x)->flags & AST_F_PATTERN)
             {
-                continue;
-            }
-            later = 1;
-            // Clauses take disjoint values, as arms do (std.md §8): the order decides nothing but
-            // where the catch-all goes, so a value two clauses with patterns both take is an error.
-            // As for arms, the check is on one column: both clauses have their only pattern in the
-            // same parameter. With patterns in several places the first that matches wins.
-            int every = has_patterns(u, theirs), col_x = -1, col_y = -1, nx = 0, ny = 0, k = 0;
-            for (NodeId x = params, y = theirs; x && y; x = NEXT(u, x), y = NEXT(u, y), k++)
-            {
-                if (NODE(u, x)->flags & AST_F_PATTERN)
-                {
-                    nx++;
-                    col_x = k;
-                }
-                if (NODE(u, y)->flags & AST_F_PATTERN)
-                {
-                    ny++;
-                    col_y = k;
-                }
-            }
-            every = every && nx == 1 && ny == 1 && col_x == col_y;
-            for (NodeId x = params, y = theirs; x && y && every; x = NEXT(u, x), y = NEXT(u, y))
-            {
-                every = sema_params_overlap(u, x, y, sym->owner);
-            }
-            if (every)
-            {
-                int line, col;
-                source_pos(u->src, TSTART(TOK(u, sym->tok)), &line, &col);
-                diag_at(u, SYM(t)->tok, "error",
-                        "this clause takes values the clause at line %d takes too: clauses take disjoint "
-                        "values, so what each takes is what it says", line);
+                patterns++;
+                col = k;
+                only = x;
             }
         }
-        // A clause set with no result may leave values to nobody (the call does nothing for them):
-        // a warning, as for arms. One that gives a value takes them all.
-        NodeId ret = fn_ret_node(u, sym->decl);
-        const Token *rt = ret ? TOK(u, NODE(u, ret)->tok) : NULL;
-        int nil = !ret || (rt->len == 3 && memcmp(TSTART(rt), "nil", 3) == 0);
-        if (!later && nil)
+        if (patterns != 1)
         {
-            const Token *name = TOK(u, sym->tok);
-            diag_at(u, sym->tok, "warning",
-                    "'%.*s' with %d argument%s: no clause takes the other values, so a call with one does "
-                    "nothing (`nil %.*s(T n) {}` last says so)",
-                    name->len, TSTART(name), n, n == 1 ? "" : "s", name->len, TSTART(name));
+            continue;
         }
-        else if (!later)
+        Pattern pat;
+        uint64_t lo, hi;
+        int kind = sema_pattern_span(u, only, SYM(chain_syms[group[0].pos])->owner, &pat, &lo, &hi);
+        if (!kind)
         {
-            const Token *name = TOK(u, sym->tok);
-            diag_at(u, sym->tok, "error",
-                    "'%.*s' with %d argument%s has clauses with patterns but none after them that "
-                    "takes every value: add one last, e.g. `T %.*s(T n): ...`",
-                    name->len, TSTART(name), n, n == 1 ? "" : "s", name->len, TSTART(name));
+            continue; // does not fit its type: the check of the clause says so
+        }
+        if (kind == 2)
+        {
+            static uint8_t text[4096];
+            size_t len = sema_pattern_text(u, pat.tok, text, sizeof(text));
+            lo = hash_bytes(text, len < sizeof(text) ? len : sizeof(text), 0);
+            hi = len;
+            col |= 1u << 31;
+        }
+        if (spans == spans_cap)
+        {
+            chain_spans = (ClauseSpan *)arena_grow(chain_spans, sizeof(ClauseSpan), &spans_cap);
+        }
+        chain_spans[spans++] = (ClauseSpan){lo, hi, col, group[i].pos, pat.tok};
+    }
+    if (spans < 2)
+    {
+        return;
+    }
+    qsort(chain_spans, spans, sizeof(ClauseSpan), span_order);
+    pairs_n = 0;
+    for (size_t i = 0; i < spans;)
+    {
+        size_t j = i + 1;
+        if (chain_spans[i].col >> 31) // strings: the same bytes, within one run of equal hashes
+        {
+            while (j < spans && chain_spans[j].col == chain_spans[i].col && chain_spans[j].lo == chain_spans[i].lo &&
+                   chain_spans[j].hi == chain_spans[i].hi)
+            {
+                j++;
+            }
+            for (size_t a = i + 1; a < j; a++)
+            {
+                for (size_t b = i; b < a; b++)
+                {
+                    if (same_string(u, chain_spans[a].tok, chain_spans[b].tok))
+                    {
+                        pair_add(chain_spans[a].pos, chain_spans[b].pos);
+                        break;
+                    }
+                }
+            }
+            i = j;
+            continue;
+        }
+        // numbers: sorted by low end, an interval overlaps one before it when it starts at or
+        // before the highest end seen so far
+        size_t top = i;
+        while (j < spans && chain_spans[j].col == chain_spans[i].col)
+        {
+            if (chain_spans[j].lo <= chain_spans[top].hi)
+            {
+                pair_add(chain_spans[j].pos, chain_spans[top].pos);
+            }
+            if (chain_spans[j].hi > chain_spans[top].hi)
+            {
+                top = j;
+            }
+            j++;
+        }
+        i = j;
+    }
+    qsort(chain_pairs, pairs_n, sizeof(ClausePair), pair_order);
+    for (size_t i = 0; i < pairs_n; i++)
+    {
+        int line, col;
+        source_pos(u->src, TSTART(TOK(u, SYM(chain_syms[chain_pairs[i].earlier])->tok)), &line, &col);
+        diag_at(u, SYM(chain_syms[chain_pairs[i].later])->tok, "error",
+                "this clause takes values the clause at line %d takes too: clauses take disjoint "
+                "values, so what each takes is what it says", line);
+    }
+}
+
+// One chain of definitions of a name: its groups are the definitions with the same parameter
+// types (clauses), found by sorting on the types' hash.
+static void clause_chain(Unit *u, SymId head, uint8_t *seen, SymId first_sym)
+{
+    uint32_t m = 0;
+    for (SymId t = head; t; t = SYM(t)->next_overload, m++)
+    {
+        if (m == chain_cap)
+        {
+            chain_syms = (SymId *)arena_grow(chain_syms, sizeof(SymId), &chain_cap);
+        }
+        chain_syms[m] = t;
+        seen[(t - first_sym) >> 3] |= (uint8_t)(1u << ((t - first_sym) & 7));
+    }
+    while (keys_cap < m)
+    {
+        chain_keys = (ClauseKey *)arena_grow(chain_keys, sizeof(ClauseKey), &keys_cap);
+    }
+    for (uint32_t i = 0; i < m; i++)
+    {
+        chain_keys[i] = (ClauseKey){signature_hash(u, sema_callable_params(u, SYM(chain_syms[i])->decl), 0), i};
+    }
+    qsort(chain_keys, m, sizeof(ClauseKey), key_order);
+    for (uint32_t i = 0; i < m;)
+    {
+        uint32_t j = i + 1;
+        while (j < m && chain_keys[j].key == chain_keys[i].key)
+        {
+            j++;
+        }
+        // One run of equal hashes: almost always one group. A collision splits it by comparing.
+        while (i < j)
+        {
+            NodeId rep = sema_callable_params(u, SYM(chain_syms[chain_keys[i].pos])->decl);
+            uint32_t end = i + 1;
+            for (uint32_t k = i + 1; k < j; k++)
+            {
+                if (same_types(u, sema_callable_params(u, SYM(chain_syms[chain_keys[k].pos])->decl), rep))
+                {
+                    ClauseKey keep = chain_keys[k];
+                    memmove(&chain_keys[end + 1], &chain_keys[end], (k - end) * sizeof(ClauseKey));
+                    chain_keys[end++] = keep;
+                }
+            }
+            clause_group(u, &chain_keys[i], end - i);
+            clause_last(u, chain_syms[chain_keys[end - 1].pos]);
+            i = end;
         }
     }
 }

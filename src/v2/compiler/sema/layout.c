@@ -380,6 +380,12 @@ static SymId field_of(SymId s, const Unit *home, NodeId m)
 }
 
 // The struct's own name and the names import bindings give it: whether any is marked.
+// The bits the import bindings give each struct, gathered once per symbol: each new symbol is
+// looked at once (a walk of every symbol per field was O(fields x symbols): 12,000 structs took
+// 0.5 s in emit).
+static uint8_t *binding_bits;
+static uint32_t binding_bits_cap, binding_bits_upto = 1;
+
 static int struct_marked(SymId s, uint8_t bit)
 {
     NameId own = cx.sym_names[s];
@@ -387,15 +393,32 @@ static int struct_marked(SymId s, uint8_t bit)
     {
         return 1;
     }
-    for (SymId b = 1; b < cx.syms.size; b++)
+    for (; binding_bits_upto < cx.syms.size; binding_bits_upto++)
     {
-        if (SYM(b)->kind == SYM_IMPORT && cx.sym_names[b] < F.n && (F.bits[cx.sym_names[b]] & bit) &&
-            module_binding_target(b) == s)
+        SymId b = binding_bits_upto;
+        if (SYM(b)->kind != SYM_IMPORT || cx.sym_names[b] >= F.n || !F.bits[cx.sym_names[b]])
         {
-            return 1;
+            continue;
         }
+        SymId t = module_binding_target(b);
+        if (!t)
+        {
+            continue;
+        }
+        if (t >= binding_bits_cap)
+        {
+            uint32_t n = binding_bits_cap ? binding_bits_cap : 256;
+            while (n <= t)
+            {
+                n *= 2;
+            }
+            binding_bits = realloc(binding_bits, n);
+            memset(binding_bits + binding_bits_cap, 0, n - binding_bits_cap);
+            binding_bits_cap = n;
+        }
+        binding_bits[t] |= F.bits[cx.sym_names[b]];
     }
-    return 0;
+    return s < binding_bits_cap && (binding_bits[s] & bit);
 }
 
 int layout_field_use(SymId field, uint64_t *value)

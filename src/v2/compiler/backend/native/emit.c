@@ -39,7 +39,6 @@ typedef struct
     uint32_t ref; // a label or a function symbol
 } Fixup;
 
-#define MAX_LABELS 4096
 #define NOT_EMITTED ((size_t)-1)
 
 typedef struct
@@ -80,7 +79,8 @@ typedef struct
 
     Fixup *jumps; // branches of the function being emitted
     size_t njumps, jumps_cap;
-    size_t labels[MAX_LABELS];
+    size_t *labels; // per label of the function being emitted (grown to its nlabels: no limit)
+    size_t labels_cap;
 
     // `main` is a constant program: after the optimizer its MIR only writes constant text and
     // returns a constant. Then the whole program is that text and that status (see const_entry).
@@ -432,11 +432,10 @@ static size_t remap(void *list, size_t n, size_t stride, const uint8_t *keep, co
 // function, the one it became (SIZE_MAX: itself or dropped).
 typedef struct
 {
-    const Fixup *calls;
-    size_t ncalls;
-    size_t rt_lo, rt_hi;   // its runtime calls in nat.rtcalls
-    size_t ext_lo, ext_hi; // its C calls in nat.externs
-} FnFixups;
+    uint32_t first_call, ncalls; // its calls: nat.calls[first_call ..]
+    uint32_t rt_lo, rt_hi;       // its runtime calls in nat.rtcalls
+    uint32_t ext_lo, ext_hi;     // its C calls in nat.externs
+} FnFixups; // (indices, not pointers and size_t: 24 bytes a function, not 48)
 
 static int same_function(size_t i, size_t j, const FnFixups *fx)
 {
@@ -452,7 +451,7 @@ static int same_function(size_t i, size_t j, const FnFixups *fx)
     }
     for (size_t k = 0; k < fx[i].ncalls; k++)
     {
-        const Fixup *x = &fx[i].calls[k], *y = &fx[j].calls[k];
+        const Fixup *x = &nat.calls[fx[i].first_call + k], *y = &nat.calls[fx[j].first_call + k];
         if (x->at - a->at != y->at - b->at || x->ref != y->ref || x->reloc != y->reloc ||
             x->addend != y->addend)
         {
@@ -479,49 +478,49 @@ static int same_function(size_t i, size_t j, const FnFixups *fx)
     return 1;
 }
 
-static size_t *fold_identical(uint8_t *keep)
+static uint32_t *fold_identical(uint8_t *keep)
 {
     size_t nf = nat.norder;
-    size_t *alias = (size_t *)arena_alloc(nf * sizeof(size_t));
+    uint32_t *alias = (uint32_t *)arena_alloc(nf * sizeof(uint32_t));
     FnFixups *fx = (FnFixups *)arena_alloc(nf * sizeof(FnFixups));
     size_t nbuckets = 1;
     while (nbuckets < nf * 2)
     {
         nbuckets <<= 1;
     }
-    size_t *bucket = (size_t *)arena_alloc(nbuckets * sizeof(size_t));
+    uint32_t *bucket = (uint32_t *)arena_alloc(nbuckets * sizeof(uint32_t));
     for (size_t b = 0; b < nbuckets; b++)
     {
-        bucket[b] = SIZE_MAX;
+        bucket[b] = UINT32_MAX;
     }
     size_t rt = 0, ext = 0;
     for (size_t i = 0; i < nf; i++)
     {
-        alias[i] = SIZE_MAX;
+        alias[i] = UINT32_MAX;
         size_t at = nat.order[i].at, end = i + 1 < nf ? nat.order[i + 1].at : nat.len;
         size_t c_end = i + 1 < nf ? nat.order[i + 1].first_call : nat.ncalls;
-        fx[i].calls = nat.calls ? nat.calls + nat.order[i].first_call : NULL;
-        fx[i].ncalls = c_end - nat.order[i].first_call;
+        fx[i].first_call = (uint32_t)nat.order[i].first_call;
+        fx[i].ncalls = (uint32_t)(c_end - nat.order[i].first_call);
         while (rt < nat.nrtcalls && nat.rtcalls[rt].at < at)
         {
             rt++;
         }
-        fx[i].rt_lo = rt;
+        fx[i].rt_lo = (uint32_t)rt;
         while (rt < nat.nrtcalls && nat.rtcalls[rt].at < end)
         {
             rt++;
         }
-        fx[i].rt_hi = rt;
+        fx[i].rt_hi = (uint32_t)rt;
         while (ext < nat.nexterns && nat.externs[ext].at < at)
         {
             ext++;
         }
-        fx[i].ext_lo = ext;
+        fx[i].ext_lo = (uint32_t)ext;
         while (ext < nat.nexterns && nat.externs[ext].at < end)
         {
             ext++;
         }
-        fx[i].ext_hi = ext;
+        fx[i].ext_hi = (uint32_t)ext;
         if (!keep[i] || i + 1 == nf || !nat.order[i].sym)
         {
             continue; // the entry stays itself
@@ -533,19 +532,19 @@ static size_t *fold_identical(uint8_t *keep)
         }
         for (size_t k = 0; k < fx[i].ncalls; k++)
         {
-            h = (h ^ fx[i].calls[k].ref) * 1099511628211ull;
+            h = (h ^ nat.calls[fx[i].first_call + k].ref) * 1099511628211ull;
         }
         size_t b = (size_t)(h ^ (h >> 29)) & (nbuckets - 1);
-        for (; bucket[b] != SIZE_MAX; b = (b + 1) & (nbuckets - 1))
+        for (; bucket[b] != UINT32_MAX; b = (b + 1) & (nbuckets - 1))
         {
             if (same_function(bucket[b], i, fx))
             {
                 break;
             }
         }
-        if (bucket[b] == SIZE_MAX)
+        if (bucket[b] == UINT32_MAX)
         {
-            bucket[b] = i;
+            bucket[b] = (uint32_t)i;
             continue;
         }
         alias[i] = bucket[b];
@@ -563,19 +562,19 @@ static void shake(void)
     size_t nf = nat.norder;
     uint8_t *keep = (uint8_t *)arena_alloc(nf);
     size_t *start = (size_t *)arena_alloc(nf * sizeof(size_t));
-    size_t *stack = (size_t *)arena_alloc(nf * sizeof(size_t));
-    size_t *index_of = (size_t *)arena_alloc(cx.syms.cap * sizeof(size_t));
+    uint32_t *stack = (uint32_t *)arena_alloc(nf * sizeof(uint32_t));
+    uint32_t *index_of = (uint32_t *)arena_alloc(cx.syms.cap * sizeof(uint32_t));
     memset(keep, 0, nf);
     for (size_t i = 0; i < nf; i++)
     {
         if (nat.order[i].sym)
         {
-            index_of[nat.order[i].sym] = i;
+            index_of[nat.order[i].sym] = (uint32_t)i;
         }
     }
     size_t sp = 0;
     keep[nf - 1] = 1; // the entry
-    stack[sp++] = nf - 1;
+    stack[sp++] = (uint32_t)(nf - 1);
     while (sp)
     {
         size_t f = stack[--sp];
@@ -587,7 +586,7 @@ static void shake(void)
             {
                 continue; // reported when the calls are filled
             }
-            size_t g = index_of[callee];
+            uint32_t g = index_of[callee];
             if (!keep[g])
             {
                 keep[g] = 1;
@@ -596,7 +595,7 @@ static void shake(void)
         }
     }
 
-    size_t *alias = fold_identical(keep);
+    uint32_t *alias = fold_identical(keep);
 
     size_t to = nat.order[0].at;
     for (size_t i = 0; i < nf; i++)
@@ -617,7 +616,7 @@ static void shake(void)
         if (nat.order[i].sym)
         {
             nat.fn_at[nat.order[i].sym] = keep[i]                ? start[i]
-                                          : alias[i] != SIZE_MAX ? start[alias[i]]
+                                          : alias[i] != UINT32_MAX ? start[alias[i]]
                                                                  : NOT_EMITTED;
         }
     }
@@ -711,14 +710,14 @@ static uint32_t ret_slots, addressed_lo, addressed_hi;
 // Loops: a branch back to a label before it. Within one, a value is read again on the next
 // pass, before the place it was written, so the accumulator may stand in for it only if no
 // other instruction of the loop reads it. (MIR from output sinks has loops; source has none.)
-#define MAX_LOOPS 256
-static struct
+typedef struct
 {
     uint32_t lo, hi; // MIR indices: the label and the branch back to it
-} loops[MAX_LOOPS];
-static uint32_t nloops;
-static int loops_overflow; // more loops than recorded: no accumulator at all in this function
-static uint32_t label_index[MAX_LABELS];
+} Loop;
+static Loop *loops; // grown: past a fixed 256 the whole function lost its accumulator
+static uint32_t nloops, loops_cap;
+static int loops_overflow; // (no longer set: kept so a cap can come back without new code)
+static uint32_t *label_index; // as nat.labels: grown to the function's nlabels
 
 static int reads(const MirInst *in, MirSlot s, uint32_t frame_size)
 {
@@ -747,6 +746,8 @@ static int reads(const MirInst *in, MirSlot s, uint32_t frame_size)
         return s >= in->a && s < in->a + in->imm; // its address escapes
     case MIR_MOVE:
         return s >= in->a && s < in->a + in->imm;
+    case MIR_LOADN:
+        return in->a == s;
     default:
         return 0;
     }
@@ -959,6 +960,7 @@ static int clobbers(const MirInst *in)
     case MIR_ZERO:
         return in->imm > 16;
     case MIR_MOVE:
+    case MIR_LOADN:
         return 1;
     case MIR_BIN:
     case MIR_BINI:
@@ -2111,7 +2113,7 @@ static void plan_homes(const MirFunc *f)
     for (size_t k = 0; k < f->n && nat.arch->cpu == CPU_X86_64; k++)
     {
         const MirInst *in = &ra.code[k];
-        if (clobbers(in) && in->op != MIR_CALL && in->op != MIR_WRITE && in->op != MIR_ZERO && in->op != MIR_MOVE)
+        if (clobbers(in) && in->op != MIR_CALL && in->op != MIR_WRITE && in->op != MIR_ZERO && in->op != MIR_MOVE && in->op != MIR_LOADN)
         {
             MirSlot s[3] = {in->d, in->a, in->b};
             for (int i = 0; i < 3; i++)
@@ -2254,6 +2256,9 @@ static void emit_regs(const MirFunc *f)
             break;
         case MIR_MOVE:
             emit(H(in->d) > H(in->a) ? ST_move_down : ST_move, H(in->d), H(in->a), in->imm, 0, 0);
+            break;
+        case MIR_LOADN:
+            emit(ST_loadn, H(in->d), H(in->a), in->imm, 0, 0);
             break;
         case MIR_ZERO:
             if (in->imm > 16)
@@ -2543,15 +2548,13 @@ static void emit_stencils(const MirFunc *f)
         }
         else if (MIR_BRANCHES(in) && label_index[in->imm] != UINT32_MAX)
         {
-            if (nloops < MAX_LOOPS)
+            if (nloops == loops_cap)
             {
-                loops[nloops].lo = label_index[in->imm];
-                loops[nloops++].hi = (uint32_t)k;
+                loops_cap = loops_cap ? loops_cap * 2 : 64;
+                loops = (Loop *)realloc(loops, loops_cap * sizeof(Loop));
             }
-            else
-            {
-                loops_overflow = 1;
-            }
+            loops[nloops].lo = label_index[in->imm];
+            loops[nloops++].hi = (uint32_t)k;
         }
         if (in->op == MIR_ADDR)
         {
@@ -2598,6 +2601,9 @@ static void emit_stencils(const MirFunc *f)
             break;
         case MIR_MOVE:
             emit(in->d > in->a ? ST_move_down : ST_move, in->d, in->a, in->imm, 0, 0);
+            break;
+        case MIR_LOADN:
+            emit(ST_loadn, in->d, in->a, in->imm, 0, 0);
             break;
         case MIR_LOAD:
             emit(st_load[in->var] + v, in->d, in->a, in->imm, 0, 0);
@@ -2781,9 +2787,16 @@ static int regs_mode(void)
 
 static void emit_mir(const MirFunc *f)
 {
-    if (f->nlabels > MAX_LABELS)
+    if (f->nlabels > nat.labels_cap) // a function's labels: as many as it has (4096 was fatal)
     {
-        fatal("too many branches in one function");
+        size_t cap = nat.labels_cap ? nat.labels_cap : 4096;
+        while (cap < f->nlabels)
+        {
+            cap *= 2;
+        }
+        nat.labels = (size_t *)realloc(nat.labels, cap * sizeof(size_t));
+        label_index = (uint32_t *)realloc(label_index, cap * sizeof(uint32_t));
+        nat.labels_cap = cap;
     }
     fn_at_fit();
     nat.fn_at[f->sym] = nat.len;
@@ -2802,6 +2815,11 @@ static void emit_mir(const MirFunc *f)
         if (in->op == MIR_MOVE)
         {
             uint32_t hi = (in->d > in->a ? in->d : in->a) + (uint32_t)in->imm - 1;
+            top = hi > top ? hi : top;
+        }
+        if (in->op == MIR_LOADN)
+        {
+            uint32_t hi = in->d + (uint32_t)in->imm - 1;
             top = hi > top ? hi : top;
         }
         uses = top + 1 > uses ? top + 1 : uses;
@@ -2855,7 +2873,8 @@ static void emit_mir(const MirFunc *f)
 static void native_begin(const BackendJob *job, const NativeArch *arch)
 {
     Unit *u = job->entry;
-    nat = (Native){.arch = arch, .u = u};
+    size_t *labels = nat.labels, labels_cap = nat.labels_cap; // kept from the last program
+    nat = (Native){.arch = arch, .u = u, .labels = labels, .labels_cap = labels_cap};
     if (arch->set_hash != STENCIL_SET_HASH)
     {
         fatal("its stencils are out of date: run `make stencils`");
@@ -3017,6 +3036,7 @@ static StackNeed stack_need(SymId main_sym)
     StackNeed r = {.out = OUT_UNKNOWN};
     uint64_t call_frame = frame_bytes(&nat.arch->stencils[ST_call]);
     size_t nf = nat.norder;
+    ArenaMark mark = arena_mark(); // its tables are its own (kept, they were 57 B a function at the peak)
     size_t *index_of = (size_t *)arena_alloc(cx.syms.cap * sizeof(size_t));
     uint64_t *need = (uint64_t *)arena_alloc(nf * sizeof(uint64_t) + 1);
     uint32_t *levels = (uint32_t *)arena_alloc(nf * sizeof(uint32_t) + 1);
@@ -3039,6 +3059,7 @@ static StackNeed stack_need(SymId main_sym)
     }
     if (main_sym >= cx.syms.cap || index_of[main_sym] == SIZE_MAX)
     {
+        arena_release(mark);
         return r;
     }
     size_t sp = 0;
@@ -3105,6 +3126,7 @@ static StackNeed stack_need(SymId main_sym)
     r.levels = levels[index_of[main_sym]];
     r.machine = machine[index_of[main_sym]];
     r.out = r.recursive ? OUT_UNKNOWN : out[index_of[main_sym]];
+    arena_release(mark);
     return r;
 }
 

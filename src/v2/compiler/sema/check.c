@@ -37,15 +37,133 @@ typedef struct
     uint32_t nt;
     uint8_t generated, queued;      // checked for the backend / waiting for its turn
     uint8_t failed;                 // a type of its signature could not be computed: reported
+    uint32_t index;                 // its place: SPEC_AT(index) is this one
+    uint32_t depth;                 // specializations made inside one another down to this one
 } Spec;
-#define SPEC_MAX 4096
+// No limit on how many: they are kept in blocks that never move (a binding points into one while
+// a nested one is made). A chain of specializations each made inside the last deeper than
+// SPEC_DEPTH_MAX is an endless recursion on values known while compiling.
+#define SPEC_BLOCK 1024
+#define SPEC_BLOCKS_MAX 4096 // blocks: 4M specializations
+#define SPEC_DEPTH_MAX 8192 // a recursion over fields is as deep as its struct has fields
 static int resolving_signature; // a parameter's or a result's type: `[N]T` may name a length to bind
 static NodeId length_name_node(const Unit *u, NodeId param);
 static NameId length_bound_name(const Token *param);
 static int is_length_param(SymId fn, int i, NameId name);
 static int is_function_param(SymId fn, int i);
-static Spec specs[SPEC_MAX]; // fixed: a binding points into it while a nested one is made
+static Spec *spec_blocks[SPEC_BLOCKS_MAX];
+static inline Spec *SPEC_AT(uint32_t i) // a function: its argument is read once
+{
+    return &spec_blocks[i / SPEC_BLOCK][i % SPEC_BLOCK];
+}
 static uint32_t nspecs;
+
+// Indexes over specs, so no lookup walks the table (a walk per function or per call made the
+// check and the lowering O(functions x specializations)):
+// - per symbol: the specialization it is (1 + its index), how many a generic has made, and the
+//   generic's entry in `generics` (1 + its index);
+// - a hash of (generic, arguments known while compiling) to the specialization made for them;
+// - the specializations waiting to be checked, in the order they were queued.
+typedef struct
+{
+    uint32_t spec;    // 1 + the index in specs of the specialization this symbol is, or 0
+    uint32_t generic; // 1 + the index in generics of this function's entry, or 0
+    uint32_t made;    // the specializations made of this generic function
+} SpecSym;
+static SpecSym *spec_syms;
+static size_t spec_syms_cap;
+static uint32_t *spec_hash;           // 1 + an index in specs, 0 for an empty bucket
+static uint32_t spec_hash_cap;        // a power of two, at most half full
+static uint32_t *spec_queue;          // each specialization is queued at most once
+static uint32_t spec_queue_cap, spec_queue_head, spec_queue_tail;
+
+static SpecSym *spec_sym(SymId fn)
+{
+    if (fn >= spec_syms_cap)
+    {
+        size_t cap = spec_syms_cap ? spec_syms_cap : 1024;
+        while (cap <= fn)
+        {
+            cap *= 2;
+        }
+        SpecSym *grown = (SpecSym *)realloc(spec_syms, cap * sizeof(SpecSym));
+        memset(grown + spec_syms_cap, 0, (cap - spec_syms_cap) * sizeof(SpecSym));
+        spec_syms = grown;
+        spec_syms_cap = cap;
+    }
+    return &spec_syms[fn];
+}
+
+static uint32_t spec_key(SymId of, int k, const TypeId *types, const uint64_t *values)
+{
+    uint64_t h = 1469598103934665603ull ^ of;
+    h = (h ^ (uint64_t)k) * 1099511628211ull;
+    for (int j = 0; j < k; j++)
+    {
+        h = (h ^ types[j]) * 1099511628211ull;
+        h = (h ^ values[j]) * 1099511628211ull;
+        h ^= h >> 29;
+    }
+    return (uint32_t)(h ^ (h >> 32));
+}
+
+// The specialization of `of` made for these arguments, or NULL.
+static Spec *spec_find(SymId of, int k, const TypeId *types, const uint64_t *values)
+{
+    for (uint32_t b = spec_key(of, k, types, values) & (spec_hash_cap - 1); spec_hash_cap;
+         b = (b + 1) & (spec_hash_cap - 1))
+    {
+        if (!spec_hash[b])
+        {
+            return NULL;
+        }
+        Spec *s = SPEC_AT(spec_hash[b] - 1);
+        if (s->of == of && s->n == (uint32_t)k && memcmp(s->types, types, (size_t)k * sizeof(TypeId)) == 0 &&
+            memcmp(s->values, values, (size_t)k * sizeof(uint64_t)) == 0)
+        {
+            return s;
+        }
+    }
+    return NULL;
+}
+
+static void spec_hash_put(const Spec *s)
+{
+    uint32_t b = spec_key(s->of, (int)s->n, s->types, s->values) & (spec_hash_cap - 1);
+    while (spec_hash[b])
+    {
+        b = (b + 1) & (spec_hash_cap - 1);
+    }
+    spec_hash[b] = s->index + 1;
+}
+
+static void spec_insert(const Spec *s)
+{
+    if (2 * nspecs > spec_hash_cap) // grown and filled again from the blocks
+    {
+        spec_hash_cap = spec_hash_cap ? spec_hash_cap * 2 : 1024;
+        free(spec_hash);
+        spec_hash = (uint32_t *)calloc(spec_hash_cap, sizeof(uint32_t));
+        for (uint32_t i = 0; i < nspecs; i++)
+        {
+            if (SPEC_AT(i) != s)
+            {
+                spec_hash_put(SPEC_AT(i));
+            }
+        }
+    }
+    spec_hash_put(s);
+}
+
+static void spec_enqueue(uint32_t index)
+{
+    if (spec_queue_tail == spec_queue_cap)
+    {
+        spec_queue_cap = spec_queue_cap ? spec_queue_cap * 2 : 256;
+        spec_queue = (uint32_t *)realloc(spec_queue, spec_queue_cap * sizeof(uint32_t));
+    }
+    spec_queue[spec_queue_tail++] = index;
+}
 static const Spec *binding; // the specialization whose names resolve_type is reading under
 
 typedef struct
@@ -63,6 +181,12 @@ typedef struct
     NodeId call;     // `a := f(x)` called later as `a()`: the call, its arguments bound (0: none)
     SymId err_of;    // `n, e := f()`: e is f's error (its arms are checked against f's set)
 } Local;
+
+typedef struct
+{
+    NameId name; // 0: empty
+    uint32_t at;
+} LocalSlot;
 
 typedef struct
 {
@@ -90,7 +214,13 @@ typedef struct
     int nlits;
     NodeId handled;        // the call `n, e := f()` binds: its error is the second name's
     NodeId guard;          // and that call, a boundary: its panics come back to it
-    Local locals[MAX_LOCALS];
+    LocalSlot *lmap;       // past LOCALS_BY_WALK locals: name -> latest local (see local_find)
+    uint32_t lmap_cap, lmap_used;
+    // (not cleared: the memsets stop at `locals`) the locals: first_locals, then the arena
+    // past MAX_LOCALS (a limit no more: it was an error)
+    Local *locals;
+    uint32_t locals_cap;
+    Local first_locals[MAX_LOCALS];
 } Check;
 
 // ---- error sets (guards.md §5, step 6) ----------------------------------------------------------
@@ -349,26 +479,53 @@ int sema_error_set(SymId fn, uint8_t *panics, const uint64_t **ids, uint32_t *n,
 }
 
 // Every error a program can name: std's panics and the program's own (`bad_input: error`), for
-// print(e). Returns how many (at most cap).
-uint32_t sema_errors_list(uint64_t *ids, uint32_t cap)
+// print(e). The symbols that can be one are gathered once each (a walk of every symbol per
+// print was O(prints x symbols)); their values are read at each call, as they may be computed
+// later. No cap: a 513th error printed as `error N` when the list held 512.
+static SymId *error_syms;
+static uint32_t nerror_syms, cerror_syms;
+static SymId error_syms_upto = 1;
+static uint64_t *error_ids;
+static uint32_t cerror_ids;
+
+const uint64_t *sema_errors(uint32_t *count)
 {
-    uint32_t n = 0;
-    for (uint64_t k = PANIC_DIVISION; k <= PANIC_STACK && n < cap; k++)
+    for (; error_syms_upto < cx.syms.size; error_syms_upto++)
     {
-        ids[n++] = k;
-    }
-    for (SymId s = 1; s < cx.syms.size && n < cap; s++)
-    {
-        uint64_t v;
+        SymId s = error_syms_upto;
         if (SYM(s)->kind == SYM_CONST && !SYM(s)->owner && SYM(s)->decl &&
             NODE(&cx.units[SYM(s)->unit], SYM(s)->decl)->kind == AST_FIELD_DECL &&
-            sema_value_type(&cx.units[SYM(s)->unit], s) == T_ERROR && sema_comptime_value(s, &v) &&
-            v >= ERROR_FIRST)
+            sema_value_type(&cx.units[SYM(s)->unit], s) == T_ERROR)
         {
-            ids[n++] = v;
+            if (nerror_syms == cerror_syms)
+            {
+                cerror_syms = cerror_syms ? cerror_syms * 2 : 64;
+                error_syms = (SymId *)realloc(error_syms, cerror_syms * sizeof(SymId));
+            }
+            error_syms[nerror_syms++] = s;
         }
     }
-    return n;
+    uint32_t need = (uint32_t)(PANIC_STACK - PANIC_DIVISION + 1) + nerror_syms;
+    if (need > cerror_ids)
+    {
+        cerror_ids = need * 2;
+        error_ids = (uint64_t *)realloc(error_ids, cerror_ids * sizeof(uint64_t));
+    }
+    uint32_t n = 0;
+    for (uint64_t k = PANIC_DIVISION; k <= PANIC_STACK; k++)
+    {
+        error_ids[n++] = k;
+    }
+    for (uint32_t i = 0; i < nerror_syms; i++)
+    {
+        uint64_t v;
+        if (sema_comptime_value(error_syms[i], &v) && v >= ERROR_FIRST)
+        {
+            error_ids[n++] = v;
+        }
+    }
+    *count = n;
+    return error_ids;
 }
 
 // An error's name, for a message or --sig: `bad_input`, or `panic.division`.
@@ -1281,14 +1438,13 @@ static const AstNode *callable_node(const Unit *u, NodeId decl)
 
 static const Spec *spec_of(SymId fn)
 {
-    for (uint32_t i = 0; fn && i < nspecs; i++)
+    // most symbols are not one: a program with none reads one global, and one with some reads the
+    // symbol (in cache, its callers read it) before the side table
+    if (!nspecs || !fn || !(SYM(fn)->flags & SYM_F_SPEC))
     {
-        if (specs[i].fn == fn)
-        {
-            return &specs[i];
-        }
+        return NULL;
     }
-    return NULL;
+    return SPEC_AT(spec_syms[fn].spec - 1);
 }
 
 // The functions a specialization was made for (its `function(...)` parameters), in order.
@@ -1444,10 +1600,16 @@ int sema_capturing(void)
     return capture_mir;
 }
 
+SymId sema_spec_generic(SymId fn)
+{
+    const Spec *sp = spec_of(fn);
+    return sp ? sp->of : 0;
+}
+
 int sema_spec_index(SymId fn)
 {
     const Spec *sp = spec_of(fn);
-    return sp ? (int)(sp - specs) + 1 : 0;
+    return sp ? (int)sp->index + 1 : 0;
 }
 
 // While reading fn's signature (or body): its bound names, if it is a specialization.
@@ -1745,25 +1907,124 @@ uint32_t sema_captures(SymId lit, Capture *out, uint32_t cap)
 
 // ---- names -----------------------------------------------------------------------------------
 
+// The latest local of a name. Past LOCALS_BY_WALK locals a function's lookups go through a map
+// (NameId -> 1 + the index of the latest local of that name, 0: none), so a function with n
+// locals costs n lookups, not n² steps of a walk back. An entry is exact for what was pushed
+// since the map was made: a name missing from it has no local, and a push writes its entry. A
+// block that ended may have taken the local an entry points to; then the walk finds the one it
+// shadowed and writes it down. The one place that lowers nlocals and raises it again drops the map.
+#define LOCALS_BY_WALK 32
+
+static uint32_t *local_entry(Check *c, NameId name, int add);
+
+static void local_map_make(Check *c, uint32_t cap)
+{
+    LocalSlot *old = c->lmap;
+    uint32_t old_cap = c->lmap_cap;
+    c->lmap = (LocalSlot *)arena_alloc((size_t)cap * sizeof(LocalSlot));
+    memset(c->lmap, 0, (size_t)cap * sizeof(LocalSlot));
+    c->lmap_cap = cap;
+    c->lmap_used = 0;
+    for (uint32_t i = 0; i < old_cap; i++)
+    {
+        if (old[i].name)
+        {
+            *local_entry(c, old[i].name, 1) = old[i].at;
+        }
+    }
+}
+
+// The entry of `name`, or NULL when it has none and !add.
+static uint32_t *local_entry(Check *c, NameId name, int add)
+{
+    uint32_t mask = c->lmap_cap - 1, i = (name * 0x9e3779b1u) & mask;
+    while (c->lmap[i].name)
+    {
+        if (c->lmap[i].name == name)
+        {
+            return &c->lmap[i].at;
+        }
+        i = (i + 1) & mask;
+    }
+    if (!add)
+    {
+        return NULL;
+    }
+    if ((c->lmap_used + 1) * 2 > c->lmap_cap)
+    {
+        local_map_make(c, c->lmap_cap * 2);
+        return local_entry(c, name, 1);
+    }
+    c->lmap_used++;
+    c->lmap[i] = (LocalSlot){name, 0};
+    return &c->lmap[i].at;
+}
+
+static int local_walk(const Check *c, NameId name)
+{
+    int i = c->nlocals - 1;
+    while (i >= 0 && c->locals[i].name != name)
+    {
+        i--;
+    }
+    return i;
+}
+
+static int local_find(Check *c, NameId name) // the index, or -1
+{
+    if (!c->lmap)
+    {
+        if (c->nlocals <= LOCALS_BY_WALK)
+        {
+            return local_walk(c, name);
+        }
+        uint32_t cap = 256;
+        while (cap < (uint32_t)c->nlocals * 4)
+        {
+            cap *= 2;
+        }
+        local_map_make(c, cap);
+        for (int i = 0; i < c->nlocals; i++)
+        {
+            *local_entry(c, c->locals[i].name, 1) = (uint32_t)i + 1;
+        }
+    }
+    uint32_t *at = local_entry(c, name, 0);
+    if (!at)
+    {
+        return -1; // never pushed since the map was made, and not in it then
+    }
+    if (*at && *at <= (uint32_t)c->nlocals && c->locals[*at - 1].name == name)
+    {
+        return (int)*at - 1;
+    }
+    int i = *at ? local_walk(c, name) : -1;
+    *at = (uint32_t)(i + 1);
+    return i;
+}
+
 static void push_local(Check *c, uint32_t tok, TypeId type, int mut)
 {
     const Token *t = TOK(c->u, tok);
     NameId name = token_name(t);
-    for (int i = c->block_base; i < c->nlocals; i++)
+    if (local_find(c, name) >= c->block_base)
     {
-        if (c->locals[i].name == name)
-        {
-            diag_at(c->u, tok, "error", "'%.*s' is already declared in this block", t->len,
-                    TSTART(t));
-            return;
-        }
-    }
-    if (c->nlocals == MAX_LOCALS)
-    {
-        diag_at(c->u, tok, "error", "too many locals in one function (limit is %d)", MAX_LOCALS);
+        diag_at(c->u, tok, "error", "'%.*s' is already declared in this block", t->len,
+                TSTART(t));
         return;
     }
+    if ((uint32_t)c->nlocals == c->locals_cap) // past first_locals: a copy in the arena, twice as big
+    {
+        Local *grown = (Local *)arena_alloc(2 * c->locals_cap * sizeof(Local));
+        memcpy(grown, c->locals, c->locals_cap * sizeof(Local));
+        c->locals = grown;
+        c->locals_cap *= 2;
+    }
     c->locals[c->nlocals++] = (Local){tok, type, name, (uint8_t)mut, 0, 0, 0, 0, 0, 0, 0, 0};
+    if (c->lmap)
+    {
+        *local_entry(c, name, 1) = (uint32_t)c->nlocals;
+    }
 }
 
 // `a := f(x)` holds the call itself, its arguments bound, when the body calls `a()` after it:
@@ -1875,9 +2136,8 @@ static NameKind find_name(Check *c, const Token *t, SymId *sym, TypeId *type)
         return c->has_self ? NAME_SELF : NAME_MISSING;
     }
     NameId name = token_name(t);
-    for (int i = c->nlocals - 1; i >= 0; i--)
+    for (int i = local_find(c, name); i >= 0; i = -1)
     {
-        if (c->locals[i].name == name)
         {
             if (c->literal && i < c->fn_base)
             {
@@ -2495,11 +2755,8 @@ static void fill_contexts(Check *c, NodeId id, SymId fn, uint32_t at)
         }
         const Token *name = TOK(home, NODE(home, p)->tok);
         NameId want = token_name(name);
-        const Local *found = NULL;
-        for (int i = c->nlocals - 1; i >= 0 && !found; i--)
-        {
-            found = c->locals[i].name == want ? &c->locals[i] : NULL;
-        }
+        int li = local_find(c, want);
+        const Local *found = li >= 0 ? &c->locals[li] : NULL;
         if (!found && text_is(name, "site") && resolve_type((Unit *)home, NODE(home, p)->a, 0, 0) == T_STR)
         {
             args[n++] = (AstNode){.kind = AST_SITE, .tok = at}; // the compiler knows where this call is
@@ -2570,11 +2827,8 @@ static void route_output(Check *c, NodeId id, uint32_t at)
     Unit *u = c->u;
     note_effect(c, FX_OUTPUT, at);
     NameId want = name_intern("out", 3);
-    const Local *found = NULL;
-    for (int i = c->nlocals - 1; i >= 0 && !found; i--)
-    {
-        found = c->locals[i].name == want ? &c->locals[i] : NULL;
-    }
+    int li = local_find(c, want);
+    const Local *found = li >= 0 ? &c->locals[li] : NULL;
     SymId declared = scope_find(u->scope, "out", 3);
     int file_has_out = declared && SYM(declared)->kind == SYM_STRUCT;
     if (!found)
@@ -2857,13 +3111,11 @@ static int sig_exprs_name(SymId fn, NameId name)
 static int type_variable(const Unit *u, NameId name, SymId owner)
 {
     SymId s = scope_lookup_name(owner ? struct_scope(owner) : u->scope, name);
-    if (getenv("TVDBG")) fprintf(stderr, "tv %.*s s=%u kind=%d\n", (int)name_at(name)->len, name_at(name)->start, s, s ? SYM(s)->kind : -1);
     for (int hops = 0; s && SYM(s)->kind == SYM_IMPORT && hops < 16; hops++)
     {
         s = module_binding_target(s); // (std's mod.modal binds it in turn)
     }
-    if (getenv("TVDBG") && s) fprintf(stderr, "  -> s=%u kind=%d owner=%u flags=%d decl=%u\n", s, SYM(s)->kind, SYM(s)->owner, SYM(s)->flags, SYM(s)->decl);
-    if (!s || SYM(s)->kind != SYM_FIELD || SYM(s)->owner || (SYM(s)->flags & SYM_F_MUT) || !SYM(s)->decl)
+    if (!s || (SYM(s)->kind != SYM_CONST && SYM(s)->kind != SYM_FIELD) || SYM(s)->owner || (SYM(s)->flags & SYM_F_MUT) || !SYM(s)->decl)
     {
         return 0;
     }
@@ -2875,6 +3127,16 @@ static int type_variable(const Unit *u, NameId name, SymId owner)
     }
     const AstNode *t = NODE(home, d->a);
     return t->kind == AST_TYPE_NAME && !t->aux && text_is(TOK(home, t->tok), "type");
+}
+
+int sema_is_type_variable(SymId s)
+{
+    if (!s || !SYM(s)->decl || SYM(s)->owner)
+    {
+        return 0;
+    }
+    const Unit *u = &cx.units[SYM(s)->unit];
+    return type_variable(u, token_name(TOK(u, SYM(s)->tok)), 0);
 }
 
 // The type variables a type node names, added to names[k..] once each; the new count.
@@ -3001,6 +3263,21 @@ static int type_params(SymId fn, int *index, NameId *names)
 static SymId *generic_names;
 static uint32_t ngeneric_names, cgeneric_names;
 static uint16_t generic_names_units = 0xffff;
+// Their names as a set (1 + an index in generic_names), so a body's text is read once: a memmem
+// per generic per body was O(bodies x generics x body); 400 generics made 20,000 bodies 4x slower.
+#define GENERIC_NAMES_BY_TEXT 16 // up to this many, each is searched for in the text
+static uint32_t *generic_name_set;
+static uint32_t generic_name_set_cap; // a power of two, at least twice ngeneric_names
+
+static uint32_t name_text_hash(const char *p, size_t n)
+{
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < n; i++)
+    {
+        h = (h ^ (uint8_t)p[i]) * 16777619u;
+    }
+    return h;
+}
 
 static int sig_generic(SymId fn)
 {
@@ -3057,14 +3334,75 @@ static int names_a_generic(const char *text, size_t len)
                 generic_names[ngeneric_names++] = s;
             }
         }
-    }
-    for (uint32_t i = 0; i < ngeneric_names; i++)
-    {
-        int nlen;
-        const char *name = symbol_name(generic_names[i], &nlen);
-        if (name && nlen > 0 && memmem(text, len, name, (size_t)nlen))
+        uint32_t cap = 64;
+        while (cap < 2 * ngeneric_names)
         {
-            return 1;
+            cap *= 2;
+        }
+        if (cap > generic_name_set_cap)
+        {
+            generic_name_set = realloc(generic_name_set, cap * sizeof(uint32_t));
+            generic_name_set_cap = cap;
+        }
+        memset(generic_name_set, 0, generic_name_set_cap * sizeof(uint32_t));
+        for (uint32_t i = 0; i < ngeneric_names; i++)
+        {
+            int nlen;
+            const char *name = symbol_name(generic_names[i], &nlen);
+            if (!name || nlen <= 0)
+            {
+                continue;
+            }
+            uint32_t b = name_text_hash(name, (size_t)nlen) & (generic_name_set_cap - 1);
+            while (generic_name_set[b])
+            {
+                b = (b + 1) & (generic_name_set_cap - 1);
+            }
+            generic_name_set[b] = i + 1;
+        }
+    }
+    if (!ngeneric_names)
+    {
+        return 0;
+    }
+    if (ngeneric_names <= GENERIC_NAMES_BY_TEXT) // a few: memmem for each (vectorized) is faster
+    {
+        for (uint32_t i = 0; i < ngeneric_names; i++)
+        {
+            int nlen;
+            const char *name = symbol_name(generic_names[i], &nlen);
+            if (name && nlen > 0 && memmem(text, len, name, (size_t)nlen))
+            {
+                return 1;
+            }
+        }
+        return 0;
+    }
+    // every name in the text (letters, digits, `_`): one that is a generic's says yes
+    for (size_t i = 0; i < len;)
+    {
+        unsigned char ch = (unsigned char)text[i];
+        if (!(ch == '_' || (ch | 32) - 'a' < 26u))
+        {
+            i++;
+            continue;
+        }
+        size_t start = i;
+        while (i < len && (text[i] == '_' || ((unsigned char)text[i] | 32) - 'a' < 26u ||
+                           (unsigned char)text[i] - '0' < 10u))
+        {
+            i++;
+        }
+        size_t n = i - start;
+        for (uint32_t b = name_text_hash(text + start, n) & (generic_name_set_cap - 1); generic_name_set[b];
+             b = (b + 1) & (generic_name_set_cap - 1))
+        {
+            int nlen;
+            const char *name = symbol_name(generic_names[generic_name_set[b] - 1], &nlen);
+            if ((size_t)nlen == n && memcmp(name, text + start, n) == 0)
+            {
+                return 1;
+            }
         }
     }
     return 0;
@@ -3288,16 +3626,16 @@ static size_t generic_cap;
 
 // Every parameter of fn known while compiling (types first, then field numbers): their count.
 // Found once per function, from its body as written (later its body may be parsed in place).
-#define GENERIC_MAX 1024
-static struct
+typedef struct
 {
     SymId fn;
     int k, ntypes;
     int index[SPEC_MAX_BOUND];
     NameId names[SPEC_MAX_BOUND];
     uint32_t body_tok; // its body as written (a deferred token), 0 if it was parsed with it
-} generics[GENERIC_MAX];
-static uint32_t ngenerics;
+} Generic;
+static Generic *generics; // grown: past a fixed 1024 a generic was silently not remembered
+static uint32_t ngenerics, cgenerics;
 
 // The parameters typed `function(...)` (context.md §61): known while compiling, each a function
 // given by name or as a literal; the function is made once per set of them.
@@ -3406,15 +3744,14 @@ static int is_length_param(SymId fn, int i, NameId name)
 
 static int compile_params(SymId fn, int *index, NameId *names, int *types_count)
 {
-    for (uint32_t g = 0; g < ngenerics; g++)
+    uint32_t known = fn < spec_syms_cap ? spec_syms[fn].generic : 0; // a read: no growth
+    if (known)
     {
-        if (generics[g].fn == fn)
-        {
-            memcpy(index, generics[g].index, sizeof(generics[g].index));
-            memcpy(names, generics[g].names, sizeof(generics[g].names));
-            *types_count = generics[g].ntypes;
-            return generics[g].k;
-        }
+        uint32_t g = known - 1;
+        memcpy(index, generics[g].index, sizeof(generics[g].index));
+        memcpy(names, generics[g].names, sizeof(generics[g].names));
+        *types_count = generics[g].ntypes;
+        return generics[g].k;
     }
     int k = type_params(fn, index, names);
     *types_count = k;
@@ -3424,8 +3761,13 @@ static int compile_params(SymId fn, int *index, NameId *names, int *types_count)
         k += function_params(fn, index, names, k);
         k += length_params(fn, index, names, k);
     }
-    if (k && ngenerics < GENERIC_MAX)
+    if (k)
     {
+        if (ngenerics == cgenerics)
+        {
+            cgenerics = cgenerics ? cgenerics * 2 : 64;
+            generics = (Generic *)realloc(generics, cgenerics * sizeof(Generic));
+        }
         generics[ngenerics].fn = fn;
         generics[ngenerics].k = k;
         generics[ngenerics].ntypes = *types_count;
@@ -3436,20 +3778,15 @@ static int compile_params(SymId fn, int *index, NameId *names, int *types_count)
         NodeId node = NODE(u, decl)->kind == AST_DEFINE ? NODE(u, decl)->a : decl;
         generics[ngenerics].body_tok = (NODE(u, node)->flags & AST_F_LAZY) ? fn_body(u, node) : 0;
         ngenerics++;
+        spec_sym(fn)->generic = ngenerics;
     }
     return k;
 }
 
 static uint32_t generic_body_token(SymId fn)
 {
-    for (uint32_t g = 0; g < ngenerics; g++)
-    {
-        if (generics[g].fn == fn)
-        {
-            return generics[g].body_tok;
-        }
-    }
-    return 0;
+    uint32_t known = fn < spec_syms_cap ? spec_syms[fn].generic : 0;
+    return known ? generics[known - 1].body_tok : 0;
 }
 
 static void check_spec(Spec *sp);
@@ -3481,15 +3818,16 @@ static void lit_owner_set(SymId lit, SymId owner)
 // file are never in memory together.)
 static int literal_specs_waiting(SymId fn)
 {
-    for (uint32_t i = 0; i < nspecs; i++)
+    for (uint32_t q = spec_queue_head; q < spec_queue_tail; q++) // only those waiting
     {
-        if (!specs[i].queued || specs[i].generated || specs[i].failed)
+        const Spec *sp = SPEC_AT(spec_queue[q]);
+        if (!sp->queued || sp->generated || sp->failed)
         {
             continue;
         }
-        for (uint32_t k = 0; k < specs[i].n; k++)
+        for (uint32_t k = 0; k < sp->n; k++)
         {
-            SymId l = specs[i].is_value[k] == 2 ? (SymId)specs[i].values[k] : 0;
+            SymId l = sp->is_value[k] == 2 ? (SymId)sp->values[k] : 0;
             if (l && (SYM(l)->flags & SYM_F_LITERAL) && l < lit_owner_cap && lit_owner[l] == fn)
             {
                 return 1;
@@ -3502,18 +3840,16 @@ static int literal_specs_waiting(SymId fn)
 // The specializations made while checking, each checked (and generated) in its turn.
 void sema_drain_specs(void)
 {
-    for (int more = 1; more;)
+    // in the order they were queued; one queued while another is checked joins the end (a
+    // drain inside a drain takes from the same queue)
+    while (spec_queue_head < spec_queue_tail)
     {
-        more = 0;
-        for (uint32_t i = 0; i < nspecs; i++)
+        Spec *sp = SPEC_AT(spec_queue[spec_queue_head++]);
+        if (sp->queued && !sp->generated && !sp->failed)
         {
-            if (specs[i].queued && !specs[i].generated && !specs[i].failed)
-            {
-                specs[i].generated = 1;
-                specs[i].queued = 0;
-                check_spec(&specs[i]);
-                more = 1;
-            }
+            sp->generated = 1;
+            sp->queued = 0;
+            check_spec(sp);
         }
     }
 }
@@ -3550,6 +3886,8 @@ static void check_spec(Spec *sp)
     Unit *u = &cx.units[SYM(sp->fn)->unit];
     Check c;
     memset(&c, 0, offsetof(Check, locals));
+    c.locals = c.first_locals;
+    c.locals_cap = MAX_LOCALS;
     c.u = u;
     c.implicit_self = domain_config_bool(u->domain, "implicit_self", 0);
     if (!u->side_cap || !u->types)
@@ -3640,6 +3978,8 @@ static void spec_type_exprs(Check *caller, Spec *sp, uint32_t at)
     Unit *u = &cx.units[SYM(sp->of)->unit];
     Check c;
     memset(&c, 0, offsetof(Check, locals));
+    c.locals = c.first_locals;
+    c.locals_cap = MAX_LOCALS;
     c.u = u;
     if (!u->side_cap || !u->types) // a file whose turn has not come: its declarations first
     {
@@ -3726,6 +4066,29 @@ static SymId function_argument(Check *c, SymId fn, int pi, NodeId a, const NameI
     if (an->kind == AST_FN_LIT)
     {
         int i = 0;
+        NodeId wt = ft->a;
+        for (NodeId q = an->a; q && wt; q = NEXT(u, q), wt = NEXT(home, wt), i++)
+        {
+            NameId tv[SPEC_MAX_BOUND];
+            int ntv = (!NODE(u, q)->a && i < nwant && want[i] == T_NONE) ? type_vars_in(home, wt, SYM(fn)->owner, tv, 0, 0) : 0;
+            for (int v = 0; v < ntv; v++)
+            {
+                for (int j = 0; j < ntypes; j++)
+                {
+                    if (names[j] == tv[v] && types[j] == T_NONE)
+                    {
+                        const Name *nm = name_at(tv[v]);
+                        const Token *qt = TOK(u, NODE(u, q)->tok);
+                        diag_at(u, NODE(u, q)->tok, "error",
+                                "'%.*s': no argument gives %.*s, which '%.*s' takes (an untyped number takes "
+                                "the type the others give): say it, `u64(0)`",
+                                len, name, (int)nm->len, nm->start, qt->len, TSTART(qt));
+                        return 0;
+                    }
+                }
+            }
+        }
+        i = 0;
         for (NodeId q = an->a; q; q = NEXT(u, q), i++)
         {
             if (!NODE(u, q)->a && !(NODE(u, q)->flags & AST_F_PATTERN) && i < nwant)
@@ -3954,39 +4317,35 @@ static SymId specialize(Check *c, SymId fn, NodeId args, uint32_t at)
             return 0;
         }
     }
-    Spec *sp = NULL;
-    for (uint32_t i = 0; i < nspecs && !sp; i++)
-    {
-        sp = specs[i].of == fn && specs[i].n == (uint32_t)k &&
-                     memcmp(specs[i].types, types, (size_t)k * sizeof(TypeId)) == 0 &&
-                     memcmp(specs[i].values, values, (size_t)k * sizeof(uint64_t)) == 0
-                 ? &specs[i]
-                 : NULL;
-    }
-    uint32_t made = 0;
-    for (uint32_t i = 0; i < nspecs && !sp; i++)
-    {
-        made += specs[i].of == fn;
-    }
-    if (!sp && made >= 256)
+    Spec *sp = spec_find(fn, k, types, values);
+    const Spec *parent = c->fn ? spec_of(c->fn) : NULL; // made inside another: one deeper
+    uint32_t depth = parent ? parent->depth + 1 : 0;
+    if (!sp && depth >= SPEC_DEPTH_MAX)
     {
         int len;
         const char *name = symbol_name(fn, &len);
         diag_at(c->u, at, "error",
-                "'%.*s' is made for more than 256 sets of arguments known while compiling: its arms on them "
-                "never end the recursion",
-                len, name);
+                "'%.*s' is made inside a specialization made inside another, %d deep: its arms on the "
+                "arguments known while compiling never end the recursion",
+                len, name, SPEC_DEPTH_MAX);
         return 0;
     }
     if (!sp)
     {
-        if (nspecs == SPEC_MAX)
+        if (nspecs == SPEC_BLOCK * SPEC_BLOCKS_MAX)
         {
-            diag_at(c->u, at, "error", "more than %d specializations of functions made once per type", SPEC_MAX);
+            diag_at(c->u, at, "error", "more than %d specializations of functions made once per type",
+                    SPEC_BLOCK * SPEC_BLOCKS_MAX);
             return 0;
         }
-        sp = &specs[nspecs++];
+        if (nspecs % SPEC_BLOCK == 0)
+        {
+            spec_blocks[nspecs / SPEC_BLOCK] = (Spec *)malloc(SPEC_BLOCK * sizeof(Spec));
+        }
+        sp = SPEC_AT(nspecs);
         memset(sp, 0, sizeof(*sp));
+        sp->index = nspecs++;
+        sp->depth = depth;
         sp->of = fn;
         sp->n = (uint32_t)k;
         memcpy(sp->names, names, (size_t)k * sizeof(NameId));
@@ -3996,21 +4355,25 @@ static SymId specialize(Check *c, SymId fn, NodeId args, uint32_t at)
         {
             sp->is_value[j] = is_function_param(fn, index[j]) ? 2 : 1; // 2: a function (its symbol)
         }
+        spec_sym(fn)->made++;
+        spec_insert(sp); // found from here on, as a nested specialize found it in the table before
         spec_type_exprs(c, sp, at);
         Unit *home = &cx.units[SYM(fn)->unit];
         sp->fn = symbol_new(home, SYM_METHOD, SYM(fn)->flags, SYM(fn)->tok, SYM(fn)->owner, SYM(fn)->decl);
+        spec_sym(sp->fn)->spec = sp->index + 1;
+        SYM(sp->fn)->flags |= SYM_F_SPEC;
     }
-    uint32_t at_index = (uint32_t)(sp - specs);
-    if (!specs[at_index].generated && !specs[at_index].queued && !capture_mir)
+    if (!sp->generated && !sp->queued && !capture_mir)
     {
         // checked in its turn, when no body is being checked (sema_drain_specs): a body checked
         // inside another would need room for both. The backend declares it now (C: a prototype).
         // (One made while a body is checked again for the compiler is for the compiler only: it
         // lowers it when it runs it, and the program has the one made in the body's own turn.)
-        specs[at_index].queued = 1;
-        codegen_declare(specs[at_index].fn);
+        sp->queued = 1;
+        spec_enqueue(sp->index);
+        codegen_declare(sp->fn);
     }
-    return specs[at_index].fn;
+    return sp->fn;
 }
 
 // A literal whose parameter is a pattern alone, `f := (0..10) { ... }`, waits for its first call:
@@ -4051,6 +4414,8 @@ static void check_waiting_literal(Check *c, SymId lit, NodeId args)
         c->nlocals = w.nlocals < saved ? w.nlocals : saved;
         check_callable(c, w.node, c->owner, lit);
         c->nlocals = saved;
+        c->lmap = NULL; // the locals above w.nlocals were written over: made again when needed
+        c->lmap_cap = c->lmap_used = 0;
         return;
     }
 }
@@ -4081,7 +4446,13 @@ static TypeId call_function(Check *c, NodeId id, uint32_t at, SymId first)
         fn = specialize(c, fn, args, at); // `soma(point, p)`: soma made for point
         if (!fn)
         {
-            check_args(c, args, 0);
+            for (NodeId a = args; a; a = NEXT(c->u, a))
+            {
+                if (NODE(c->u, a)->kind != AST_FN_LIT)
+                {
+                    check_expr(c, a); // (a literal is typed by the call that was reported: not again)
+                }
+            }
             return T_NONE;
         }
     }
@@ -4541,15 +4912,8 @@ static Local *local_named(Check *c, NodeId id)
     {
         return NULL;
     }
-    NameId name = token_name(TOK(c->u, n->tok));
-    for (int i = c->nlocals - 1; i >= 0; i--)
-    {
-        if (c->locals[i].name == name)
-        {
-            return &c->locals[i];
-        }
-    }
-    return NULL;
+    int at = local_find(c, token_name(TOK(c->u, n->tok)));
+    return at >= 0 ? &c->locals[at] : NULL;
 }
 
 // A reference into this function's frame: 1 for `&T{ ... }` (a literal given storage here),
@@ -5418,10 +5782,7 @@ static TypeId check_match(Check *c, NodeId id)
         }
         NameId want = token_name(TOK(u, name_tok));
         subj_name[k] = want;
-        for (int i = c->nlocals - 1; i >= 0 && subj_local[k] < 0; i--)
-        {
-            subj_local[k] = c->locals[i].name == want ? i : -1;
-        }
+        subj_local[k] = local_find(c, want);
     }
     TypeId result = T_NONE;
     int value_arms = 1, index = 0, all_names_last = 0;
@@ -5634,13 +5995,10 @@ static TypeId check_match(Check *c, NodeId id)
         !(m->aux & MATCH_PARTIAL))
     {
         NameId en = token_name(TOK(u, NODE(u, m->a)->tok));
-        for (int i = c->nlocals - 1; i >= 0; i--)
+        int at = local_find(c, en);
+        if (at >= 0)
         {
-            if (c->locals[i].name == en)
-            {
-                err_callee = c->locals[i].err_of;
-                break;
-            }
+            err_callee = c->locals[at].err_of;
         }
     }
     if (err_callee)
@@ -6303,9 +6661,8 @@ static TypeId check_expr(Check *c, NodeId id)
         if (ix->kind == AST_IDENT && !u->refs[n->b])
         {
             NameId name = token_name(TOK(u, ix->tok));
-            for (int i = c->nlocals - 1; i >= 0; i--)
+            for (int i = local_find(c, name); i >= 0; i = -1)
             {
-                if (c->locals[i].name == name)
                 {
                     if (c->locals[i].below && c->locals[i].below <= type_len(base))
                     {
@@ -6343,10 +6700,8 @@ static TypeId check_expr(Check *c, NodeId id)
         if (named->kind == AST_IDENT)
         {
             NameId name = token_name(TOK(u, named->tok));
-            for (int i = c->nlocals - 1; i >= 0 && !local; i--)
-            {
-                local = c->locals[i].name == name ? &c->locals[i] : NULL;
-            }
+            int at = local_find(c, name);
+            local = at >= 0 ? &c->locals[at] : NULL;
             if (local && c->literal && local - c->locals < c->fn_base)
             {
                 const Token *nt = TOK(u, named->tok);
@@ -6879,18 +7234,36 @@ static void check_field(Check *c, NodeId decl, SymId owner)
 
 // The symbol a callable declaration created: looked up by name in the scope that owns it,
 // then matched by declaration among the overloads and any field sharing the name.
+// Clauses are declared and checked in the same order, so the one after the last found is
+// tried first: n clauses cost n lookups, not n² steps (sema_check_bodies resets it per unit).
+static SymId decl_last_first, decl_last;
+
 static SymId decl_symbol(const Unit *u, SymId owner, NodeId decl, uint32_t name_tok)
 {
     const Token *name = TOK(u, name_tok);
     const Scope *scope = owner ? struct_scope(owner) : u->scope;
     SymId first = scope_find_token(scope, name);
 
+    if (first && first == decl_last_first && SYM(decl_last)->kind == SYM_METHOD)
+    {
+        SymId next = SYM(decl_last)->next_overload;
+        if (next && SYM(next)->decl == decl)
+        {
+            decl_last = next;
+            return next;
+        }
+    }
     while (first)
     {
         for (SymId o = first; o; o = SYM(o)->kind == SYM_METHOD ? SYM(o)->next_overload : 0)
         {
             if (SYM(o)->decl == decl)
             {
+                if (SYM(o)->kind == SYM_METHOD)
+                {
+                    decl_last_first = first;
+                    decl_last = o;
+                }
                 return o;
             }
         }
@@ -7220,6 +7593,29 @@ int sema_params_overlap(Unit *u, NodeId a, NodeId b, SymId owner)
     return alo <= bhi && blo <= ahi;
 }
 
+// What a pattern parameter takes as an interval of order keys (the value as 64 bits, with the
+// sign bit flipped for a signed type, so unsigned order is the value's order). 1: a number or a range,
+// 2: a string (its literal in pat->tok), 0: no pattern, or one that does not fit (reported loud
+// by the check of the clause).
+int sema_pattern_span(Unit *u, NodeId param, SymId owner, Pattern *pat, uint64_t *lo, uint64_t *hi)
+{
+    const AstNode *n = NODE(u, param);
+    TypeId t = !(n->flags & AST_F_PATTERN) ? T_NONE
+             : n->a ? resolve_type(u, n->a, owner, 0) : u->types && param < u->side_cap ? u->types[param] : T_NONE;
+    if (t == T_NONE || !pattern_from(u, n, t, pat, 0))
+    {
+        return 0;
+    }
+    if (pat->kind == PATTERN_TEXT)
+    {
+        return 2;
+    }
+    uint64_t flip = signed_type(t) ? 1ull << 63 : 0;
+    *lo = pat->lo ^ flip;
+    *hi = (pat->kind == PATTERN_RANGE ? pat->hi : pat->lo) ^ flip;
+    return 1;
+}
+
 // An arm's pattern known while compiling (a literal, or a name of a constant), for a subject of
 // `type`. 0 for `_`, a name known only when the program runs, or an error.
 int sema_arm_pattern(Unit *u, NodeId pat, TypeId type, Pattern *out)
@@ -7462,7 +7858,8 @@ void sema_syntax_only(Unit *u)
 typedef struct
 {
     uint32_t hash; // of the declaration's name, as text
-    uint32_t idx;  // its index + 1 (0: empty)
+    uint32_t idx;  // the first declaration with that name: its index + 1 (0: empty)
+    uint32_t last; // the last one (index + 1): the others follow `next` from idx, as written
 } OrderSlot;
 typedef struct
 {
@@ -7472,8 +7869,9 @@ typedef struct
     uint8_t *state;   // 0 not visited, 1 in progress, 2 placed
     NodeId *out;
     uint32_t nout;
-    OrderSlot *slots; // the functions by the hash of their names' text (one probe per call)
+    OrderSlot *slots; // the functions by their names' text: one slot per name (one probe per call)
     uint32_t mask;
+    uint32_t *next;   // the next declaration with the same name (index + 1, 0: none)
 } Order;
 
 static int is_function_decl(const Unit *u, NodeId d)
@@ -7505,14 +7903,21 @@ static void order_calls_text(Order *o, const char *w, size_t n)
         {
             return;
         }
-        if (sl->hash != h || o->state[sl->idx - 1])
+        if (sl->hash != h)
         {
             continue;
         }
         const Token *t = TOK(o->u, NODE(o->u, o->decls[sl->idx - 1])->tok);
         if (t->len == n && memcmp(TSTART(t), w, n) == 0)
         {
-            order_visit(o, sl->idx - 1);
+            for (uint32_t i = sl->idx; i; i = o->next[i - 1])
+            {
+                if (!o->state[i - 1])
+                {
+                    order_visit(o, i - 1);
+                }
+            }
+            return;
         }
     }
 }
@@ -7581,7 +7986,7 @@ static void order_visit(Order *o, uint32_t i)
 // The file's declarations in checking order (out holds n): callees first.
 static uint32_t check_order(Unit *u, NodeId **out)
 {
-    Order o = {u, NULL, 0, NULL, NULL, 0, NULL, 0};
+    Order o = {u, NULL, 0, NULL, NULL, 0, NULL, 0, NULL};
     for (NodeId d = NODE(u, u->root)->a; d; d = NEXT(u, d))
     {
         o.n++;
@@ -7596,7 +8001,8 @@ static uint32_t check_order(Unit *u, NodeId **out)
     o.out = (NodeId *)malloc((o.n + 1) * sizeof(NodeId));
     o.state = (uint8_t *)calloc(o.n + 1, 1);
     o.slots = (OrderSlot *)calloc(cap, sizeof(OrderSlot));
-    if (!o.decls || !o.out || !o.state || !o.slots)
+    o.next = (uint32_t *)calloc(o.n + 1, sizeof(uint32_t));
+    if (!o.decls || !o.out || !o.state || !o.slots || !o.next)
     {
         fprintf(stderr, "fatal: out of memory\n");
         exit(2);
@@ -7611,9 +8017,22 @@ static uint32_t check_order(Unit *u, NodeId **out)
             uint32_t h = text_hash(TSTART(t), t->len), k = h & o.mask;
             while (o.slots[k].idx)
             {
+                const Token *f = TOK(u, NODE(u, o.decls[o.slots[k].idx - 1])->tok);
+                if (o.slots[k].hash == h && f->len == t->len && memcmp(TSTART(f), TSTART(t), t->len) == 0)
+                {
+                    break; // another definition of the name: chained after the last
+                }
                 k = (k + 1) & o.mask;
             }
-            o.slots[k] = (OrderSlot){h, i + 1};
+            if (o.slots[k].idx)
+            {
+                o.next[o.slots[k].last - 1] = i + 1;
+                o.slots[k].last = i + 1;
+            }
+            else
+            {
+                o.slots[k] = (OrderSlot){h, i + 1, i + 1};
+            }
         }
     }
     static int off = -1;
@@ -7636,6 +8055,7 @@ static uint32_t check_order(Unit *u, NodeId **out)
     free(o.decls);
     free(o.state);
     free(o.slots);
+    free(o.next);
     *out = o.out;
     return o.nout;
 }
@@ -7649,6 +8069,8 @@ void sema_check_decls(Unit *u)
     // The checker state is a few KB of locals: it lives on the C stack.
     Check c;
     memset(&c, 0, offsetof(Check, locals)); // the locals array needs no clearing
+    c.locals = c.first_locals;
+    c.locals_cap = MAX_LOCALS;
     c.u = u;
     c.implicit_self = domain_config_bool(u->domain, "implicit_self", 0);
     for (NodeId d = NODE(u, u->root)->a; d; d = NEXT(u, d))
@@ -7661,8 +8083,11 @@ void sema_check_decls(Unit *u)
 
 void sema_check_bodies(Unit *u)
 {
+    decl_last_first = decl_last = 0;
     Check c;
     memset(&c, 0, offsetof(Check, locals));
+    c.locals = c.first_locals;
+    c.locals_cap = MAX_LOCALS;
     c.u = u;
     c.implicit_self = domain_config_bool(u->domain, "implicit_self", 0);
     if (!u->valued)
@@ -7705,6 +8130,8 @@ int sema_lower_for_comptime(SymId fn)
     NodeId node = NODE(u, decl)->kind == AST_DEFINE ? NODE(u, decl)->a : decl;
     Check c;
     memset(&c, 0, offsetof(Check, locals));
+    c.locals = c.first_locals;
+    c.locals_cap = MAX_LOCALS;
     c.u = u;
     c.implicit_self = domain_config_bool(u->domain, "implicit_self", 0);
     int saved = capture_mir, errors = cx.quiet_errors;

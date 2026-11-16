@@ -90,6 +90,8 @@ static int reads(const Opt *o, const MirInst *in, MirSlot s)
         return s < o->f->ret_slots;
     case MIR_MOVE:
         return s >= in->a && s < in->a + in->imm;
+    case MIR_LOADN:
+        return in->a == s;
     default:
         return 0;
     }
@@ -101,6 +103,10 @@ static int kills(const MirInst *in, MirSlot s)
     if (in->op == MIR_ZERO)
     {
         return s >= in->a && s < in->a + in->imm;
+    }
+    if (in->op == MIR_LOADN)
+    {
+        return s >= in->d && s < in->d + in->imm && s != in->a;
     }
     if (in->op == MIR_MOVE) // (a move onto itself in part: the slots it reads stay live first)
     {
@@ -350,6 +356,7 @@ static int fold(Opt *o)
             }
             break;
         case MIR_MOVE:
+        case MIR_LOADN:
             nfacts = 0; // it may write slots some address points into
             for (uint64_t k = 0; k < in->imm; k++)
             {
@@ -586,7 +593,7 @@ static int dead_stores(Opt *o)
                 changed = 1;
                 break;
             }
-            if (in->op == MIR_LOAD || in->op == MIR_STORE || in->op == MIR_CALL || in->op == MIR_MOVE ||
+            if (in->op == MIR_LOAD || in->op == MIR_STORE || in->op == MIR_CALL || in->op == MIR_MOVE || in->op == MIR_LOADN ||
                 in->op == MIR_LABEL || MIR_BRANCHES(in) || in->op == MIR_RET ||
                 in->op == MIR_TRAP || in->op == MIR_WRITE || kills(in, st->a) ||
                 (st->a < o->nslots && o->addressed[st->a]))
@@ -709,7 +716,7 @@ static int frame_fields(Opt *o)
                 count[in->d] = (MirSlot)in->imm;
             }
         }
-        else if (in->op == MIR_ZERO || in->op == MIR_MOVE)
+        else if (in->op == MIR_ZERO || in->op == MIR_MOVE || in->op == MIR_LOADN)
         {
             MirSlot to = in->op == MIR_ZERO ? in->a : in->d;
             for (uint64_t k = 0; k < in->imm && to + k < o->nslots; k++)
@@ -740,31 +747,166 @@ static void mark_addressed(Opt *o)
     }
 }
 
+// What live_after says of every slot at once, kept from the end of the function backwards: one
+// sweep, so dce costs n, not a forward scan per instruction (n² in a long block). A slot's value
+// holds when its stamp is the current epoch; otherwise it is `base`, which a label, a branch or
+// an end sets for every slot at once.
+typedef struct
+{
+    const Opt *o;
+    uint32_t *stamp;
+    uint8_t *val;
+    uint32_t epoch;
+    uint8_t base;
+} Live;
+
+static int live_get(const Live *l, MirSlot s)
+{
+    if (s >= l->o->nslots || l->o->addressed[s])
+    {
+        return 1;
+    }
+    return l->stamp[s] == l->epoch ? l->val[s] : l->base;
+}
+
+static void live_set(Live *l, MirSlot s, uint8_t v)
+{
+    if (s < l->o->nslots)
+    {
+        l->stamp[s] = l->epoch;
+        l->val[s] = v;
+    }
+}
+
+static void live_range(Live *l, uint64_t from, uint64_t n, uint8_t v)
+{
+    for (uint64_t k = 0; k < n && from + k < l->o->nslots; k++)
+    {
+        live_set(l, (MirSlot)(from + k), v);
+    }
+}
+
+static void live_all(Live *l, uint8_t v)
+{
+    l->epoch++;
+    l->base = v;
+}
+
+// The slots `in` reads become live (as reads() says).
+static void live_reads(Live *l, const MirInst *in)
+{
+    const MirFunc *f = l->o->f;
+    switch (in->op)
+    {
+    case MIR_BIN:
+    case MIR_STORE:
+        live_set(l, in->a, 1);
+        live_set(l, in->b, 1);
+        break;
+    case MIR_COPY:
+    case MIR_BINI:
+    case MIR_NEG:
+    case MIR_NOT:
+    case MIR_NORM:
+    case MIR_LOAD:
+    case MIR_JZ:
+    case MIR_JNZ:
+    case MIR_GSTORE:
+    case MIR_TRAP:
+    case MIR_LOADN:
+        live_set(l, in->a, 1);
+        break;
+    case MIR_WRITE:
+        if (in->sub != MW_SPACE && in->sub != MW_NL)
+        {
+            live_set(l, in->a, 1);
+        }
+        break;
+    case MIR_CALL: // its window (addressed slots are always live)
+        if (f->frame_size < l->o->nslots)
+        {
+            live_range(l, f->frame_size, l->o->nslots - f->frame_size, 1);
+        }
+        break;
+    case MIR_RET:
+        live_range(l, 0, f->ret_slots, 1);
+        break;
+    case MIR_MOVE:
+        live_range(l, in->a, in->imm, 1);
+        break;
+    default:
+        break;
+    }
+}
+
+// From liveness after `in` to liveness before it, in live_after's order: a read, then a label
+// or a branch, then an overwrite, then an end.
+static void live_step(Live *l, const MirInst *in)
+{
+    if (in->op == MIR_LABEL || MIR_BRANCHES(in))
+    {
+        live_all(l, 1);
+        return;
+    }
+    if (MIR_ENDS(in))
+    {
+        live_all(l, 0); // (a RET's result slots: its reads, below)
+        live_reads(l, in);
+        return;
+    }
+    if (in->op == MIR_ZERO)
+    {
+        live_range(l, in->a, in->imm, 0);
+    }
+    else if (in->op == MIR_LOADN || in->op == MIR_MOVE)
+    {
+        live_range(l, in->d, in->imm, 0);
+    }
+    else if (produces(in->op))
+    {
+        live_set(l, in->d, 0);
+    }
+    live_reads(l, in); // (LOADN's a and MOVE's own slots: read, so live again)
+}
+
 static int dce(Opt *o)
 {
     MirFunc *f = o->f;
     int changed = 0;
+    // (a region leaving its shared page starts again elsewhere: then nothing is given back)
+    char *base = cx.regions[REGION_MIR].base;
+    size_t mark = cx.regions[REGION_MIR].used;
+    Live l = {o, (uint32_t *)region_push(REGION_MIR, ((size_t)o->nslots * 4 + 7) & ~(size_t)7),
+              (uint8_t *)region_push(REGION_MIR, (o->nslots + 7) & ~(size_t)7), 1, 0};
+    memset(l.stamp, 0, (size_t)o->nslots * 4); // nothing stamped: every slot is `base`, dead at the end
     for (size_t i = f->n; i-- > 0;)
     {
         MirInst *in = &f->code[i];
-        if (produces(in->op) && !live_after(o, i, in->d))
+        if (produces(in->op) && !live_get(&l, in->d))
         {
-            delete_inst(in);
+            delete_inst(in); // (removed: it reads nothing, so what it read may die too)
             changed = 1;
+            continue;
         }
-        else if (in->op == MIR_ZERO)
+        if (in->op == MIR_ZERO)
         {
             int any = 0;
             for (uint64_t k = 0; k < in->imm && !any; k++)
             {
-                any = live_after(o, i, (MirSlot)(in->a + k));
+                any = live_get(&l, (MirSlot)(in->a + k));
             }
             if (!any)
             {
                 delete_inst(in);
                 changed = 1;
+                continue;
             }
         }
+        live_step(&l, in);
+    }
+    if (cx.regions[REGION_MIR].base == base)
+    {
+        region_set_end(REGION_MIR, base + mark);
     }
     return changed;
 }
@@ -887,7 +1029,7 @@ static int known_bounds(Opt *o)
         }
         for (int h = 0; h < nheld; h++)
         {
-            if (kills(in, held[h].i) || (in->op == MIR_MOVE && held[h].i >= in->d && held[h].i < in->d + in->imm))
+            if (kills(in, held[h].i) || ((in->op == MIR_MOVE || in->op == MIR_LOADN) && held[h].i >= in->d && held[h].i < in->d + in->imm))
             {
                 held[h--] = held[--nheld];
             }
@@ -914,6 +1056,10 @@ void mir_optimize(MirFunc *f)
         if (in->op == MIR_MOVE)
         {
             top = (MirSlot)((in->d > in->a ? in->d : in->a) + in->imm);
+        }
+        if (in->op == MIR_LOADN)
+        {
+            top = (MirSlot)(in->d + in->imm) > top ? (MirSlot)(in->d + in->imm) : top;
         }
         nslots = top + 1 > nslots ? top + 1 : nslots;
     }

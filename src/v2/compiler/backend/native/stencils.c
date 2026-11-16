@@ -398,6 +398,16 @@ STENCIL(move) // C slots from B to A, from the first (MIR_MOVE where A is below 
     NEXT;
 }
 
+STENCIL(loadn) // C slots from the address in slot B to A (MIR_LOADN: a mutable array parameter's copy)
+{
+    const u64 *p = (const u64 *)f[B];
+    for (u64 i = 0; i < C; i++)
+    {
+        f[A + i] = p[i];
+    }
+    NEXT;
+}
+
 STENCIL(move_down) // C slots from B to A, from the last (MIR_MOVE onto an overlap above B)
 {
     u64 n = C;

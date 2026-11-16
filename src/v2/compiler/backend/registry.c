@@ -73,6 +73,7 @@ void codegen_start(const struct Backend *backend, void *out_file, const char *pa
     codegen.job.out = (FILE *)out_file;
     codegen.job.path = path;
     codegen.begun = 0;
+    module_reachable_reset(); // found again for this program
 }
 
 // Code is generated for the entry file, which is always the first unit.
@@ -82,6 +83,7 @@ void codegen_begin(Unit *u)
     {
         uint64_t t = cx.timing ? clock_ns() : 0;
         codegen.job.entry = u;
+        module_reachable_prepare(); // what main can reach, before the first body is generated
         codegen.backend->begin(&codegen.job);
         codegen.begun = 1;
         if (cx.timing)
@@ -136,6 +138,10 @@ void codegen_function(Unit *u, SymId fn)
     if (!codegen.begun)
     {
         return;
+    }
+    if (!module_reachable(fn))
+    {
+        return; // the entry cannot reach it (module.c): it would only be shaken out at the end
     }
     uint64_t t = cx.timing ? clock_ns() : 0;
     if (codegen.backend->function_mir)

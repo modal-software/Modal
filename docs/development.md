@@ -168,6 +168,12 @@ code in Modal on the `trap` and `site` primitives.
     the change;
   - compiler memory: `--stats` on the examples and on bench's `big` (about 41 MB today).
     Memory per symbol counts: big has 54,000 functions.
+  - a change to the checker or to generics: bench's `specs` as well as `big`. `big` makes no
+    specialization, so it cannot see a cost that grows with them (context.md §69).
+  - a change to code generation: bench's `reached` too, where main reaches every function. It
+    is the case where finding what main reaches gains nothing and only costs (§70).
+  - a change with a cost per declaration: the generators of context.md §70 (a feature at n and
+    4n). Instructions retired (`/usr/bin/time -l`) separate a 0.5% change from the noise.
 - The known failing checks of §4 are the only failures.
 - Commit only when the owner asks. Work on the feature branch (`feat/...`), never on `main`.
 
@@ -257,11 +263,236 @@ worse, say so; don't present that version as the "before".
 - **Pattern clauses reach the native backend joined** (`mir_clause_hold` / `mir_clause_merge`): a
   clause with a next one is held, copied to the arena, until the next is lowered. Its `--mir`
   therefore comes after the next clause's. What is still held at the end is generated as it was.
+- **No lookup that runs per function, per call or per body may walk a table.** Index it
+  (by symbol, or a hash), and check it at scale (bench `specs`, context.md §69). An index is
+  not free either: reading a side table per symbol costs cache misses on a program that does not
+  need it. Gate it on a bit the symbol already has (`SYM_F_SPEC`), and compare instructions
+  retired (`/usr/bin/time -l`) when times are within the noise.
+- **Large arrays go at the end of `cx`.** A field past an arm64 load's immediate offset costs an
+  instruction at every access: 1,024 units in front of `cx.syms` cost about 1M instructions on
+  big's check (context.md §70).
+- **A macro that reads its argument twice** breaks with `i++`: `SPEC_AT` is a function for that
+  (`-Wunsequenced` caught it).
+- **What main reaches is found from the text** (module.c, before any body is checked). A new
+  way to call a function without naming it in a reached declaration (beyond a struct's methods
+  and a specialization's generic) must be added there, or the function is not generated.
 - **A stencil change needs `make stencils`**, and the emitter refuses stale headers
   ("its stencils are out of date"). After `git stash` and back, touch the sources: make compares
   whole seconds, and a stash round trip within one second leaves a stale `./modal`.
 
-## 9. Git
+## 9. Depending on no C compiler: what is still missing
+
+Status: 2026-11-15. A C compiler (gcc, clang or `cc`; on macOS `gcc` is Apple's clang) is used
+in four places. Each one comes off separately, and they are listed here easiest first.
+
+| # | Where | What uses it today | What is needed to drop it |
+|---|---|---|---|
+| 1 | Building Modal programs | the default backend is `c` (`backend_default`); `--run` with it calls `cc` (`build_and_run`, `$CC`); `-o x.c` writes C | native as the default (below) |
+| 2 | Testing | the C backend is the reference (§1's ground rule); `make fuzz` compares every backend against it; `run.sh` runs every example through `cc`; `bench.sh` builds `bestof.c`; `backends.sh` builds `elfrun.c` | a reference that is not C (below); the tools written in Modal |
+| 3 | The stencils | `make stencils`: clang compiles `stencils.c` for each CPU and `stencilgen` turns it into `stencils_*.h` | nothing while `stencils.c` does not change (the headers are in the tree); later, stencils that Modal builds itself |
+| 4 | Building the compiler | `make`: `CC = gcc`, `-O2 -flto`; `make asan`: clang | self-hosting: the compiler written in Modal, built by the native backend from a kept bootstrap binary |
+
+### 9.1 Native as the default backend (step 1)
+
+The native backend already needs no toolchain. It writes Mach-O and ELF executables itself (no
+assembler, no linker) for arm64 and x86-64, on macOS, on Linux, and on bare metal, and `--run`
+runs the program in memory. What keeps `c` the default is what native does not do yet:
+
+- **Features C has and native refuses** (found by probing, 2026-11-15; not an exhaustive list):
+  - the address of an array element, `&ps[1]` ("this unary operator", lower.c);
+  - an arm match whose value is a struct, `return if k { 0: point{...}, _: ... }` ("this struct
+    value", lower.c).
+  - The full list comes from an audit: one program per `unsupported(...)` site in `mir/lower.c`
+    and `backend/native/emit.c`, run on both backends. A site C also refuses (strings compared
+    with `==`, for example) does not block the switch.
+- **Safety native lacks:**
+  - a stack guard. A program that calls itself gets a 512 KB value stack (`stack` in mod.modal),
+    and going past it crashes instead of stopping with a message (context.md §64; Phase E);
+  - tail calls with struct blocks (100M calls end in status 139; Phase E).
+- **Then:** `backend_default()` picks the native backend for the host (C stays available with
+  `-b c`), `--run` no longer needs `cc`, and the docs and examples that assume C change with it.
+
+### 9.2 A reference that is not C (step 2)
+
+The ground rule stays the same (every backend gives byte-identical output and status). What
+changes is which backend the others are checked against:
+
+- **The MIR interpreter** (`sema/comptime.c`) becomes the fuzzer's reference, with native
+  without registers (`MODAL_REGS=0`) as a second opinion. Today it runs compile-time positions
+  only. To run a whole program it still needs to:
+  - hold mutable module variables (it stops: "uses a mutable module variable");
+  - write to the program's output instead of the compiler's;
+  - end with the program's status on a trap;
+  - run with no step budget (`comptime_steps`) in that mode.
+- The C backend becomes one more backend under test, checked when a C compiler is present and
+  skipped otherwise (`run.sh` already skips the ELF runs when `elfrun` cannot be built).
+- `bestof.c` (bench) and `elfrun.c` (running Linux ELFs on macOS) are host tools. They are
+  rewritten in Modal once std can spawn a process and read files, or they stay as optional
+  tools.
+
+### 9.3 The stencils (step 3)
+
+Today the stencils are C functions that clang compiles with `-ffreestanding -fno-pic` for each
+CPU, and `stencilgen` cuts the machine code and holes out of the object file. Building Modal
+needs clang only after `stencils.c` changes. To drop clang entirely, the stencils are written in
+Modal and compiled by Modal's own native backend into the same header. That needs step 4's
+compiler first, or a small encoder of the instructions they use.
+
+### 9.4 Self-hosting (step 4)
+
+The compiler is 44,186 lines of C (`src/v2`, without the generated stencil headers and the tools). Written in Modal, it is built by a bootstrap `./modal`
+that is kept, and from then on by itself. What Modal still lacks for that:
+
+- the collections step (context.md §64): slices and growable arrays over the arena, for token,
+  node and symbol tables;
+- files, the program's arguments and its exit status in std (only output exists today);
+- maps (hash tables), written in std;
+- pointers into arrays (`&ps[1]`, above) and structs of pointers, which every table needs;
+- the speed rule (§1) applies: the self-hosted compiler must compile as fast as the C one
+  (bench's `big`: 24 ms) before it replaces it.
+
+Also missing, found in the `unsupported(...)` sites of `mir/lower.c` and in the open questions
+(2026-11-15):
+
+| Missing | Why a compiler needs it |
+|---|---|
+| **Real memory behind the arena** | The `arena` of the examples is a struct that counts numbers; it hands out no bytes. A primitive is needed that gets memory from the target (a static region, or mmap/brk), with byte loads and stores through an address. The collections have nowhere to live without it. |
+| **Tagged unions (closed sets)** | A tree node is "one of N kinds". Still an open question (context.md §10, question 2). A struct with a `kind` field works but is slow and unchecked. This is the largest *design* gap. |
+| **A struct inside a struct** | lower.c refuses it ("a struct inside a struct"). A node holds a position, a symbol holds a type. |
+| **Operations on strings** | `[]u8` compared (`==` is refused on both backends) and sliced: every keyword and symbol lookup. |
+| **Mutable module variables that are not literals** | Otherwise all compiler state goes through context parameters. That may be the design; it has to be decided. |
+| **The stack guard; tail calls with struct blocks** (Phase E) | A recursive-descent parser passes the 512 KB value stack easily, and that crashes with no message. Loops are recursion, and the compiler's loops carry structs. |
+| **Bytes written to a file** | The backends write executables, not text on the output. |
+| **Number formatting in std** (std.md step 4) | Error messages, `--sig`. |
+
+**Bootstrap in stages.** Today's C `./modal` is kept as stage 0 and builds the compiler written in
+Modal (stage 1). Stage 1 builds itself (stage 2), and stage 2 builds itself (stage 3). Stages 2
+and 3 must be byte-identical (the fixed point), and the speed rule holds before the switch.
+
+**A cheap test of readiness:** Modal's own scanner, written in Modal. It already needs a file,
+bytes, strings, a growing table and a closed set of token kinds. Whatever blocks it is the next
+item to build.
+
+#### 9.4.1 Doing more with less: every fact written once
+
+The aim is not the 44,186 lines translated. It is the same compiler in much less Modal, at the
+same speed. Most of the C's size is not the problem's difficulty but **the same fact written in
+many places**:
+
+- **Measured (2026-11-15):** one MIR instruction, `MIR_MOVE` (context.md §64), appears in 7 files
+  and 29 places: `mir.h` 2, `lower.c` 8, `opt.c` 7 (reads, kills, fold, dead stores, fields),
+  `comptime.c` 2, `regalloc.c` 2, `native/emit.c` 6, `stencils.c` 2. `mir.h` has 44 instructions.
+- The largest files: `sema/check.c` 7,990 lines (about 170 diagnostic calls), `mir/lower.c`
+  5,956 (157 `case`s), `backend/native/emit.c` 3,825 (148 `case`s), `backend/c/emit.c` 3,776,
+  `sema/comptime.c` 1,332, `mir/opt.c` 958.
+
+Modal already has what C lacks to stop the repetition: code run while compiling with no keyword,
+code made once per field (`field(v, i)`, context.md §49), arms decided while compiling, context
+parameters, error sets. The self-hosted compiler is meant to be **the heaviest user of those
+features**, not C written in another syntax. Five applications:
+
+1. **A MIR instruction is a Modal function, and the rest is derived from it.**
+   ```
+   -- the instruction is its meaning
+   add(a: u64, b: u64): a + b
+   ```
+   - the interpreter (`comptime.c`) runs the function;
+   - folding (`opt.c`) runs the same function while compiling, when the operands are constant;
+   - reads, writes and effects come from the signature (parameters read, the result written,
+     `arena` / `out` as effects), so the optimizer has no hand-written table;
+   - the stencil is the function compiled by the native backend itself, which also settles §9.3
+     (clang leaves the build);
+   - the C backend emits it as a `static inline` function.
+   From 7 files per instruction to 1, plus a CPU encoder where a stencil is not enough.
+2. **The tree is a tagged union, and the walks are generated.** The passes that only walk the
+   tree (`resolve.c` 535, `audit.c` 502, parts of `layout.c` 625) are mostly "for each child, go
+   down". With `field(v, i)` extended to a union's variants, the generic walk is written once in
+   std, and each pass writes only the arms it cares about, with `_` for the rest. Arms on the tag
+   become a jump table: no speed cost. This makes tagged unions requirement number one, before
+   the collections.
+3. **Diagnostics are error values, with no plumbing.** Each of check.c's diagnostic calls builds
+   its place and text by hand. With what exists (`site`, error sets, `n, e :=`, errors going up),
+   a check error is a value, `return type_mismatch{ want, got }`. The place comes from `site` or
+   the node, the text from printing by reflection in std, and the `if (!ok) return` chains go away.
+4. **Memory: one arena per phase, no free.** A compiler is a batch process. The `realloc` /
+   `_push` / `grow` sites (about 80 in the five largest files) become collections over the
+   context `arena`, passed implicitly. Each phase (parse, check, lower, emit) has its own arena
+   and drops it whole when it ends: allocation is an add, there is no freeing code and no lifetime
+   bugs.
+5. **Tables are data; their matchers are generated.** The scanner's keywords, operator
+   precedence, arm64 and x86-64 instruction encodings, and the Mach-O / ELF fields become
+   constant structs. Their lookup is made while compiling (string patterns in arms already
+   exist and become a comparison tree), which keeps the arms-for-predictability rule. A CPU's
+   encoder is its table and a loop.
+
+**What this moves up in the requirements:**
+1. tagged unions, and `field(v, i)` over their variants;
+2. one function used as an instruction: called while compiling, by the interpreter, and as a
+   stencil's body;
+3. errors that carry data (structs in an error set), not only names.
+
+**How it is measured:**
+- **The metric:** the number of places touched to add a MIR instruction, a node kind or a
+  diagnostic. The target is 1. This tests the philosophy better than a line count.
+- **The brake:** the speed rule (24 ms on `big`) holds for each derivation. A derivation that
+  makes slower code than the hand-written one does not go in.
+- No line count is given for the Modal compiler: it cannot be measured yet (§7).
+- **The first experiment:** application 1 with three or four instructions (`add`, `move`, a load,
+  a branch) through all four consumers (interpreter, fold, stencil, C). It shows whether the idea
+  holds before any rewrite.
+
+**Order:** 9.1, then 9.2, then the memory primitive and the collections step, then a struct inside
+a struct, `&xs[i]`, strings, tagged unions and the stack guard, then the std pieces (files,
+arguments, exit status, maps, formatting), then 9.4 (with 9.4.1's experiment first), then 9.3,
+which 9.4.1's first application may settle. Each step is a phase with its own context.md section.
+
+#### 9.4.2 The audit of the compiler's own cost (2026-11-15)
+
+Every phase was profiled with `sample` on bench's `big` (and a version ten times as large), and
+on a program written to make specializations. What it found:
+
+- **The profile of `big` is flat.** The largest item, `native_function`, has 57 of 636 samples.
+  Tokens of 12 bytes, bodies parsed when checked, regions and an arena that never frees all hold.
+- **Fixed: specializations were found by walking their table** (context.md §69). Each lookup was
+  O(specializations) and ran once or more per function, so 4,000 specializations made a 20,000
+  function program 12 times slower (69 → 824 ms). Bench's `specs` now measures that case.
+- **`big` cannot see most features.** It has no generics, structs, arms, arrays or std, so the
+  speed rule (§1) did not protect them. `specs` covers specializations; a program that uses
+  structs, arrays, `map` / `fold` and arms at scale is still to be written.
+- ~~**Fixed limits the self-hosted compiler will reach**~~ (context.md §70: none left of these):
+  - ~~`MAX_UNITS` 64 files (cx.h)~~: 1,024, and 256 domains;
+  - ~~`SPEC_MAX` 4096, `GENERIC_MAX` 1024 (check.c)~~: they grow;
+  - ~~256 specializations per generic~~: a depth of 8,192 specializations made inside one
+    another, with a message that says so;
+  - ~~`MAX_LOCALS` 256 (check.c) and 512 (lower.c), `MAX_LABELS` 4096, `MAX_LOOPS` 256~~: they
+    grow.
+- ~~**Native generates every function and shakes them at the end**~~ (§70): a function of
+  another file that main cannot reach is not generated, on native or C. The entry file is
+  generated whole: reading its bodies cost 7% of a file whose functions are all used, so big's
+  own dead code is still generated and shaken.
+- **Native's memory per function:** ~~`big` takes 41.8 MB~~ 39.0 MB (§70: `stack_need` kept its
+  tables; the fold and the shake use 32-bit indices), against the C backend's 28.4 MB. Still
+  about 100 B a function above C: the MIR kept for inlining to the end (`Inlinable`), `fn
+  ranges` (57 B a function), `fn_at` regrown in the arena.
+
+Found by the generators of §70 (a feature at n and 4n: a ratio well above 4 is a walk inside a
+walk):
+
+- ~~`struct_marked` walked every symbol per field~~ (12,000 structs: 508 ms; §70: 21 ms).
+- ~~`names_a_generic` read each body once per generic~~ (400 unused generics made 20,000 bodies
+  4.6× slower; §70).
+- ~~`print(e)` wrote a compare per error at each print~~, capped at 512 names (100 prints × 100
+  names did not compile on native; §70: one routine).
+- ~~C: a match past about 5,000 arms crashed clang~~ (§70: a flat chain past 64).
+- **Clauses:** one group of n pattern clauses is O(n²) in `sema_declare` (2,000: 93.7 ms). Not
+  fixed.
+- **`val` is still a keyword** (v1): a module-level `val(...)` parses as an import list.
+- The C backend's chain per `print(e)`, the duplicate-local check (O(locals²) in a block), and
+  the 200-level nesting guard stay.
+- **`--time` costs time:** two `clock_gettime` per deferred body, about 2% of the samples. Its
+  numbers are slightly above the real ones.
+
+## 10. Git
 
 - Work on the feature branch. Commit or push only when the owner asks.
 - Commit messages end with the attribution line given to the session.

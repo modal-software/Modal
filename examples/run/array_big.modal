@@ -16,8 +16,8 @@ fill(xs: *[]u64, u64 i) {
 u64 work() {
     [30000]u64 a
     fill(&a, 0)
-    b := map(u64, u64, a, x: x * 2 + 1)
-    return fold(u64, u64, b, 0, (s, x): s + x)
+    b := map(a, x: x * 2 + 1)
+    return fold(b, u64(0), (s, x): s + x)
 }
 main(): u8 {
     print(work())

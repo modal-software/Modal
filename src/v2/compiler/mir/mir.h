@@ -57,6 +57,8 @@ typedef enum
     MIR_DESC,   // d = the address of the descriptor of type imm, in the compiler (comptime.c)
     MIR_MOVE,   // slots d .. d + imm - 1 = slots a .. a + imm - 1 (as memmove: they may overlap);
                 // an array or a struct of many slots, in one instruction (copy_slots)
+    MIR_LOADN,  // slots d .. d + imm - 1 = the imm words at the address in slot a (a mutable array
+                // parameter's own copy, one instruction for any length)
     MIR__COUNT,
 } MirOp;
 

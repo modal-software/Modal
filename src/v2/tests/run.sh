@@ -151,7 +151,7 @@ else
     echo "FAIL  unknown backend is rejected"
     fail=1
 fi
-for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms arm_edges arm_search arm_consts clauses_nil arrays fields reflect field_use nested module_structs any types generic fields_each bound pipes errors error_stages panics error_sets arena_errors closures functions struct_arrays generic_loop print_errors struct_errors captures len lengths map_fold array_moves array_big array_frames array_results fields_grouped conditions; do
+for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms arm_edges arm_search arm_consts clauses_nil arrays fields reflect field_use nested module_structs any types generic fields_each bound pipes errors error_stages panics error_sets arena_errors closures functions struct_arrays generic_loop print_errors struct_errors captures len lengths map_fold array_moves array_big array_frames array_results fields_grouped type_vars conditions; do
     if $BIN --run $EX/run/$prog.modal 2>&1 | cmp -s - $EX/run/$prog.expected; then
         echo "ok    $prog.modal compiles to C and prints the expected output"
     else
@@ -229,7 +229,7 @@ fi
 
 # the native backend (copy-and-patch): same output and exit status as the C backend
 if [ "$(uname -m)" = arm64 ] || [ "$(uname -m)" = aarch64 ]; then
-    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms arm_edges arm_search arm_consts clauses_nil arrays fields reflect field_use nested module_structs any types generic fields_each bound pipes errors error_stages panics error_sets arena_errors closures functions struct_arrays generic_loop print_errors struct_errors captures len lengths map_fold array_moves array_big array_frames array_results fields_grouped conditions; do
+    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms arm_edges arm_search arm_consts clauses_nil arrays fields reflect field_use nested module_structs any types generic fields_each bound pipes errors error_stages panics error_sets arena_errors closures functions struct_arrays generic_loop print_errors struct_errors captures len lengths map_fold array_moves array_big array_frames array_results fields_grouped type_vars conditions; do
         if $BIN --backend native --run $EX/run/$prog.modal 2>&1 | cmp -s - $EX/run/$prog.expected; then
             echo "ok    $prog.modal compiles to arm64 by copy-and-patch and prints the expected output"
         else
@@ -259,7 +259,7 @@ if [ "$(uname -m)" = arm64 ] || [ "$(uname -m)" = aarch64 ]; then
 fi
 # x86-64: on an x86-64 host, or on Apple Silicon through Rosetta
 if [ "$(uname -m)" = x86_64 ] || arch -x86_64 /usr/bin/true 2>/dev/null; then
-    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms arm_edges arm_search arm_consts clauses_nil arrays fields reflect field_use nested module_structs any types generic fields_each bound pipes errors error_stages panics error_sets arena_errors closures functions struct_arrays generic_loop print_errors struct_errors captures len lengths map_fold array_moves array_big array_frames array_results fields_grouped conditions; do
+    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms arm_edges arm_search arm_consts clauses_nil arrays fields reflect field_use nested module_structs any types generic fields_each bound pipes errors error_stages panics error_sets arena_errors closures functions struct_arrays generic_loop print_errors struct_errors captures len lengths map_fold array_moves array_big array_frames array_results fields_grouped type_vars conditions; do
         if $BIN --backend x86_64 --run $EX/run/$prog.modal 2>&1 | cmp -s - $EX/run/$prog.expected; then
             echo "ok    $prog.modal compiles to x86-64 by copy-and-patch and prints the expected output"
         else
@@ -290,7 +290,7 @@ for cpu in arm64 x86_64; do
     else
         continue
     fi
-    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms arm_edges arm_search arm_consts clauses_nil arrays fields reflect field_use nested module_structs any types generic fields_each bound pipes errors error_stages panics error_sets arena_errors closures functions struct_arrays generic_loop print_errors struct_errors captures len lengths map_fold array_moves array_big array_frames array_results fields_grouped conditions; do
+    for prog in hello counter context patterns globals literals structs output locals divide same comptime guards primitives loops quotients matching arms arm_edges arm_search arm_consts clauses_nil arrays fields reflect field_use nested module_structs any types generic fields_each bound pipes errors error_stages panics error_sets arena_errors closures functions struct_arrays generic_loop print_errors struct_errors captures len lengths map_fold array_moves array_big array_frames array_results fields_grouped type_vars conditions; do
         if $BIN --target $cpu-linux -o "$ELF" $EX/run/$prog.modal >/dev/null 2>&1 &&
             $runner "$ELF" 2>&1 | untrap "$ELF.traps" | cmp -s - $EX/run/$prog.expected; then
             echo "ok    $prog.modal as a Linux $cpu ELF prints the expected output"
@@ -477,6 +477,9 @@ fi
 rm -f "$NE_OUT" "$NE_OUT.traps"
 expect_output "errors: a module-level value's call that gives an error stops the compiler" "module_errors.modal:10:.*'b' cannot be computed by the compiler: gets an error from a call" $EX/errors/module_errors.modal
 CO=$EX/errors/conditions.modal
+TV=$EX/errors/type_vars.modal
+expect_output "type variables: the arguments agree on T" "type_vars.modal:12:.*'max': T is u64 here, but u8 from an argument before" $TV
+expect_output "type variables: an untyped number gives none" "type_vars.modal:13:.*'fold': no argument gives A, which 's' takes" $TV
 expect_output "conditions: a value match still needs _ (a condition takes nothing for sure)" "conditions.modal:11:.*not every value is taken" $CO
 expect_output "conditions: not on a call that can fail yet" "conditions.modal:15:.*a condition is not a pattern of a call that can fail yet" $CO
 # A big array costs no code per element (§64): copied in one block, passed on in a loop as its
@@ -490,6 +493,16 @@ else
     fail=1
 fi
 rm -f "$AB_OUT" "$AB_OUT.traps"
+# A mutable array parameter's own copy is one instruction (MIR_LOADN), not a load per element:
+# array_frames' [5000]u64 took 8000 loads and 118 ms of compiling; now under 100 MIR lines.
+AF_N=$($BIN --backend native --mir -o "${TMPDIR:-/tmp}/modal-array-frames.$$" $EX/run/array_frames.modal 2>&1 | wc -l)
+rm -f "${TMPDIR:-/tmp}/modal-array-frames.$$" "${TMPDIR:-/tmp}/modal-array-frames.$$.traps"
+if [ "$AF_N" -lt 100 ]; then
+    echo "ok    native: a mutable array parameter is copied in one instruction"
+else
+    echo "FAIL  native: a mutable array parameter is copied in one instruction ($AF_N MIR lines)"
+    fail=1
+fi
 # An array result is written in the caller's place (§64): C passes it as m_ret, the local
 # returned lives there, and nothing is copied back (no `return *(m_arr_N *)`).
 AR_C=${TMPDIR:-/tmp}/modal-array-results.$$.c
@@ -527,7 +540,7 @@ FI=$EX/errors/field_index.modal
 expect_output "field: the number is one of the fields" "field_index.modal:12:.*cannot compute for this call: .*assert(u64(i) < self.fields) is false" $FI
 expect_output "field: a number its caller knows only when it runs" "field_index.modal:14:.*'at' takes this argument while compiling" $FI
 expect_output "field: of the struct its type says" "field_index.modal:15:.*argument 2 of 'field' should be \*u8, but it is \*rec" $FI
-if $BIN $FI 2>&1 | grep -q "type.modal:3[0-9]"; then
+if $BIN $FI 2>&1 | grep -q "^error \[[^]]*type.modal:"; then
     echo "FAIL  field: a specialization whose types cannot be computed is not checked further"
     fail=1
 else
@@ -661,6 +674,57 @@ expect_output "immutable method defined twice" "'area' is already declared at li
 expect_output "overload with the same signature" "'twice' is already declared at line 24 with the same" $EX/errors/syntax.modal
 expect_output "self of a foreign type" "the type of .self. must be this module" $EX/errors/syntax.modal
 expect_output "untyped parameter" "parameter 'a' needs a type" $EX/errors/syntax.modal
+
+# Scale (context.md §70): limits that were fixed, and what a large program must not pay for.
+# Each program is generated here; every one runs on C and native and must give the same output.
+SC=${TMPDIR:-/tmp}/modal-scale-$$
+mkdir -p "$SC"
+scale_same() { # description, file, expected output
+    c_out=$($BIN -b c --run "$2" 2>&1)
+    n_out=$($BIN --backend native --run "$2" 2>&1)
+    if [ "$c_out" = "$3" ] && [ "$n_out" = "$3" ]; then
+        echo "ok    $1"
+    else
+        echo "FAIL  $1 (c: $(echo "$c_out" | head -1 | cut -c1-100); native: $(echo "$n_out" | head -1 | cut -c1-100))"
+        fail=1
+    fi
+}
+awk 'BEGIN { print "print := import(\"std\").io.print\nu64 seed = 1\nf(a: u64): u64 {"
+    for (i = 0; i < 600; i++) printf "    u64 x%d = a + %d\n", i, i
+    print "    return x0 + x599\n}\nmain(): u8 {\n    print(f(seed))\n    return 0\n}" }' > "$SC/locals.modal"
+scale_same "600 locals in one function (the limit was 256 in the check, 512 in the lowering)" "$SC/locals.modal" "601"
+awk 'BEGIN { print "print := import(\"std\").io.print\nu64 seed = 7\nu64 f(u64 k) {\n    return if k {"
+    for (i = 0; i < 6000; i++) printf "        %d: %d,\n", i * 3, i
+    print "        _: 0,\n    }\n}\nmain(): u8 {\n    print(f(seed * 3), f(seed))\n    return 0\n}" }' > "$SC/arms.modal"
+scale_same "6,000 arms: flat in C (clang crashed on the else-if chain), past 4,096 labels on native" "$SC/arms.modal" "7 0"
+awk 'BEGIN { print "print := import(\"std\").io.print\nu64 seed = 0"
+    for (i = 0; i < 40; i++) printf "bad%d: error\n", i
+    for (i = 0; i < 40; i++) printf "f%d(u64 a): u64, error {\n    if a { 0: return bad%d, _: return a }\n}\n", i, i
+    print "main(): u8 {"
+    for (i = 0; i < 40; i++) printf "    n%d, e%d := f%d(seed)\n    print(e%d)\n", i, i, i, i
+    print "    return 0\n}" }' > "$SC/errors.modal"
+scale_same "print(e) with 40 error names: one routine, not a chain per print" "$SC/errors.modal" "$(awk 'BEGIN { for (i = 0; i < 40; i++) printf "bad%d\n", i }')"
+expect_output "the names of print(e) are a routine made once" "^fn out.error " "$SC/errors.modal" --backend native -o "$SC/errors" --mir
+awk 'BEGIN { print "print := import(\"std\").io.print\ntype := import(\"std\").type"
+    for (i = 0; i < 300; i++) printf "s%d: struct { u64 a, u64 b }\n", i
+    print "first(T: type, a: *T): u64 { return a.a + a.b }"
+    for (i = 0; i < 300; i++) printf "g%d(n: u64): u64 {\n    x := s%d{ a: n, b: %d }\n    return first(s%d, &x)\n}\n", i, i, i, i
+    print "u64 seed = 1\nmain(): u8 {\n    print(g0(seed), g299(seed))\n    return 0\n}" }' > "$SC/specs.modal"
+scale_same "one generic made for 300 types (the limit was 256 per generic)" "$SC/specs.modal" "1 300"
+awk 'BEGIN { print "print := import(\"std\").io.print"
+    for (i = 0; i < 3000; i++) printf "u64 f(u64 %d): %d\n", i * 2, i
+    print "u64 f(u64 k): 7\nu64 seed = 9\nmain(): u8 {\n    print(f(seed * 222), f(seed))\n    return 0\n}" }' > "$SC/clauses.modal"
+scale_same "3,000 clauses of one function: declared, ordered, checked and named in linear time" "$SC/clauses.modal" "999 7"
+printf 'u8 k(u8 0..10): 1\nu8 k(u8 10..): 2\nu8 k(u8 20..30): 3\nu8 k(u8 3): 4\nu8 k(u8 n): 5\nu8 main(): k(1)\n' > "$SC/overlap.modal"
+expect_output "clauses that overlap are found by sorting, not by pairs" "overlap.modal:3:.*takes values the clause at line 2 takes too" "$SC/overlap.modal"
+expect_output "a clause inside an earlier range is found too" "overlap.modal:4:.*takes values the clause at line 1 takes too" "$SC/overlap.modal"
+printf 'used(a: u64): u64 { return helper(a) * 3 }\nhelper(a: u64): u64 { return a + 1 }\nunused(a: u64): u64 { return a * 5 }\nalso_unused(a: u64): u64 { return unused(a) }\n' > "$SC/lib.modal"
+printf 'print := import("std").io.print\nused := import("./lib").used\nu64 seed = 2\nmain(): u8 {\n    print(used(seed))\n    return 0\n}\n' > "$SC/unreached.modal"
+printf 'print := import("std").io.print\nlib := import("./lib")\nu64 seed = 2\nmain(): u8 {\n    print(lib.used(seed))\n    return 0\n}\n' > "$SC/whole.modal"
+scale_same "a file's function bound by name runs (and what it calls)" "$SC/unreached.modal" "9"
+expect_output "a function of another file main cannot reach is not generated" "^functions 3 " "$SC/unreached.modal" --backend native -o "$SC/unreached" --stats
+expect_output "a file imported as a module is generated whole" "^functions 5 " "$SC/whole.modal" --backend native -o "$SC/whole" --stats
+rm -rf "$SC"
 
 if [ $fail -eq 0 ]; then
     echo "all v2 checks passed"

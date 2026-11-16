@@ -164,6 +164,65 @@ static void out_sym_name(Emit *e, SymId s)
 }
 
 // modal_<struct>_<name>, with __<parameter count> for the overloadable (type-first) form.
+// A clause's place among the definitions of its name with as many parameters (0: the first,
+// which calls go to). A name is mangled at every call, so the places of a whole chain are
+// counted once, on its first use: n clauses cost n, not n² (backend_c_begin empties it).
+static uint32_t *clause_places; // 1 + the place, by SymId; 0: not counted yet
+static size_t clause_places_cap;
+
+static int clause_index(const Unit *home, SymId fn)
+{
+    if (fn < clause_places_cap && clause_places[fn])
+    {
+        return (int)clause_places[fn] - 1;
+    }
+    SymId first = scope_find_token(SYM(fn)->owner ? scope_at(SYM(SYM(fn)->owner)->scope_ref) : home->scope,
+                                   TOK(home, SYM(fn)->tok));
+    SymId last = first;
+    for (SymId s = first; s; s = SYM(s)->next_overload)
+    {
+        last = s > last ? s : last;
+    }
+    if (!first || last >= clause_places_cap)
+    {
+        size_t cap = clause_places_cap ? clause_places_cap : 1024;
+        while (cap <= last || cap <= fn)
+        {
+            cap *= 2;
+        }
+        uint32_t *grown = (uint32_t *)realloc(clause_places, cap * sizeof(uint32_t));
+        if (!grown)
+        {
+            return sema_clause_index((Unit *)home, fn);
+        }
+        memset(grown + clause_places_cap, 0, (cap - clause_places_cap) * sizeof(uint32_t));
+        clause_places = grown;
+        clause_places_cap = cap;
+    }
+    enum { ARITIES = 64 };
+    uint32_t seen[ARITIES] = {0};
+    int found = 0;
+    for (SymId s = first; s; s = SYM(s)->next_overload)
+    {
+        if (SYM(s)->kind != SYM_METHOD)
+        {
+            continue;
+        }
+        int arity = 0;
+        for (NodeId p = sema_fn_params(home, s); p; p = NEXT(home, p))
+        {
+            arity++;
+        }
+        if (arity >= ARITIES)
+        {
+            continue; // counted by sema_clause_index, one by one
+        }
+        clause_places[s] = 1 + seen[arity]++;
+        found |= s == fn;
+    }
+    return found ? (int)clause_places[fn] - 1 : sema_clause_index((Unit *)home, fn);
+}
+
 static void out_fn_name(Emit *e, SymId fn)
 {
     if (SYM(fn)->flags & SYM_F_LITERAL) // anonymous: named by its symbol
@@ -213,7 +272,7 @@ static void out_fn_name(Emit *e, SymId fn)
             put_c(e, digits[--n]);
         }
         // a later clause of the same arity: _2, _3, ... (calls go to the first)
-        int clause = sema_clause_index((Unit *)home, fn);
+        int clause = clause_index(home, fn);
         if (clause > 0)
         {
             put_c(e, '_');
@@ -944,8 +1003,8 @@ static void emit_output(Emit *e, NodeId args, int newline, SymId sink)
         }
         if (t == T_ERROR) // print(e): its name, or `error N`
         {
-            static uint64_t ids[512];
-            uint32_t ne = sema_errors_list(ids, 512);
+            uint32_t ne;
+            const uint64_t *ids = sema_errors(&ne);
             char line[160], var[32];
             snprintf(var, sizeof(var), "m_e%u", (unsigned)a);
             PUT(e, "({ uint64_t ");
@@ -1618,6 +1677,7 @@ static void emit_error_match(Emit *e, NodeId id)
     }
 }
 
+#define FLAT_ARMS 64
 static void emit_match_as(Emit *e, NodeId id, int returned)
 {
     if (NODE(e->u, id)->aux & MATCH_ERRORS)
@@ -1674,6 +1734,24 @@ static void emit_match_as(Emit *e, NodeId id, int returned)
         PUT(e, "{\n");
     }
     NodeId only = e->fn ? sema_taken_arm(e->fn, id) : 0; // decided while compiling: that arm, untested
+    // Past FLAT_ARMS arms the chain is flat: `if (!m_dN && ...) { m_dN = 1; ... }` per arm, no
+    // `else`. clang parses an `else if` chain as nesting and crashed (stack) near 5,000 arms.
+    int narms = 0;
+    for (NodeId arm = m->b; arm; arm = NEXT(u, arm))
+    {
+        narms++;
+    }
+    int flat = !only && narms > FLAT_ARMS;
+    char done[24], open_flat[40], open_flat_paren[40];
+    snprintf(done, sizeof(done), "m_d%u", (unsigned)id);
+    snprintf(open_flat, sizeof(open_flat), "if (!%s && ", done);
+    snprintf(open_flat_paren, sizeof(open_flat_paren), "if (!%s && (", done);
+    if (flat)
+    {
+        put(e, "int ");
+        put(e, done);
+        put(e, " = 0;\n");
+    }
     for (NodeId arm = m->b; arm; arm = NEXT(u, arm))
     {
         if (only && arm != only)
@@ -1693,13 +1771,13 @@ static void emit_match_as(Emit *e, NodeId id, int returned)
             }
             if (sema_arm_pattern(u, pat, types[k], &pt)) // `_`: none
             {
-                put(e, tests ? " && " : "if (");
+                put(e, tests ? " && " : flat ? open_flat : "if (");
                 emit_pattern_cond(e, &pt, types[k], subj[k]);
                 tests++;
             }
             else if ((name = sema_arm_name(u, pat, types[k]))) // a value known when the program runs
             {
-                put(e, tests ? " && " : "if (");
+                put(e, tests ? " && " : flat ? open_flat : "if (");
                 out_subject(e, subj[k]);
                 PUT(e, " == (");
                 emit_as(e, name, types[k]);
@@ -1708,13 +1786,27 @@ static void emit_match_as(Emit *e, NodeId id, int returned)
             }
             else if ((name = sema_arm_cond(u, pat))) // a condition: the arm when it is true
             {
-                put(e, tests ? " && (" : "if ((");
+                put(e, tests ? " && (" : flat ? open_flat_paren : "if ((");
                 emit_as(e, name, T_BOOL);
                 PUT(e, ")");
                 tests++;
             }
         }
-        put(e, tests ? ") {\n" : "{\n");
+        if (flat)
+        {
+            if (!tests)
+            {
+                put(e, "if (!");
+                put(e, done);
+            }
+            put(e, ") { ");
+            put(e, done);
+            put(e, " = 1;\n");
+        }
+        else
+        {
+            put(e, tests ? ") {\n" : "{\n");
+        }
         NodeId r = a->b;
         int saved = e->indent;
         e->indent = 2;
@@ -1773,7 +1865,14 @@ static void emit_match_as(Emit *e, NodeId id, int returned)
         if (last && tests && (m->aux & MATCH_PASS) && m->a && !returned && type != T_VOID && type != T_NONE)
         {
             char line[64]; // a stage: the values no arm takes go on as its value (std.md §14)
-            snprintf(line, sizeof(line), "} else { m_r%u = (", id);
+            if (flat)
+            {
+                snprintf(line, sizeof(line), "}\nif (!m_d%u) { m_r%u = (", (unsigned)id, id);
+            }
+            else
+            {
+                snprintf(line, sizeof(line), "} else { m_r%u = (", id);
+            }
             put(e, line);
             out_type(e, type, m->tok);
             PUT(e, ")(");
@@ -1783,14 +1882,27 @@ static void emit_match_as(Emit *e, NodeId id, int returned)
         }
         if (last && tests && (m->aux & MATCH_PASS) && m->a && returned && ret != T_VOID)
         {
-            PUT(e, "} else { return ("); // `return x.(5: 1)`: a value no arm takes is the result
+            if (flat)
+            {
+                put(e, "}\nif (!");
+                put(e, done);
+                put(e, ") { return (");
+            }
+            else
+            {
+                PUT(e, "} else { return ("); // `return x.(5: 1)`: a value no arm takes is the result
+            }
             out_type(e, ret, m->tok);
             PUT(e, ")(");
             out_subject(e, subj[0]);
             PUT(e, "); }\n");
             continue;
         }
-        put(e, last ? "}\n" : "} else ");
+        put(e, last || flat ? "}\n" : "} else ");
+    }
+    if (flat && (!m->a || returned) && ret != T_VOID)
+    {
+        PUT(e, "__builtin_unreachable();\n"); // the arms cover every value (checked): every one returned
     }
     if (m->a && !returned)
     {
@@ -3499,6 +3611,10 @@ static void backend_c_begin(const BackendJob *job)
     Unit *u = job->entry;
     emit_state = (Emit){.u = u, .out = job->out};
     Emit *e = &emit_state;
+    if (clause_places)
+    {
+        memset(clause_places, 0, clause_places_cap * sizeof(uint32_t));
+    }
 
     // Other files (std, imported modules) give their functions to the program: each is emitted
     // in its own file's context, named m_u<file>_... Their types and module-level values are
@@ -3518,6 +3634,10 @@ static void backend_c_begin(const BackendJob *job)
                         (n->kind == AST_DEFINE && NODE(m, n->a)->kind != AST_FN_LIT && !ast_import_root(m, n->a));
             SymId vs = scope_find_token(m->scope, TOK(m, n->tok));
             uint64_t ev;
+            if (value && sema_is_type_variable(vs))
+            {
+                continue; // `T: type`: a type the arguments give, no value
+            }
             if (value && vs && sema_value_type(m, vs) == T_ERROR && sema_comptime_value(vs, &ev))
             {
                 continue; // `division: error`: a number, written where it is used
@@ -3628,9 +3748,9 @@ static void backend_c_begin(const BackendJob *job)
     for (SymId fn = 1; fn < cx.syms.size; fn++)
     {
         Unit *home = &cx.units[SYM(fn)->unit];
-        if (SYM(fn)->kind != SYM_METHOD || home->is_manifest || home->broken)
+        if (SYM(fn)->kind != SYM_METHOD || home->is_manifest || home->broken || !module_reachable(fn))
         {
-            continue;
+            continue; // (one the entry cannot reach is not written: no prototype without a body)
         }
         e->u = home;
         NodeId fd = SYM(fn)->decl ? (NODE(home, SYM(fn)->decl)->kind == AST_DEFINE ? NODE(home, SYM(fn)->decl)->a

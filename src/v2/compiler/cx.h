@@ -70,9 +70,9 @@ typedef struct
     size_t used;
 } ArenaMark;
 
-#define MAX_UNITS 64
+#define MAX_UNITS 1024 // (in cx: about 200 bytes each, pages touched only as files load)
 #define MAX_REPORTED 20 // errors printed in full; the rest are only counted
-#define MAX_DOMAINS 32
+#define MAX_DOMAINS 256
 
 // A source file. The file is also a module: `example/john.modal` is module `john` in domain
 // (folder) `example`, and `example/mod.modal` is the domain's public face.
@@ -96,6 +96,7 @@ struct Unit
     uint16_t domain;
     size_t max_body;     // bytes of the largest deferred body: a bound on its tokens and nodes
     uint32_t nimports;   // import(...) expressions in this file
+    uint32_t module_imports; // of them, those outside bodies (counted before any body is parsed)
     uint8_t is_manifest; // this file is a mod.modal
     uint8_t provided;    // made by the compiler, not read from disk: import("target")
     uint8_t bound;       // the domain's mod.modal binds this module: it is part of the face
@@ -153,12 +154,8 @@ typedef struct
 typedef struct
 {
     Region regions[REGION__COUNT];
-    Unit units[MAX_UNITS];
     uint16_t nunits;
     uint16_t linked;                  // units whose imports and manifest have been processed
-    const char *domains[MAX_DOMAINS]; // canonical folder paths
-    const char *domain_names[MAX_DOMAINS]; // their last component, computed once
-    uint8_t domain_manifest[MAX_DOMAINS]; // 0: not looked for yet, 1: looked for (loaded or none)
     uint16_t ndomains;
     SymVec syms;    // slot 0 is reserved as "no symbol"
     TypeVec types;  // the type table (see sema/types.h)
@@ -191,6 +188,12 @@ typedef struct
     int warnings;
     const MachineTarget *target; // see target_get()
     uint8_t target_given;        // --target named it
+    // The large arrays last: the fields above stay within a load's immediate offset of &cx (on
+    // arm64, 1024 units of ~200 bytes in front of them cost an extra instruction per access).
+    Unit units[MAX_UNITS];
+    const char *domains[MAX_DOMAINS];      // canonical folder paths
+    const char *domain_names[MAX_DOMAINS]; // their last component, computed once
+    uint8_t domain_manifest[MAX_DOMAINS];  // 0: not looked for yet, 1: looked for (loaded or none)
 } context;
 
 extern context cx;
@@ -448,8 +451,13 @@ enum
 int comptime_fold_notes(SymId fn, uint32_t *budget);
 // std's `any` (std/any.modal): a reference that carries the type of what it points to.
 int sema_is_any(SymId strct);
+int sema_is_type_variable(SymId s); // a module-level `T: type` with no value: no value at run time (§67)
 int sema_is_generic(SymId fn);   // made once per type (docs/comptime.md §3.2): never generated itself
 int sema_spec_index(SymId fn);   // a specialization's number (1 on), or 0
+SymId sema_spec_generic(SymId fn); // the generic a specialization was made of, or 0
+int module_reachable(SymId fn);    // can the entry reach fn, from the program's text (module.c)
+void module_reachable_reset(void); // a new program: found again
+void module_reachable_prepare(void); // found now (codegen_begin)
 TypeId sema_bound_type(SymId fn, NameId name); // in specialization fn, the type `name: type` is bound to (or T_NONE)
 uint32_t sema_spec_functions(SymId fn, SymId *out, uint32_t cap); // the functions a specialization is for
 NameId sema_capture_name(SymId lit, NameId name); // a specialization's own name for a capture of lit
@@ -535,6 +543,7 @@ typedef struct
 int sema_pattern_of(Unit *u, NodeId param, SymId owner, Pattern *out, int loud);
 // Do two parameters of clauses with the same types take a value in common? (no pattern: all)
 int sema_params_overlap(Unit *u, NodeId a, NodeId b, SymId owner);
+int sema_pattern_span(Unit *u, NodeId param, SymId owner, Pattern *pat, uint64_t *lo, uint64_t *hi);
 int sema_arm_pattern(Unit *u, NodeId pat, TypeId type, Pattern *out); // an arm's (0: `_`, a run-time name)
 NodeId sema_arm_name(Unit *u, NodeId pat, TypeId type); // a run-time name pattern: its AST_IDENT (else 0)
 NodeId sema_arm_cond(Unit *u, NodeId pat);              // a condition pattern (`k > a.len:`): its expression (else 0)
@@ -562,7 +571,7 @@ int sema_fn_fails(SymId fn); // the result says `, error`
 // it reaches was checked (the set is whole).
 int sema_error_set(SymId fn, uint8_t *panics, const uint64_t **ids, uint32_t *n, int *any);
 int sema_error_name(uint64_t id, char *buf, size_t cap); // `bad_input`, `panic.division`
-uint32_t sema_errors_list(uint64_t *ids, uint32_t cap);  // every error the program can name (print(e))
+const uint64_t *sema_errors(uint32_t *count); // every error the program can name (print(e)); no cap
 void sema_errors_finish(void); // every body is checked: `if e` on a call's error against its set
 // A function literal's captures (context.md §60): locals of the function around it that it reads,
 // passed by every call after its declared arguments.

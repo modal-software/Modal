@@ -264,6 +264,11 @@ static void keep(CtFunc *to, const MirFunc *f)
             uint32_t hi = (in->d > in->a ? in->d : in->a) + (uint32_t)in->imm - 1;
             top = hi > top ? hi : top;
         }
+        if (in->op == MIR_LOADN)
+        {
+            uint32_t hi = in->d + (uint32_t)in->imm - 1;
+            top = hi > top ? hi : top;
+        }
         uses = top + 1 > uses ? top + 1 : uses;
         if (in->op == MIR_LABEL && in->imm < f->nlabels)
         {
@@ -543,6 +548,9 @@ static int run(Vm *vm, SymId sym, const CtFunc *f, size_t fp)
             break;
         case MIR_MOVE:
             memmove(&s[in->d], &s[in->a], in->imm * 8);
+            break;
+        case MIR_LOADN:
+            memmove(&s[in->d], (const void *)(uintptr_t)s[in->a], in->imm * 8);
             break;
         case MIR_LOAD:
         case MIR_STORE:

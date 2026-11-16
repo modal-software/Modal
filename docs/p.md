@@ -42,6 +42,8 @@ Done (details in context.md):
 | comptime 2 | `import("target")` and mod.modal values at compile time; the interpreter keeps its own call stack (no C recursion per Modal call) | §27 |
 | std 4 (prerequisites) | tail calls as jumps on every backend, pattern clauses joined so a clause loop is a loop in registers (100M turns: 290 → 23.5 ms, and no crash past ~16K turns); inline byte sink; unsigned division by a constant as a multiplication. Formatting in Modal is 2.1× the C stencil: waits on arrays (std.md §6) | §28 |
 | std 5 (part 1), patterns | `nil`; overloads by type; range and string patterns; arms (`value { ... }`, bodies of arms) with coverage errors; a loop written as arms is one function and a loop | §29 |
+| audit | specializations found by index, not by walking the table: bench `specs` (4,000 specializations) `-o` 841.0 → 59.3 ms, `big` unchanged | §69 |
+| scale | no fixed limit on locals, specializations, files, labels, error names; walks inside walks removed (12,000 structs 508 → 21 ms; 400 unused generics 97 → 21 ms); C arms past 5,000 compile; a function of another file main cannot reach is not generated; native arena on big 20.3 → 15.0 MB | §70 |
 
 Not done: the Cortex-M backend (register allocation, its base, is done: §20), interrupts (need
 QEMU or a board to verify).

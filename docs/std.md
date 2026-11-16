@@ -409,6 +409,14 @@ functions, with no cost to speed and nothing that helps reverse engineering.
   `v: T` (a parameter typed by another, or the result) makes the function one per type given
   to it: `first(point, p, q)` and `first(u32, 3, 4)` are two functions, each checked with T
   bound (context.md §48). No marker: the use says T is known while compiling.
+  **Type variables** (the owner, 2026-11-15; context.md §67): std/type.modal declares `T: type`
+  (no value), the default one; a program or module declares its own the same way (`U, A: type`).
+  A parameter typed by one makes the function generic with no `T: type` parameter: the call
+  reads T from the argument in that place (`max(a: T, b: T)`, `first(xs: []T)`, `p: *T`, the
+  result of a function given, `f: function(T): U`). So `map(c, v: v + 1)`,
+  `fold(xs, u64(0), (s, v): s + v)`. The arguments must agree; an untyped number gives no type.
+  A name that is not declared `: type` is never a type variable (a typo stays an error).
+  `T: type` as a parameter stays for a type no argument has: `zero(T: type): T`, `zero(u64)`.
 - **Type queries**, predeclared names like `sizeof` (never keywords; a program's own name wins):
   `sizeof(T)`, `alignof(T)`, `fieldsof(T)` (how many fields; 0: not a struct),
   `offsetof(T.field)`, `typeof(T)`. Each takes a type or a value (its type). Each is an unsized

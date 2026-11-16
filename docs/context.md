@@ -2706,6 +2706,241 @@ type last.
 - Example run/fields_grouped (+ .expected); array_moves.modal (the owner's edit) passes again.
   Tests 497 ok (the failures as in §64); fuzz 0 differ.
 
+## 67. Type variables: `T: type` declared once, read from the arguments
+
+The owner (2026-11-15): `map(u16, u16, c, ...)` repeats what `c` says, and `T: type` parameters
+inflate every signature and call. No `[T]` / `<T>`, nothing assigned: std/type.modal declares
+`T: type`, the default; a parameter in that position takes the type of its argument.
+- **A type variable** (check.c `type_variable`): a module-level `T: type` with no value, seen
+  through imports (std's mod.modal binds `T`; `U, A: type` in std/array.modal; a program's own
+  `K: type`). A name not declared so is never one: a typo stays "unknown type".
+- **Generic by its parameters:** `type_params` adds the type variables a parameter's type names
+  (through `*`, `[N]`, `[]` and `function(...)`), with no argument of their own (index -1);
+  `sig_generic` sees them. The specialization machinery is unchanged: the names are bound as
+  `T: type` ones were, so the body, the result `[xs.len]U` and the backends see the same thing.
+- **Read from the arguments** (`specialize`, `infer_type_var`): each argument whose parameter
+  names the variable gives it (`[]T` against `[3]u16`: u16; `*[]U` against `&out`; `*T`
+  against `*point`); they must agree ("'max': T is u64 here, but u8 from an argument before").
+  An untyped number gives none. A variable only a function's result names comes from the
+  function given (`function_argument`: `map(a, v: u64(v) * 2)` makes U u64). One no argument
+  gives is an error that says to write the type (`fold(xs, u64(0), ...)`), reported once (the
+  literal is not checked again after a failed call).
+- **Backends:** a type variable has no value (`sema_is_type_variable`: C skips it among an
+  imported file's module values).
+- **std/array.modal:** `map(xs: []T, f: function(T): U): [xs.len]U`, `fold(xs: []T, acc: A,
+  f: function(A, T): A): A`; the examples call `map(people, x: x.id)`, `fold(ids, u64(0), ...)`.
+  `T: type` as a parameter stays for a type no argument has (`zero(T: type): T`).
+- **Test fix:** field_index's "not checked further" test grepped `type.modal:3[0-9]`, which the
+  moved lines made match a message's quoted assert; it now matches an error's location.
+- Examples run/type_vars (+ .expected, every backend), errors/type_vars. Tests 504 ok (the
+  failures as in §64); ASan/UBSan the same; fuzz 0 differ. Bench unchanged (structs 2868 B,
+  big 24.4 ms).
+- **Left:** native cannot take `&ps[1]` (the address of an array element: "this unary
+  operator is not supported yet"); C can.
+
+## 68. A mutable array parameter copied in one instruction (MIR_LOADN)
+
+The owner (2026-11-15): array_frames took 123 ms where 3 ms at most was expected.
+- **Measured:** the program runs in 0.00 s; the native compile was 117.7 ms, all in emit, and
+  quadratic in the frame (500 slots 1.7 ms, 2000 20 ms, 4000 75 ms, 8000 259 ms). `pick([5000]u64
+  a, ...)` copied its parameter in as one MIR_LOAD per element (8003 of the 8065 MIR lines), and
+  each pass then walked those loads against a frame of as many slots.
+- **MIR_LOADN** (mir.h): slots d .. d + imm - 1 = the imm words at the address in slot a. The
+  copy-in of a mutable array parameter is one (lower.c). It reads slot a and writes the block
+  (opt.c reads / kills / facts / dead stores / bounds; lower.c reads, read counts, reframe, never
+  inlined; comptime.c runs it as a memmove from the address); regalloc keeps the block and the
+  address in the frame; the stencil `loadn` copies them (both CPUs).
+- array_frames: compile 117.8 ms → 0.83 ms (the 8000-slot version 259 ms → 1.7 ms); `--run` on
+  native under 10 ms in all. A test that its MIR stays under 100 lines. Tests 505 ok (the failures
+  as in §64); ASan/UBSan the same; fuzz 0 differ. Bench unchanged (structs 2868 B, big 24.3 ms).
+- The C backend's `--run` is the system C compiler's time (cc, about 3 s on this machine's
+  first run), not Modal's.
+
+## 69. Specializations found by index, not by walking the table
+
+An audit of every phase (development.md §9.4.2, 2026-11-15) profiled `big` with `sample`:
+flat, no hot spot. `big` makes no specialization, so a program that does was written for it.
+- **Measured (before):** 20,000 functions calling generics, only the number of specializations
+  changing. This is the cost of the walk, since the number of functions stays the same:
+
+| specializations | check | emit | total |
+|---|---|---|---|
+| 100 | 23.8 ms | 38.8 ms | 69 ms |
+| 1000 | 79.1 ms | 108.4 ms | 193 ms |
+| 2000 | 140.7 ms | 193.9 ms | 341 ms |
+| 4000 | 336.8 ms | 480.7 ms | 824 ms |
+
+- **Why:** `specs[]` (check.c) was searched by walking it. `spec_of(fn)` ("is fn a
+  specialization?") walked all of it for every ordinary function, from 15 places in the check
+  and, through `sema_spec_functions`, from the lowering and the emit. `specialize` walked it
+  twice per generic call (the lookup, and the count of what the generic had made).
+  `sema_drain_specs` walked it after every body, and so did `literal_specs_waiting`.
+  `compile_params` and `generic_body_token` walked `generics[]`. That made the cost O(functions ×
+  specializations). The profile at 4000 put the time in the functions those walks were inlined
+  into (`mir_lower`, `check_callable`, `mir_param_slots`, `fn_ret_type`, `compile_params`).
+- **How:** a side table per symbol, `SpecSym`, holds the specialization the symbol is, its
+  entry in `generics`, and how many specializations it has made. It grows on write only
+  (`spec_sym`); a read past its end means "none". `spec_of` reads it only for a symbol marked
+  `SYM_F_SPEC` (a free bit of `Symbol.flags`, so a symbol stays 24 bytes), and not at all while
+  `nspecs` is 0. `spec_find` is
+  an open-addressing hash of (generic, arguments known while compiling) over `specs`, at most
+  half full (`SPEC_HASH` = 2 × SPEC_MAX). A specialization goes into it before its signature's
+  types are computed (`spec_type_exprs`), because a nested `specialize` found it in the table
+  then too. `spec_queue` lists the specializations waiting, in the order they were queued. Each
+  is queued at most once, and the drain (even a nested one) takes from its head.
+  `literal_specs_waiting` looks only at the queue.
+- **Measured (after),** best of 5, `--backend native -o` (1000 and 2000: the first version,
+  before the `SYM_F_SPEC` fix below; 100 and 4000 remeasured after it):
+
+| specializations | before | after |
+|---|---|---|
+| 100 | 67.2 ms | 53.0 ms |
+| 1000 | 190.9 ms | 54.6 ms |
+| 2000 | 329.8 ms | 55.6 ms |
+| 4000 | 803.0 ms | 59.4 ms |
+
+- The executables and the C written are the same before and after. The one byte that differs is
+  the output's own file name, which also differs between two runs of the old compiler.
+- `make bench` now has `specs` (bench.sh): 100 struct types, 40 generics each made for all of
+  them (4,000 specializations), 20,000 callers. check warm 228.4 → 13.4 ms, emit 476.0 → 32.6 ms,
+  `-o` 841.0 → 59.3 ms; memory 18,179 KB in use, the same.
+- **Found (a regression on big, fixed):** the first version read `spec_syms[fn]` in every
+  `spec_of`. std's generics (`map`, `fold`) allocate the table, so on big each call read a
+  650 KB array where the old walk of an empty table read one global. Measured with
+  `/usr/bin/time -l` (instructions retired, median of 5, `-b c -o`): 1,296.3M before, 1,303.1M
+  with it. Reverting only `spec_of` brought it back (1,297.0M). A 48 KB unused array in the old
+  compiler did not change it (1,295.5M), so it was not the layout. With `SYM_F_SPEC`: 1,294.9M
+  against 1,292.4M (C) and 1,586.1M against 1,585.0M (native), +0.2% and +0.07%.
+- **big:** `-o`, best of 20 in four rounds with the two compilers alternating: before 64.9,
+  65.6, 65.6, 66.0 ms; after 64.9, 65.5, 66.1, 66.1 ms. check warm (`--repeat 20`) 24.1–24.5 ms
+  before, 23.7–24.4 ms after. RSS 44.8 MB and ~3,055 page reclaims for both.
+- **Verified:** tests 505 ok, with the failures of the old compiler (the owner's edited examples,
+  as in §64); ASan/UBSan 505 ok, no report; fuzz 0 differ (mix and struct, N=200, SEED=7;
+  `MODAL_REGS=0`, N=100, SEED=3).
+- **Not yet** (found by the same audit; development.md §9.4.2): ~~the fixed limits (`SPEC_MAX`
+  4096, `GENERIC_MAX` 1024, 256 specializations per generic, `MAX_UNITS` 64, `MAX_LOCALS`); the
+  256 message says "its arms on them never end the recursion" for a program with no recursion;
+  native generates every function and shakes them at the end (`shake`), so a growing std costs
+  every program; native's arena per function (big: 20.3 MB against C's 9.6 MB)~~: done or
+  narrowed in §70.
+
+## 70. Scale: the limits a large program reaches, and the walks that grow with it
+
+The owner (2026-11-15): fix what §69 left, and look for more gaps that will block progress or
+cost speed. Found by a generator per feature (`n` and `4n`; a ratio well above 4 is a walk
+inside a walk) and by profiling what was slow.
+
+**What works**
+- No fixed limit on: locals per function (check 256, lowering 512: fatal), specializations
+  (4,096) and per generic (256), generics (1,024: past it one was silently not remembered),
+  files (64) and domains (32), labels per native function (4,096: fatal) and loops (256: past it
+  the function lost its accumulator), error names `print(e)` can name (512: the 513th printed as
+  `error N`).
+- The specialization limit is a depth now: specializations made inside one another, 8,192 deep
+  (a recursion over fields is as deep as its struct has fields). The message says so; a struct of
+  300 fields made the old one say "never end the recursion" for a program with no recursion.
+- A match of 6,000 arms compiles on C (clang crashed on its `else if` chain near 5,000) and on
+  native (past 4,096 labels).
+- A function of another file that main cannot reach is not generated (C or native).
+- `print(e)` with more than 8 error names calls one routine made once per program (`out.error`).
+
+**How**
+- **`struct_marked`** (layout.c) walked every symbol for each field asked about: O(fields ×
+  symbols). Each new import binding is now read once, and its bits go to the struct it names
+  (`binding_bits`).
+- **`names_a_generic`** (check.c) did a `memmem` of each body's text per generic. Past 16
+  generics their names are a set, and the body's names are read once (`generic_name_set`); up
+  to 16 the `memmem` stays (it is vectorized, and faster for a few).
+- **Error names** (`sema_errors`, check.c): the symbols that can be one are gathered once each,
+  with no cap. `write_error` (lower.c) calls a sink helper of kind `SINK_ERROR` past
+  `ERRORS_INLINE` (8) names; the compiler's own runs keep the tests inline (the interpreter has
+  no routines). The C backend keeps its chain (no label limit there).
+- **Locals:** `Check.locals` points at `first_locals` (256, on the stack as before) and doubles
+  into the arena past it. The lowering's locals are two growing pools, one for a lowering and one
+  for a lowering nested in it, since `mir_nest_begin` saves `L` by value.
+- **Specializations:** `specs` lives in blocks of 1,024 that never move (a binding points into
+  one); `SPEC_AT(i)` is a function, because a macro read its argument twice (`spec_queue_head++`).
+  The hash and the queue grow. `Spec.depth` is the parent's + 1 when it is made while a
+  specialization is checked. `generics` grows.
+- **Files:** `MAX_UNITS` 1,024, `MAX_DOMAINS` 256, and both arrays moved to the end of `cx`.
+  In front, they put the hot fields (`cx.syms`, `cx.names`, ...) past an arm64 load's immediate
+  offset: about 1M more instructions on big's check.
+- **Native labels and loops** grow to the function's count (`nat.labels`, `label_index`,
+  `loops`).
+- **C arms** (`emit_match_as`): past `FLAT_ARMS` (64) the chain is flat, `if (!m_dN && cond) {
+  m_dN = 1; ... }`, then `__builtin_unreachable()` when every arm returns.
+- **What main reaches** (`module_reachable`, module.c), found once in `codegen_begin`, before any
+  body is checked:
+  - The entry file is generated whole. Reading its bodies cost 7% of the compile of a file whose
+    functions are all used (the first version did; see Measured).
+  - What a file reaches elsewhere is what its import bindings name. A binding of a module makes
+    that file whole too.
+  - A binding of a declaration reaches it. From there, every name in a reached declaration's
+    tokens (signature) and body text reaches every declaration of that name in a file that is not
+    whole; a struct reaches all its methods (the compiler calls `out.put` without naming it).
+  - Off when a whole file's text holds the word `import` more times, outside `--` comments and
+    strings, than its module-level imports (`Unit.module_imports`), since an import in a body
+    could bring a file in later. Off as well with no `main`, in eager mode, or when no file that
+    is not whole has a function.
+  - `codegen_function` and the C backend's prototypes skip what it does not reach. A
+    specialization follows its generic, and a literal is always generated.
+- **Native memory:** `stack_need` released none of its tables (about 57 B a function, at the
+  peak); it takes an arena mark now. The identical-code fold and `shake` use 32-bit indices, and
+  `FnFixups` holds indices, not pointers (48 → 24 B a function).
+
+**Measured** (before = the compiler of §69)
+
+| | before | after |
+|---|---|---|
+| 12,000 struct types, `-o` | 508 ms | 21 ms |
+| 400 unused generics, 20,000 bodies, `-o` | 97.1 ms | 20.9 ms |
+| bench `specs` (§69), `-o` | 825.3 ms | 60.0 ms |
+| bench `reached` (new: big with every function reached), compiler memory | 42,522 KB (arena 20,462) | 39,637 KB (arena 15,121) |
+| big, compiler memory | 41,848 KB (arena 20,294) | 38,963 KB (arena 14,953) |
+| 200 files of 20 functions | `fatal: too many source files (limit is 64)` | 6.1 ms (800: 24.7 ms) |
+| `print(e)` × 100 with 100 error names, native | `too many branches in one function` | compiles |
+| print_errors example, native code | 7,984 B | 3,344 B |
+
+- **The first reachability read every reached body, the entry's included:** big `-o` 65.0 →
+  29.1 ms (54,000 functions, almost none reached), but `reached` 72.9 → 79.5 ms (7.5 ms reading
+  3.4 MB of bodies and looking up 600,000 names). Using tokens for signatures and a bit filter
+  in front of `name_find` brought it to 4.8 ms; a compact table of declared names made it
+  slower (5.5 ms) and was dropped. Generating the entry whole takes the cost away, and big's
+  gain with it: its dead code is in its own file, and a program's own file holds little it does
+  not use.
+- **Interleaved, best of 15** (four rounds): big `-o` before 65.0, 65.0, 64.8, 66.6 ms, after
+  64.8, 64.8, 65.2, 64.7; C `-o` before 54.3, 54.2, 54.1, 54.6, after 54.2, 54.1, 54.7, 54.7;
+  check warm (`--repeat 20`, ten pairs) the same within ±0.8 ms, on average +0.05 ms.
+- **Instructions retired** (median of 5, big): native `-o` 1,585.8M → 1,586.0M; check 671.1M →
+  673.9M (+0.4%); C `-o` 1,293.4M → 1,305.0M (+0.9%: 5.5M is the reachability's tables and
+  108,000 queries, the rest is spread out, under 0.5% and not found).
+- Bench `reached` `-o` 73.3 → 74.2 ms in single runs; 69.7, 69.2, 69.4, 71.0 against 69.7,
+  69.6, 70.0, 72.0 interleaved, before the last reachability changes cut it from 1.27 to 0.16 ms.
+
+**Verified**
+- Tests 513 ok (505 and 8 new, in run.sh's scale block). The failures are the 51 of the old
+  compiler.
+- Every example gives the same output and status on C, arm64 and x86-64 as the old compiler,
+  multi-file domains included. The exceptions are improvements: the C backend now builds
+  calls.modal, kinds.modal and secret.modal, whose unreached `john.modal` function it refuses;
+  main.modal fails on C before and after, with another first error.
+- ASan/UBSan: 513 ok, no report; the stress programs and a fuzz run under it are clean.
+- Fuzz 0 differ: mix, struct, scalar, pressure (N=150), `MODAL_REGS=0` (N=100), `MODAL_TREE=0`.
+- Not regressed: `print(e)` output on C and native, arms in every form past 64 (a value, a
+  statement, a pipe stage that passes a value on, `return x.(...)`), 1,000-field recursion.
+
+**Not yet**
+- **Clauses:** a group of n pattern clauses is O(n²) in `sema_declare`, from the duplicate and
+  catch-all checks in `declare_callable` and the pairwise overlap check (2,000 clauses 93.7 ms,
+  500 11.8 ms). Sorted intervals would make it n log n.
+- **`val` is still a keyword** (v1's `AST_VAL_DECL`): a module-level `val(k: u64)` parses as an
+  import list. The no-keywords rule says it should be a name.
+- **Native memory** still about 100 B a function above C: the MIR kept for inlining
+  (`Inlinable`, kept to the end), `fn ranges` (57 B a function), `fn_at` regrown in the arena.
+- The C backend still writes a chain of compares per `print(e)` (code O(prints × errors)).
+- A body's duplicate-local check walks the block's locals (O(locals²) in one block).
+- Nesting is still limited to 200 levels (a guard, not a gap).
+
 ## Appendix A. The owner's original specification inputs
 
 These are the inputs the design started from, as the owner wrote them. Where the
