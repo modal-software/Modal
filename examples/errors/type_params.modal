@@ -1,0 +1,13 @@
+-- types as values: each function's marked line is an error
+type := import("std").type
+point: struct {
+    i32 x,
+}
+size(T: type): u64 {
+    return T.size
+}
+main(): u8 {
+    p := point{ x: 1 }
+    n := size(p)
+    return 0
+}

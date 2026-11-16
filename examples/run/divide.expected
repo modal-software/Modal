@@ -1,0 +1,2 @@
+ok 3 -2147483648 0
+wrapped ./examples/run/divide.modal:5:14: division by zero

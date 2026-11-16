@@ -1,0 +1,38 @@
+-- Arrays (collections, context.md §64): functions over a pure array, taken as `xs: []T` and its
+-- length read as `xs.len`; each is made once per type, length and function given (nothing is
+-- passed at run time for them, and a small function given is inlined). Written in Modal: a loop
+-- is a recursion that ends with an arm on i. T, U and A are type variables (context.md §67): the
+-- arguments give them, `map(xs, x: x * 2)`.
+type := import("./type").type
+T := import("./type").T
+U, A: type
+
+-- map: a new array, f of each element. U is what f gives.
+map(xs: []T, f: function(T): U): [xs.len]U {
+    [xs.len]U out
+    map_into(xs, &out, 0, f)
+    return out
+}
+
+nil map_into(xs: []T, out: *[]U, u64 i, f: function(T): U) {
+    if i {
+        xs.len: return
+        _: {
+            out[i] = f(xs[i])
+            map_into(xs, out, i + 1, f)
+        }
+    }
+}
+
+-- fold: one value from all the elements, f(acc, x) from the first to the last. A is acc's type
+-- (an untyped number gives none: `fold(xs, u64(0), (s, x): s + x)`).
+fold(xs: []T, acc: A, f: function(A, T): A): A {
+    return fold_from(xs, 0, acc, f)
+}
+
+fold_from(xs: []T, u64 i, acc: A, f: function(A, T): A): A {
+    return if i {
+        xs.len: acc
+        _: fold_from(xs, i + 1, f(acc, xs[i]), f)
+    }
+}

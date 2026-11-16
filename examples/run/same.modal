@@ -1,0 +1,18 @@
+-- identical functions are one in the machine code (identical-code folding): `twice` is `mix`,
+-- only its name differs; the program prints and returns the same
+print := import("std").io.print
+
+mix(a: u32, b: u32): u32 {
+    return a * 3 + b * 5 - a * 7 + b * 11 + a * b + (a + b) * (a - b) + a * 13 + b * 17
+}
+
+twice(x: u32, y: u32): u32 {
+    return x * 3 + y * 5 - x * 7 + y * 11 + x * y + (x + y) * (x - y) + x * 13 + y * 17
+}
+
+u32 three = 3 -- a variable: the calls run in the program (constant arguments are folded)
+
+main(): u8 {
+    print(mix(three, 4), twice(4, three), mix(10, 2), twice(2, 10))
+    return 0
+}

@@ -1,0 +1,40 @@
+-- arm mistakes: values no arm takes, arms that never run, overlaps, results of different types
+[]u8 size(u8 n) {
+    0: "none"
+    1..9: "small"
+}
+[]u8 twice(u8 n) {
+    1..9: "small"
+    5: "five"
+    _: "other"
+}
+u8 pick([]u8 s) {
+    "a": 1
+}
+u8 mixed(u8 n) {
+    0..255: 1
+    _: 2
+}
+[]u8 band(u8 n) {
+    1..9: "low"
+    5..20: "mid"
+    _: "other"
+}
+u64 pair(u64 n, u64 k) {
+    0: k
+    _: n
+}
+main(): u8 {
+    bool b = true
+    x := if b {
+        true: 1,
+        false: "no"
+    }
+    i8 k = 0
+    y := if k {
+        -128..-1: 1
+        1..127: 2
+    }
+    if k return 1
+    return 0
+}

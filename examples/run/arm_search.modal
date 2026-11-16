@@ -1,0 +1,21 @@
+-- many arms, written in any order: native code finds the arm by a search over the sorted values
+-- (the first arm keeps its own test, in place). MODAL_TREE=0 tests them one by one, to compare.
+print := import("std").io.print
+u8 big(u64 n) {
+    18446744073709551615: 4, 0: 1, 10..18446744073709551614: 3, 1..9: 2
+}
+u8 neg(i64 n) {
+    -9223372036854775808: 1, -9223372036854775807..-1: 2, 0: 3, 1..100: 4, 101..: 5
+}
+u8 small(i8 n) {
+    -128..-100: 1, -99..0: 2, 1: 3, 2..126: 4, 127: 5
+}
+main(): u8 {
+    u64 z = 0
+    i64 w = 0
+    i8 q = 0
+    print(big(z), big(z + 5), big(z + 10), big(z - 2), big(z - 1))
+    print(neg(w - 9223372036854775807 - 1), neg(w - 3), neg(w), neg(w + 50), neg(w + 9223372036854775807))
+    print(small(q - 127 - 1), small(q - 50), small(q + 1), small(q + 100), small(q + 127))
+    return 0
+}

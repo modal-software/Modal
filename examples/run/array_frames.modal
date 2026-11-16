@@ -1,0 +1,22 @@
+-- a frame past 4096 slots (context.md §64): arm64 reaches a slot there through a register offset
+-- (a string's address, a value kept in the frame), so a function with a big array can print
+
+print := import("std").io.print
+
+u64 pick([5000]u64 a, u64 i) {
+    a[i] = i * 3
+    x := a[i] + 1
+    print("in", x)
+    return x
+}
+main(): u8 {
+    [5000]u64 a
+    [3000]u64 b
+    a[4999] = 3
+    b[2999] = 9
+    u64 k = 4321
+    print("last", a[4999], b[2999], pick(a, k))
+    s := "after big frame"
+    print(s, s[0])
+    return 0
+}

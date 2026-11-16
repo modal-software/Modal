@@ -1,0 +1,35 @@
+-- reflection (std.md §11): sizeof, alignof, fieldsof, offsetof and typeof are predeclared
+-- names, not keywords. Each is a constant of the target's layout, folded where it is used:
+-- nothing is left for run time, and no type or field name reaches the binary.
+print := import("std").io.print
+assert := import("std").assert
+header: struct {
+    u8 kind,
+    u32 len,
+    u16 flags,
+}
+point: struct {
+    i32 x,
+    y: i32,
+}
+assert(sizeof(header) == 8)
+assert(alignof(header) == 4)
+assert(fieldsof(header) == 3)
+assert(offsetof(header.kind) == 6)
+assert(typeof(header).id != typeof(point).id)
+pid := typeof(point).id
+hid := typeof(header).id
+
+kind(u64 id): u8 {
+    if id {
+        pid: return 1
+        hid: return 2
+        _: return 0
+    }
+}
+
+main(): u8 {
+    p := point{ x: 1, y: 2 }
+    print(sizeof(p), alignof(p), fieldsof(p), offsetof(point.y), kind(typeof(p).id), kind(typeof(header).id), kind(7))
+    return 0
+}

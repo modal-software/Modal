@@ -1,0 +1,21 @@
+-- module-level variables: type first is mutable (`u8 hits`), type last immutable (`limit: u8`).
+-- Native code keeps them at the bottom of the value stack: no bytes in the binary.
+print := import("std").io.print
+
+u8 hits
+u64 total = 1000
+limit: u8 = 7
+
+bump(u64 n): u8 {
+    hits = hits + 1
+    total = total + n
+    return hits
+}
+
+main(): u8 {
+    bump(5)
+    bump(6);
+    print("hits", hits, "total", total, "limit", limit)
+
+    return hits
+}

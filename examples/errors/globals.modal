@@ -1,0 +1,19 @@
+print := import("std").io.print
+
+u8 hits
+u64 total = 1000
+limit: u8 = 7
+
+bump(n: u64): u8 {
+    hits = hits + 1
+    total = total + n
+    return hits
+}
+
+main(): u8 {
+    bump(5)
+    bump(6)
+    print("hits", hits, "total", total, "limit", limit)
+    limit = 9
+    return hits
+}

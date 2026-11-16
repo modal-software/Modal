@@ -1,0 +1,12 @@
+limit: u8 = 300
+f(a: u8): u8 {
+    return a
+}
+g(a: i8): i8 {
+    return a + 200
+}
+main(): u8 {
+    x := f(256)
+    y := g(-129)
+    return 1000
+}

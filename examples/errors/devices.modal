@@ -1,0 +1,31 @@
+-- errors of register blocks and devices
+mixed: struct {
+    u32 a @ 0x00,
+    u32 b,
+}
+odd: struct {
+    u32 a @ 0x02,
+}
+overlap: struct {
+    u32 a @ 0x04,
+    u16 b @ 0x06,
+}
+words: struct {
+    s: []u8 @ 0x00,
+}
+regs: struct {
+    u32 data @ 0x00,
+    status: u32 @ 0x04,
+}
+plain: struct {
+    u32 x,
+}
+poke(self: regs) {
+    self.status = 1
+}
+a: plain @ 0x1000
+regs b @ 0x2000
+c: regs @ 0x2002
+main(): u8 {
+    return 0
+}

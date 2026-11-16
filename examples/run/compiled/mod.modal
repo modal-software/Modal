@@ -1,0 +1,10 @@
+-- domain `compiled`: mod.modal is the compiler's file. Its functions run only in the compiler
+-- (docs/comptime.md §2.2): every file of the domain can call them from a module-level position,
+-- none of them is in the program, and no other domain sees them.
+version := "1.0"
+
+u32 square(u32 n): n * n
+u32 sum_squares(u32 0): 0
+u32 sum_squares(u32 n): square(n) + sum_squares(n - 1)
+[]u8 build(u8 0): "debug"
+[]u8 build(u8 n): "release"

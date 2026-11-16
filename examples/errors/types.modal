@@ -1,0 +1,43 @@
+-- the type checker: each line below is one mistake
+
+point: struct {
+    u8 x,
+    y: u8,
+
+    hidden(self): u8 {
+        return self.x
+    }
+}
+
+sum(self: point): u8 {
+    return self.x + self.y
+}
+
+move(self: point, dx: u8): u8 {
+    self.x = self.x + dx
+    self.y = 1
+    return self.x
+}
+
+wide(n: u16): u16 {
+    return n
+}
+
+label(): []u8 {
+    return 5
+}
+
+main(): u8 {
+    p := point.new()
+    q := point.sum()
+    a := q + "text"
+    b := wide(q)
+    c := q.x
+    d := p.hidden()
+    e := point()
+    f := sum
+    q := 1
+    nothing := move(q)
+    g := label() + 1
+    return "done"
+}

@@ -1,0 +1,47 @@
+-- Arrays of structs (context.md §62): `[3]person`, its elements packed in the struct's layout.
+-- An element is assigned whole or field by field, read whole (a copy) or by its fields, passed
+-- by value, and written through `*[3]person` in place.
+
+print := import("std").io.print
+
+pos: struct { i32 x, i32 y }
+person: struct { u64 id, u8 age, []u8 name, pos at, u8 unused }
+
+show(person p) { print(p.name, p.id, p.age, p.at.x, p.at.y) }
+
+birthday(ps: *[3]person, u64 i) {
+    ps[i].age = ps[i].age + 1
+    ps[i].at.x = ps[i].at.x - 1
+}
+
+N := 3
+max := (a, b: u8): (a > b).(true: a, false: b)
+
+u8 oldest([3]person ps, u64 i, u8 best) {
+    (_, N, _): best
+    _: oldest(ps, i + 1, max(ps[i].age, best)) 
+}
+main(): u8 {
+    [3]person people
+    people[0] = person{ 
+        id: 1,
+        age: 20,
+        name: "ana",
+        at: pos{ 
+            x: 5,
+            y: 6
+        },
+        unused: 9
+    }
+    people[1] = person{ id: 2, age: 41, name: "bo", at: pos{ x: -1, y: 2 }, unused: 9 }
+    people[2] = people[0]
+    people[2].name = "cy"
+    birthday(&people, 2)
+    show(people[0])
+    show(people[1])
+    show(people[2])
+    print(oldest(people, 0, 0))
+    q := people[1].at
+    print(q.x, q.y)
+    return 0
+}

@@ -1,0 +1,32 @@
+-- Conditions as patterns (std.md §14): an arm whose pattern is a comparison, `k > a.len: ...` or
+-- `(k > a.len): ...`, is taken when it is true. It is tested in its place, first wins; it takes
+-- no values the compiler counts, so a stage stays partial and a value match still needs `_`.
+print := import("std").io.print
+u64 clamp(u64 x, u64 hi) {
+    return x.(x > hi: hi)
+}
+[]u8 size(u64 n) {
+    return if n {
+        0: "none",
+        n < 10: "few",
+        (n >= 10 and n < 100): "some",
+        _: "many"
+    }
+}
+u64 pick(u64 a, u64 b) {
+    (a > b, _): a
+    _: b
+}
+main(): u8 {
+    [4]u8 a1
+    [6]u8 a2
+    print(a2.len.((a1.len > a2.len): 0), a1.len.(a1.len < a2.len: 99))
+    print(clamp(5, 3), clamp(2, 3))
+    print(size(0), size(7), size(50), size(500))
+    print(pick(9, 4), pick(1, 4))
+    u64 k = 4
+    k.(k >= a1.len: {
+        print("out of range:", k)
+    }).(_: print("in range"))
+    return 0
+}

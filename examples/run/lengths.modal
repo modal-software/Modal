@@ -1,0 +1,21 @@
+-- A length read from the argument (collections, context.md §64): `xs: []T` in a parameter takes
+-- an array and makes the function once per length; `xs.len` is a number known while compiling.
+print := import("std").io.print
+type := import("std").type
+person: struct { u64 id, u8 age }
+u64 sum_ids(T: type, xs: []T, u64 i, u64 acc) {
+    return if i { xs.len: acc, _: sum_ids(T, xs, i + 1, acc + xs[i].id) }
+}
+u64 twice(xs: []bool) { return xs.len + xs.len }
+main(): u8 {
+    [3]person ps
+    ps[0].id = 1
+    ps[2].id = 10
+    [5]person qs
+    qs[4].id = 7
+    print(sum_ids(person, ps, 0, 0), sum_ids(person, qs, 0, 0))
+    [4]bool b
+    [9]bool c
+    print(twice(b), twice(c))
+    return 0
+}

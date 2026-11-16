@@ -1,0 +1,27 @@
+-- code written once per field (the owner's form): soma is made for each type and each field
+-- number it is given (comptime.md §3.2: T types v, i is field(v, i)'s number, so both are known
+-- while compiling). The arm (_, _, fieldsof(T)) is taken while compiling once i reaches the end:
+-- that ends the recursion, and the program runs v.a + v.b + v.c with no loop and no lookup.
+print := import("std").io.print
+type := import("std").type
+field := import("std").field
+rec: struct {
+    u8 a,
+    u32 b,
+    i64 c,
+}
+point: struct {
+    i32 x,
+    i32 y,
+}
+u64 soma(T: type, v: T, u32 i) {
+    (_,_, fieldsof(T)): 0
+    _: u64(field(T, &v, i)) + soma(T, v, i + 1)
+}
+
+main(): u8 {
+    r := rec{ a: 1, b: 20, c: 300 }
+    p := point{ x: 4, y: 5 }
+    print(soma(rec, r, 0), soma(point, p, 0), soma(point, p, 1))
+    return 0
+}

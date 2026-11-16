@@ -1,0 +1,6 @@
+start: 1
+double(21) = 42
+scale(a) = 84 scale(a, 3) = 126
+advance: 88 total now: 86
+200 + 100 as u8 = 44
+done

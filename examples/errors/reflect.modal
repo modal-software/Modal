@@ -1,0 +1,11 @@
+-- reflection: each line of main is an error
+point: struct {
+    i32 x,
+}
+main(): u8 {
+    a := offsetof(point)
+    b := offsetof(point.z)
+    c := typeof(3)
+    d := sizeof(point, point)
+    return 0
+}

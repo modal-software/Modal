@@ -1,0 +1,3 @@
+assert := import("std").assert
+assert(sizeof(u8))
+n := sizeof(1, 2)

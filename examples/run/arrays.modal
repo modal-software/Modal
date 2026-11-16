@@ -1,0 +1,56 @@
+-- arrays (std.md §9): [N]T, N known now; a local starts at zero; an immutable parameter is read
+-- in place, a mutable one is the function's own copy; an index is checked unless an arm proved it
+print := import("std").io.print
+N := 4
+u8 first(a: [4]u8): a[0]
+u8 change([4]u8 a) {
+    a[0] = 99
+    return a[0]
+}
+u64 sum(a: [4]u16, u64 i, u64 acc) {
+    (_, 4, _): acc
+    _: sum(a, i + 1, acc + u64(a[i]))
+}
+u8 get(a: [4]u8, u64 i) {
+    return if i { 
+        0..3: a[i],
+        _: 0
+    }       -- inside 0..3: no bounds check
+}
+nil fill([8]i32 out, i32 v, u64 i) {        -- a loop writing every element of its own copy
+    (_, _, 8): print("filled", out[0], out[7])
+    _: {
+        out[i] = v * i32(i)
+        fill(out, v, i + 1)
+    }
+}
+main(): u8 {
+    [4]u8 a
+    [N]u16 b
+    [8]i32 c
+    a[0] = 7
+    a[1] = a[0] + 1
+    a[3] = 200
+    b[2] = 60000
+    b[3] = 5
+    print(a[0], a[1], a[2], a[3], first(a), change(a), a[0])
+    print(sum(b, 0, 0), get(a, 3))
+    fill(c, -3, 0)
+    print("c is still", c[7])
+    d := a                                   -- no `&`: a copy
+    [4]u8 e = a
+    e[1] = 1
+    r := &a                                  -- `&`: a reference (*[4]u8)
+    r[1] = 50
+    print(a[1], d[1], e[1], e[3])
+    s := "hello"
+    print(s[0], s[4])
+    u64 k = 3
+    print(a[k])
+    k = 4
+    print(k.(k >= a.len: 0, _: a[k]))
+    -- out of range: the program stops here
+   
+    print("unreachable")                              
+    return 0
+}

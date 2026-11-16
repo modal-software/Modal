@@ -1,0 +1,42 @@
+-- context parameters: a parameter named like its struct, `arena: arena`, is filled in by
+-- every call from the caller's own `arena`. It is a reference, and immutable (type last).
+print := import("std").io.print
+
+arena: struct {
+    u64 used,
+    u64 allocs,
+}
+
+start(self: arena): self {
+    self.used = 0
+    return &self
+}
+
+grab(self: arena, n: u64): u64 {
+    at := self.used
+    self.used = self.used + n
+    self.allocs = self.allocs + 1
+    return at
+}
+
+used(self: arena): u64 {
+    return self.used
+}
+
+take(arena: arena, n: u64): u64 {
+    return arena.grab(n)
+}
+
+pair(arena: arena, size: u64): u64 {
+    first := take(size)
+    second := take(size * 2)
+    return first + second
+}
+
+main(): u8 {
+    arena := arena.start()
+    print("pair at", pair(8))
+    print("explicit", take(arena, 100))
+    print("used", arena.used())
+    return 0
+}

@@ -1,0 +1,8 @@
+print := import("std").io.print
+util := import("util")
+
+main(): u8 {
+    print("twice", util.twice(21), "base", util.base)
+    print(util.greet())
+    return util.twice(3)
+}

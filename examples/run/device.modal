@@ -1,0 +1,52 @@
+-- a device: a UART's registers at a fixed address (memory-mapped I/O). Every field says its
+-- offset, so the layout is the datasheet's whatever the ABI, and every access is one load or
+-- store of the field's own width. A read-only register is type-last (`fr: u32`): assigning it
+-- is an error. The program's `out` sends every byte print makes to the UART's data register,
+-- as on a board; here it also forwards them to the system output so the test can see them.
+-- (The tests run it through tools/elfrun.c, which puts memory at the device's address.)
+print := import("std").io.print
+sysput := import("std").sys.put
+
+pl011: struct {
+    u8 dr @ 0x00,     -- data (written a byte at a time)
+    rsr: u32 @ 0x04,  -- receive status (read-only)
+    fr: u32 @ 0x18,   -- flags (read-only)
+    u16 ibrd @ 0x24,  -- baud rate divisor
+    u8 lcr @ 0x2c,    -- line control
+}
+
+send(self: pl011, b: u8) {
+    self.dr = b
+}
+
+flags(self: pl011): u32 {
+    return self.fr
+}
+
+setup(self: pl011) {
+    self.ibrd = 0xbeef
+    self.lcr = 0x70
+}
+
+uart0: pl011 @ 0x100_0000_0000
+
+out: struct {
+    u32 sent,
+}
+
+new(self: out): self {
+    return &self
+}
+
+put(self: out, b: u8) {
+    self.sent = self.sent + 1
+    uart0.send(b)
+    sysput(b)
+}
+
+main(): u8 {
+    uart0.setup()
+    out := out.new()
+    print("flags", uart0.flags())
+    return 0
+}

@@ -1,0 +1,4 @@
+-- memory budgets for this folder's programs, checked when they are compiled
+max_code := 1200
+max_ram := 512
+output_buffer := 64

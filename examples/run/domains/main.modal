@@ -1,0 +1,12 @@
+-- two domains: geo's struct, its literal and its methods, used from here (std.md §10)
+print := import("std").io.print
+point := import("./geo/shapes").point
+span := import("./geo/shapes").span
+
+main(): u8 {
+    p := point{ x: 1, y: 2 }
+    p.x = 5
+    s := span.new(3, 10)
+    print(p.x + p.y, s.lo, s.hi, s.width())
+    return 0
+}

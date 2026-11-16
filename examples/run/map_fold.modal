@@ -1,0 +1,27 @@
+-- map and fold (collections, context.md §64): std functions over an array, written in Modal;
+-- each takes `xs: []T`, reads its length as `xs.len`, and is made once per length and function.
+print := import("std").io.print
+type := import("std").type
+map := import("std").map
+fold := import("std").fold
+
+person: struct { u64 id, u8 age }
+
+max := (a, b: u8): (a > b).(true: a, false: b)
+
+main(): u8 {
+    [3]person people
+
+    people[0] = person{ id: 1, age: 20 }
+    people[1] = person{ id: 7, age: 41 }
+    people[2] = person{ id: 3, age: 21 }
+
+    ids := map(people, x: x.id)
+    print(ids[0], ids[1], ids[2], ids.len)
+    u64 base = 100
+    shifted := map(ids, x: x + base)
+    print(shifted[0], shifted[2])
+    print(fold(people, u8(0), (best, p): max(best, p.age)))
+    print(fold(ids, u64(0), (s, x): s + x))
+    return 0
+}

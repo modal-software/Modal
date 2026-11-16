@@ -1,0 +1,12 @@
+-- function literals: each line of main below its first is an error
+point: struct { i32 x, i32 y }
+main(): u8 {
+    u64 count = 0
+    bump := () { count = count + 1 }
+    [4]u8 p
+    sx := (): u8 { return p[0] }
+    small := (0..10) { count }
+    small(3)
+    small(u64(4))
+    return 0
+}

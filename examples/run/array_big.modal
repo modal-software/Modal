@@ -1,0 +1,25 @@
+-- A big array (collections, context.md §64): 30000 elements through fill, map and fold. Copying
+-- one, or passing it on in a loop, costs one block copy or one address: no code per element.
+print := import("std").io.print
+type := import("std").type
+map := import("std").map
+fold := import("std").fold
+fill(xs: *[]u64, u64 i) {
+    if i {
+        xs.len: return
+        _: {
+            xs[i] = i * 3 + 1
+            fill(xs, i + 1)
+        }
+    }
+}
+u64 work() {
+    [30000]u64 a
+    fill(&a, 0)
+    b := map(a, x: x * 2 + 1)
+    return fold(b, u64(0), (s, x): s + x)
+}
+main(): u8 {
+    print(work())
+    return 0
+}

@@ -1,0 +1,12 @@
+-- functions given while compiling: each line of main below its second is an error
+print := import("std").io.print
+type := import("std").type
+apply(T: type, v: T, f: function(T): T): T { return f(v) }
+u8 small(u8 n) { return n }
+main(): u8 {
+    u64 limit = 3
+    a := apply(u64, 5, small)
+    b := apply(u64, 5, x: x * limit)    -- (valid: a literal given may read the caller's locals)
+    c := apply(u64, 5, 7)
+    return 0
+}

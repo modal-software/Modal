@@ -1,0 +1,17 @@
+-- field (std): each line of main below its first is an error
+field := import("std").field
+rec: struct {
+    u8 a,
+    u32 b,
+}
+at(r: rec, u32 i): u32 {
+    return u32(field(rec, &r, i))
+}
+main(): u8 {
+    r := rec{ a: 1, b: 2 }
+    x := field(rec, &r, 2)
+    u32 n = 1
+    y := at(r, n)
+    z := field(u8, &r, 0)
+    return 0
+}

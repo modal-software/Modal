@@ -1,0 +1,5 @@
+-- a face line of before: visibility follows use now (std.md §10)
+point: struct {
+    i32 x,
+}
+point{ x }

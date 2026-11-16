@@ -1,0 +1,30 @@
+print := import("std").io.print
+
+u64 fact(u64 0): 1
+u64 fact(u64 n): n * fact(n - 1)
+
+u8 fib(u8 0): 0
+u8 fib(u8 1): 1
+u8 fib(u8 n): fib(n - 1) + fib(n - 2)
+
+i8 sign(i8 0): 0
+i8 sign(i8 -1): -1
+i8 sign(i8 n): 1
+
+[]u8 name(bool true): "yes"
+[]u8 name(bool b): "no"
+
+u8 pick(u8 0, u8 y): y
+u8 pick(u8 x, u8 0): x
+u8 pick(u8 x, u8 y): x + y
+
+u64 twenty = 20 -- a variable: this call runs in the program (constant arguments are folded)
+
+main(): u8 {
+    print("fact", fact(0), fact(5), fact(twenty))
+    print("fib", fib(0), fib(1), fib(10))
+    print("sign", sign(0), sign(-1), sign(5))
+    print("name", name(true), name(false))
+    print("pick", pick(0, 7), pick(3, 0), pick(2, 2))
+    return fib(7)
+}

@@ -1,0 +1,17 @@
+-- errors: each line of main below its first is an error
+bad_input: error
+parse([]u8 s): u64, error {
+    if s {
+        "": return bad_input
+        _: return 1
+    }
+}
+u64 plain() { return 1 }
+check(): error { return nil }
+main(): u8 {
+    k := parse("y")
+    a, b := plain() + 1
+    c, d := check()
+    check()
+    return 0
+}

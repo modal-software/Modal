@@ -1,0 +1,5 @@
+gauge: struct {
+    u8 level
+}
+
+u8 read(self: gauge): self.level

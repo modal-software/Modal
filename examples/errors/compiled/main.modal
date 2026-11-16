@@ -1,0 +1,5 @@
+print := import("std").io.print
+main(): u8 {
+    print(square(3))
+    return 0
+}

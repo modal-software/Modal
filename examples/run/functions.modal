@@ -1,0 +1,27 @@
+-- Functions given while compiling (context.md §61): a parameter typed `function(T): U` takes a
+-- function, by name or written in place, `x: x * 2` (x takes the type the signature gives it).
+-- The function that takes it is made once per function given, which it calls directly: nothing
+-- is passed at run time, and a small one is inlined.
+print := import("std").io.print
+type := import("std").type
+
+apply(T: type, v: T, f: function(T): T): T { return f(v) }
+
+u64 double(u64 n) { return n * 2 }
+nil each(u64 n, u64 to, f: function(u64)) {
+    n
+      .(to: print("done"),
+        _: {
+            f(n)
+            each(n + 1, to, f)
+        })
+}
+main(): u8 {
+    print(apply(u64, 5, x: x * 2))
+    print(apply(u64, 5, double))
+    print(apply(u8, 200, x: x + 100))
+    inc := (k: u64): k + 1
+    print(apply(u64, 41, inc))
+    each(0, 3, i: print("item", i))
+    return 0
+}

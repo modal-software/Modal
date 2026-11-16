@@ -1,0 +1,3 @@
+-- compile-time budgets are configuration of the domain (docs/comptime.md §4)
+comptime_depth := 5
+comptime_steps := 100000

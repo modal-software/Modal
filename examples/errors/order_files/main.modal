@@ -1,0 +1,11 @@
+-- a function of an imported file is checked before its callers: f is always nil, and add is inlined
+print := import("std").io.print
+util := import("./util")
+u64 run(u64 i, u64 acc) {
+    return if i { 0: acc, _: run(i - 1, util.add(acc, i)) }
+}
+main(): u8 {
+    b, f := util.add(1, 2)
+    print(b, run(100000000, 0))
+    return 0
+}

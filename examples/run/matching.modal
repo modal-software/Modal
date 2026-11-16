@@ -1,0 +1,57 @@
+-- Literal patterns: a value, a range (`lo..hi`, both ends included; `lo..` from lo up) or a
+-- string. Clauses are tried in order; the last takes every value. Overloads are chosen by the
+-- argument types (an unsized literal: the first one it fits), and `nil` is "no result".
+print := import("std").io.print
+
+[]u8 size(u64 0): "none"
+[]u8 size(u64 1..9): "one digit"
+[]u8 size(u64 10..99): "two digits"
+[]u8 size(u64 100..999): "three digits"
+[]u8 size(u64 n): "many"
+
+[]u8 sign(i32 -2147483648..-1): "negative"
+[]u8 sign(i32 0): "zero"
+[]u8 sign(i32 1..): "positive"
+[]u8 sign(i32 n): "unreachable"
+
+[]u8 grade(u8 90..100): "A"
+[]u8 grade(u8 80..89): "B"
+[]u8 grade(u8 n): "other"
+
+u8 command([]u8 "help"): 1
+u8 command([]u8 "quit"): 2
+u8 command([]u8 "a long command name"): 3
+u8 command([]u8 ""): 4
+u8 command([]u8 s): 0
+
+-- overloads by type, with no result
+nil show(u8 n) { print("u8", n) }
+nil show(u64 n) { print("u64", n) }
+nil show([]u8 s) { print("text", s) }
+nil show(bool true) { print("yes") }
+nil show(bool b) { print("no") }
+
+-- a loop with no result
+nil countdown(u8 0) { print("go") }
+nil countdown(u8 n) {
+    print(n)
+    countdown(n - 1)
+}
+
+main(): u8 {
+    u64 a = 0
+    print(size(a), size(a + 7), size(a + 42), size(a + 100), size(a + 18446744073709551615))
+    i32 b = 0
+    print(sign(b - 2147483647 - 1), sign(b - 1), sign(b), sign(b + 5))
+    u8 c = 0
+    print(grade(c + 95), grade(c + 100), grade(c + 80), grade(c + 101), grade(c))
+    print(command("help"), command("quit"), command("a long command name"), command(""),
+          command("hel"), command("helpx"), command("a long command namf"))
+    show(7)
+    show(300)
+    show("hi")
+    show(a == 0)
+    show(a == 1)
+    countdown(3)
+    return 0
+}

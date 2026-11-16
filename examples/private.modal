@@ -1,0 +1,8 @@
+-- every line but the last reaches for something it cannot see
+field := import("../example").john.john_nested_class.my_name
+helper := import("../example").john.john_nested_class.check
+binding := import("../example").john.print_file_name
+unbound := import("../example/secret").vault
+config := import("../example").implicit_self
+missing := import("../example").john.john_nested_class.does_not_exist
+ok := import("../example").john.john_nested_class.add_oneline

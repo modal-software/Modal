@@ -1,0 +1,15 @@
+-- Type variables (context.md §67): the arguments must agree on one, and some argument must give it.
+print := import("std").io.print
+T := import("std").T
+fold := import("std").fold
+max(a: T, b: T): T {
+    return if a > b { true: a, _: b }
+}
+main(): u8 {
+    u8 x = 7
+    u64 y = 9
+    [3]u64 a
+    print(max(x, y))
+    print(fold(a, 0, (s, v): s + v))
+    return 0
+}

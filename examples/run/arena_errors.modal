@@ -1,0 +1,59 @@
+-- The arena on an error (guards.md §5 step 7): a boundary, `n, e := f()`, whose call takes the
+-- `arena` context gives back what the call allocated when an error (or a panic) comes back, if
+-- nothing it allocated can stay reachable: its value holds no reference, no other argument is one,
+-- and neither it nor what it calls uses a mutable module variable. Nothing is written for it: the
+-- compiler decides, and --audit says what it decided and why.
+print := import("std").io.print
+bad_input: error
+u64 total = 0
+
+arena: struct {
+    u64 used,
+    u64 allocs,
+}
+start(self: arena): self {
+    self.used = 0
+    return &self
+}
+grab(self: arena, n: u64): u64 {
+    at := self.used
+    self.used = self.used + n
+    self.allocs = self.allocs + 1
+    return at
+}
+
+build(arena: arena, u64 n): u64, error {
+    a := arena.grab(64)
+    b := arena.grab(n)
+    if n {
+        0: return bad_input
+        _: return a + b
+    }
+}
+half(arena: arena, u64 n): u64 {
+    x := arena.grab(32)
+    return 100 / n + x
+}
+count(arena: arena, u64 n): u64, error {
+    x := arena.grab(8)
+    total = total + x
+    f := (u8 0..10) {}
+
+    if n {
+        0: return bad_input
+        _: return x
+    }
+}
+
+main(): u8 {
+    arena := arena.start()
+    a, e := build(16)
+    print("ok", a, arena.used, arena.allocs)
+    b, f := build(0)                  -- an error: what build took is given back
+    print("error", f.(nil: 0, _: 1), arena.used, arena.allocs)
+    c, g := half(0)                   -- a panic: given back too
+    print("panic", g.(nil: 0, _: 1), arena.used)
+    d, h := count(0)                  -- count writes a module variable: kept
+    print("kept", h.(nil: 0, _: 1), arena.used)
+    return 0
+}

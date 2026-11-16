@@ -1,0 +1,19 @@
+-- a value computed while compiling: a module-level binding runs its call in the compiler, so
+-- the program holds only the result, and --sig says which functions ran for it
+print := import("std").io.print
+type := import("std").type
+
+
+loop(T: type, n: T) {
+    (_, 0..10): {
+        loop(u64, n + 1)
+        print(n)
+    }
+    _: print("finished")
+}
+
+
+main(): u8 {
+    loop(u64, 1)
+    return 0
+}

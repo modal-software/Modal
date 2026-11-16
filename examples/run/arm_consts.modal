@@ -1,0 +1,32 @@
+-- names in patterns: a constant counts like its literal (here also at a range's ends); a mutable
+-- module variable is compared when the program runs, in its arm's place
+print := import("std").io.print
+lo: u8 = 48
+hi := 57
+limit: i32 = 100
+u8 seen = 5
+[]u8 kind(u8 c) {
+    lo..hi: "digit",
+    0..31: "control",
+    58..: "above",
+    _: "other"
+}
+[]u8 sign(i32 n) {
+    -limit..-1: "small negative",
+    0..limit: "small",
+    101..: "big",
+    _: "very negative"
+}
+u8 again(u8 c) {
+    seen: 1,
+    5: 2,
+    _: 0
+}
+main(): u8 {
+    print(kind(50), kind(5), kind(200), kind(40))
+    i32 z = 0
+    print(sign(z - 5), sign(z + 5), sign(z + 500), sign(z - 500))
+    seen = 7
+    print(again(5), again(7), again(9))
+    return 0
+}

@@ -1,0 +1,6 @@
+-- a first program that runs:  ./modal-v2 --run examples/v2/run/hello.modal
+print := import("std").io.print
+
+main() {
+    print "hello from Modal"
+}

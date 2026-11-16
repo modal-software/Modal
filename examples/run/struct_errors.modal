@@ -1,0 +1,31 @@
+-- A struct value with its error (guards.md §5): `parse(...): point, error`; `p, e :=` binds both,
+-- the value at zero when there is an error (also a panic, at a boundary).
+print := import("std").io.print
+bad_input: error
+point: struct { i32 x, i32 y }
+parse([]u8 s): point, error {
+    if s {
+        "": return bad_input
+        _: return point{ x: 3, y: 4 }
+    }
+}
+shifted([]u8 s): point, error {
+    p := parse(s)
+    return point{ x: p.x + 10, y: p.y }
+}
+point corner(i32 n) { return point{ x: 100 / n, y: n } }
+main(): u8 {
+    p, e := parse("x")
+    print(p.x, p.y, e)
+    q, f := parse("")
+    print(q.x, q.y, f)
+    r, g := shifted("x")
+    print(r.x, r.y, g)
+    s, h := shifted("")
+    print(s.x, s.y, h)
+    t, k := corner(0)            -- a panic: a struct value comes back zero
+    print(t.x, t.y, k)
+    w, m := corner(5)
+    print(w.x, w.y, m)
+    return 0
+}

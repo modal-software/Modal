@@ -1,0 +1,6 @@
+-- a stage without a pattern after a stage of several arms: which arm would it continue?
+print := import("std").io.print
+main(): u8 {
+    k := u64(3).(0: 1, 1: 2).(print)
+    return 0
+}

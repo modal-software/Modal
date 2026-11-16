@@ -1,0 +1,44 @@
+-- fields by use (std.md §10): a field nothing reads has no bytes, and one every write gives the
+-- same constant is that constant. Here item keeps only hits (4 bytes, not 24); noisy() still
+-- runs. made keeps both: sizeof looks at it, and made.new makes one at zero (kind is 0 there).
+print := import("std").io.print
+item: struct {
+    u64 id,
+    u32 hits,
+    u8 tag,
+    u16 version,
+    i32 bias,
+}
+made: struct {
+    u8 kind,
+    u32 n,
+}
+new(self: made, n: u32): *made {
+    self.n = n
+    return &self
+}
+noisy(): u32 {
+    print("called")
+    return 9
+}
+bump(*item it): *item {
+    it.hits = it.hits + 1
+    it.tag = 3
+    return it
+}
+main(): u8 {
+    a: *item = &item{ 
+        id: 1, 
+        hits: noisy(),
+        tag: 3,
+        version: 2,
+        bias: -4,
+    }
+    b := bump(a)                   -- a is a reference already (a value would need &)
+    print(a.id, a.hits, a.version, a.bias, sizeof(made))
+    print(b.id, b.hits, b.version, b.bias, sizeof(made))
+    m := made.new(5)
+    q := made{ kind: 7, n: 1 }
+    print(m.kind, q.kind, m.n)
+    return 0
+}

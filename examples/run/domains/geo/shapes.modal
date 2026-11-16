@@ -1,0 +1,22 @@
+-- domain geo: nothing here says what is public. main.modal, in another domain, uses
+-- point.x, point.y, span.lo, span.hi, new and width, so `--sig` lists those; span.reads is
+-- used only inside geo, so it stays in the domain.
+point: struct {
+    i32 x,
+    y: i32,
+}
+
+span: struct {
+    lo: i32,
+    hi: i32,
+    u32 reads,
+}
+
+new(self: span, lo: i32, hi: i32): *span {
+    return &span{ lo, hi, reads: 0 }
+}
+
+width(self: span): i32 {
+    self.reads = self.reads + 1
+    return self.hi - self.lo
+}

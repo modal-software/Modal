@@ -1,0 +1,8 @@
+u8 f(u8 1..9): 1
+u8 f(u8 5..20): 2
+u8 f(u8 n): 3
+nil g(u8 0) {}
+nil g(u8 1) {}
+main(): u8 {
+    return f(7)
+}

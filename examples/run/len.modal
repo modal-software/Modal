@@ -1,0 +1,17 @@
+-- len (collections, context.md §64): every collection has one; an array's is a constant (its N),
+-- folded where it is used (an arm `ps.len:` ends a recursion over it), a []u8's is read.
+print := import("std").io.print
+person: struct { u64 id }
+u64 count([8]u8 xs) { return xs.len }
+u64 total(ps: *[3]person, u64 i, u64 acc) {
+    return if i { ps.len: acc, _: total(ps, i + 1, acc + ps[i].id) }
+}
+main(): u8 {
+    [4]u8 a
+    [8]u8 b
+    s := "hello"
+    [3]person ps
+    ps[1].id = 5
+    print(a.len, s.len, count(b), "".len, total(&ps, 0, 0))
+    return 0
+}

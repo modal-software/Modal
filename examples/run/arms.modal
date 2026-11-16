@@ -1,0 +1,190 @@
+-- Arms: `pattern: result`, tried against a value; `:` takes the value (only `=` assigns).
+-- A pattern is a literal, a range (`1..9`, `100..`), a string, true / false, or `_` (every
+-- value). Several values: one pattern each, in parentheses; `_` alone takes all of them.
+-- An arm binds no name: the value keeps its own, and inside an arm it is known to be one of the
+-- arm's values. Arms take disjoint values, and every value must be taken: the compiler checks.
+print := import("std").io.print
+type := import("std").type
+
+u8 command([]u8 s) {          -- a body of arms matches the parameters
+    "help": 1
+    "quit": 2
+    "": 4
+    _: 0
+}
+
+[]u8 kind(c: u8) {
+    48..57: "digit"
+    32: "space"
+    _: "other"
+}
+
+-- literals that cover every u8: no `_` needed, and the last arm needs no test
+[]u8 size(u8 n) {
+    0: "none"
+    1..9: "small"
+    10..255: "big"
+}
+
+-- a loop: the arm's call is a tail call, so ten million turns run as a loop
+u64 sum(u64 n, u64 acc) {
+    (0, _): acc
+    _: sum(n - 1, acc + n)
+}
+
+-- inside 1..9, n is known not to be 0: `100 / n` has no zero guard
+u64 share(u64 n) {
+    0: 0
+    1..9: 100 / n
+    _: n / 10
+}
+
+nil countdown(u8 n) {
+    0: print("go")
+    _: {
+        print(n)
+        countdown(n - 1)
+    }
+}
+
+[]u8 sign(i32 n) {
+    -2147483648..-1: "negative"
+    0: "zero"
+    1..: "positive"
+}
+
+T loop(T: type, n: T) {
+    (_, 0..10): loop(u64, n + 1)
+    _: return n
+}
+
+a := loop(u64, 1)
+
+main(): u8 {
+    u8 c = 50
+    word := if c {
+        48..57: "a digit",
+        _: "not a digit"
+    }
+    print(a)
+
+    -{
+    print(word, kind(c), kind(32), kind(7), size(0), size(5), size(200))
+    print(command("help"), command("quit"), command(""), command("x"), sum(10000000, 0))
+    if c {
+        48..57: print("digit", c - 48)
+        _: print("not a digit")
+    }
+    --if c > 40: print("above 40") else print("40 or less")
+    if c {
+        40..: print("above 40"),
+        _: print("40 or less")
+    }
+    }-
+    return 0
+}
+
+
+-{
+proposed new syntax for match operations using pipe ops considering that every arm are computed in pipe ops.
+we should add support to pipe operators, to pipelines, im suggesting you to deep review every thing below, the costs and syntax decisions and accepting a lot of suggestions to that.
+
+loop(T: type, n: T) {
+    -- attention to "function" this are not exactly a properly lambda, but are very similar syntax, check line 133 for how a common lambda and match inside a lambda are
+    -- i want you to review this syntax its are appropriated very cetical. 
+    f := (0..10) {
+        -- even loop being invoked here he's a children of (f) and loop will not be execute until f be invoked
+        loop(u64, n + 1)
+        print(n)
+    }
+    -- here usage decides that f should be invoked
+    n.(f).(_: print("finished"))
+}
+
+-- or
+
+
+
+f := () {
+    loop(u64, 1)
+    print(n)
+}
+
+loop(T: type, n: T) {
+    -- usage will analyse and decide if the pipe ops are sequentially (pipeline) or concurrent
+    n.(0..10: n + 1).(f()).(_: print("finished"))
+    -- sequentially: (check 0..10) -> increments n by 1 -> execute f that recursely executes loop, end of sequence.
+    -- concurrent: (catches all) -> prints "finished" 
+
+}
+
+-- with lambdas and pipe operations
+loop(T: type, n: T) {
+    n.(0..10: {
+        loop(u64, n+1);
+        print(n)
+    }
+    ).(_: print("finished"))
+}
+}-
+
+
+
+--
+
+-{
+-- arm inside of a lambda equal arm inside of a function
+loop(T: type, n: T) {
+    fn := () {
+        0..10: {
+            loop(u64, n+1);
+            print(n)
+        }
+        _: print("finished")
+    }
+
+
+}
+}-
+
+-- thinking by usage this function above will be executed loop -> fn -> lambda and will be optimized in MIR to something like and by usage optimization
+-{
+idk if this syntax are the ideal. but seems very good for me but imaginaging that in our language we parametes are literals too, and variables are treated as literals
+that receive a expression
+
+loop(u64 n = 0..10) {
+    loop(n + 1)
+    print(n)
+    _: print("finished")
+}
+
+--ex:
+"n": struct{
+    []u8 john,
+}
+-- a variable that init with no value but a data structure formation later he will be structured
+
+-- deep review that, operators in str normally you should consider internally as char_id to avoid operators collisions.
+"john_+" := "n"{
+    -- surely this may collide with literal patterns that're what im talking about, but this member can be considered literal pattern of a structure, you may deep review that, and check for rules for keeping all explicit
+    john: "my name is john"
+}
+
+print("john_+".john)
+-- this may increase the possibilities of what can be built with less code in this language. because we are perfomance_and_developer_speed_driven
+-- these suggestion above may answer you questions about context literals that are to same perfomance_and_developer_speed_drive
+
+}-
+
+
+
+
+
+
+
+
+
+
+
+
+--

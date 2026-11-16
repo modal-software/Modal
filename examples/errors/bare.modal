@@ -1,0 +1,4 @@
+-- bare metal needs the memory map from mod.modal
+main(): u8 {
+    return 0
+}

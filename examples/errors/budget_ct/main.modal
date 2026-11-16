@@ -1,0 +1,6 @@
+u64 down(u64 0): 0
+u64 down(u64 n): down(n - 1) + 1
+x := down(100)
+main(): u8 {
+    return 0
+}

@@ -1,0 +1,40 @@
+-- structs at module level: a constant (home), and a variable (seg cur), read and written by any
+-- function, field by field (cur.a.x = ...) or whole (cur = seg{ ... }). On native each field of a
+-- struct variable has a global slot of its own; `&cur` is not given there yet.
+print := import("std").io.print
+pt: struct {
+    u16 x,
+    u8 y,
+}
+seg: struct {
+    u8 tag,
+    pt a,
+    pt b,
+}
+home := pt{ x: 1, y: 2 }
+seg cur = seg{ tag: 5, a: home, b: pt{ x: 300, y: 9 } }
+u32 moves = 0
+step(d: u16) {
+    cur.a.x = cur.a.x + d
+    cur.tag = cur.tag + 1
+    moves = moves + 1
+}
+total(s: seg): u32 {
+    return u32(s.a.x) + u32(s.a.y) + u32(s.b.x) + u32(s.b.y) + u32(s.tag)
+}
+main(): u8 {
+    print(cur.tag, cur.a.x, cur.a.y, cur.b.x, cur.b.y, total(cur))
+    step(10)
+    step(20)
+    print(cur.tag, cur.a.x, moves, total(cur))
+    cur.b = cur.a
+    pt p = cur.b
+    p.y = 77
+    cur.a = p
+    print(cur.a.x, cur.a.y, cur.b.x, cur.b.y)
+    seg copy = cur
+    copy.tag = 0
+    cur = seg{ tag: 1, a: home, b: home }
+    print(copy.tag, copy.a.y, cur.tag, cur.b.x, total(cur))
+    return 0
+}

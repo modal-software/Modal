@@ -1,0 +1,17 @@
+-- compile-time values (docs/comptime.md §2.2): the target's facts and the domain's
+-- configuration. Module level reads them; the program gets the results.
+print := import("std").io.print
+assert := import("std").assert
+target := import("target")
+
+words := target.ptr_size * 8   -- 64 on every target today
+budget := max_ram / 2          -- mod.modal's max_ram
+release := version
+arch := target.arch            -- "arm64", "x86_64": printed only by the target checks
+assert(max_ram >= 1024)
+assert(target.ptr_size == 8)
+
+main(): u8 {
+    print(words, budget, release)
+    return 0
+}

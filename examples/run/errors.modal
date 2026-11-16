@@ -1,0 +1,58 @@
+-- Errors (guards.md §5): a value of one word, `error` (nil: no error). A function that can fail
+-- says `, error` in its result; which errors is inferred. A caller binds the error, `n, e :=`,
+-- or lets it go up (it then says `, error` too). An `e` no line reads stops the program when an
+-- error reaches it (panic.unhandled).
+print := import("std").io.print
+
+bad_input: error            -- errors of the program: each a number of its own
+too_big: error
+
+parse([]u8 s): u64, error {
+    if s {
+        "": return bad_input
+        "big": return too_big
+        _: return 42
+    }
+}
+
+serve([]u8 s): u64, error {
+    n := parse(s)           -- not handled: an error of parse goes up from serve
+    return n + 1
+}
+
+check(u64 n): error {       -- only an error: nil when all is well
+    if n {
+        0: return bad_input
+        _: return nil
+    }
+}
+
+run(u64 n): error {
+    check(n)                -- alone: its error goes up
+    print("checked", n)
+    return nil
+}
+
+main(): u8 {
+    n, e := serve("x")
+    e.(nil: print(n), bad_input: print("empty"))
+    m, f := serve("")
+    f.(nil: print(m), bad_input: print("empty"))
+    a, g := serve("big")
+    if g {
+        nil: print(a)
+        bad_input: print("empty")
+        too_big: print("too big, and the value is zero:", a)
+        _: print("other")
+    }
+    r := run(3)
+    r.(nil: print("run ok"))
+    q := run(0)
+    q.(bad_input: print("run failed"))
+    x, h := parse("")       
+    -- if you remove this line below
+    -- h is never read: the error stops the program here
+    h.(bad_input: print("bad_input", x)).(_: print("error here"))
+    print("not reached")
+    return 0
+}

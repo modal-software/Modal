@@ -1,0 +1,44 @@
+-- any (std/any.modal, std.md §11): a reference that carries the type of what it points to. Any
+-- reference goes where *any is expected; typeof(a) is known at run time, and point(a) gives the
+-- *point back (checked: the last line stops the program, a holds a span). No name is stored.
+print := import("std").io.print
+any := import("std").any
+point: struct {
+    i32 x,
+    i32 y,
+}
+span: struct {
+    u32 lo,
+    u32 hi,
+}
+pid := typeof(point).id
+sid := typeof(span).id
+size(a: *any): u32 {
+    if typeof(a).id {
+        pid: return u32(point(a).x + point(a).y)
+        sid: return span(a).hi - span(a).lo
+        _: return 0
+    }
+}
+grow(a: *any) {
+    if typeof(a).id {
+        pid: point(a).x = point(a).x * 10
+        _: {}
+    }
+}
+main(): u8 {
+    p := point{ x: 3, y: 4 }
+    s := span{ lo: 2, hi: 9 }
+    n: u32 = 5
+    print(size(&p), size(&s), size(&n))
+    grow(&p)
+    grow(&s)
+    print(p.x, s.lo)
+    a: *any = &s
+    print(typeof(a).id == sid, typeof(a).id == pid, span(a).hi)
+    t := typeof(a)                 -- std's type, read from a's descriptor at run time
+    print(t.size, t.fields, typeof(point).size, typeof(n).size)
+    b := point(a)
+    print(b.x)
+    return 0
+}

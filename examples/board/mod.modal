@@ -1,0 +1,11 @@
+-- a board's memory map, for `--target arm64-none` / `x86_64-none`. The image goes at
+-- flash_origin; _start puts the stack at the top of RAM. flash_size and ram_size are also the
+-- budgets (max_code, max_ram), so a program that does not fit the chip is a compile error.
+-- (These addresses are for the tests, which run the image on macOS through tools/elfrun.c and
+-- can only map memory this high; QEMU's arm64 `virt` board has RAM at 0x4000_0000.)
+flash_origin := 0x100_0001_0000
+flash_size := 16384
+ram_origin := 0x100_0002_0000
+ram_size := 4096
+-- blink calls itself, so its depth is not known when compiling: it gets this much value stack
+stack := 1024

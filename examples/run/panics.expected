@@ -1,0 +1,11 @@
+panic.division
+panic.index
+panic.assert
+panic.raised
+bad_input
+ok
+pipe nil
+0 7
+panic.division
+999
+./examples/run/panics.modal:10:30: division by zero

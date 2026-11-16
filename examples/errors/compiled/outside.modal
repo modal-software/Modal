@@ -1,0 +1,2 @@
+i := import("./inner")
+x := i.twice(2)

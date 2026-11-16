@@ -1,0 +1,20 @@
+-- any: each line below main's first is an error
+any := import("std").any
+point: struct {
+    i32 x,
+}
+wrap(p: *point): *any {
+    return p
+}
+keep(): *any {
+    p := point{ x: 1 }
+    a: *any = &p
+    return a
+}
+main(): u8 {
+    p := point{ x: 1 }
+    b := point(p)
+    c: *any = p
+    d := typeof(3)
+    return 0
+}

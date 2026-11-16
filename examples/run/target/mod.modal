@@ -1,0 +1,3 @@
+-- the domain's configuration: its files read it by name, at module level
+max_ram := 4096
+version := "2.1"

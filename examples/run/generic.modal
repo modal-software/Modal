@@ -1,0 +1,37 @@
+-- functions made once per type (comptime.md §3.2): a parameter of std's type that another
+-- parameter, or the result, takes as its type is known while compiling, so the function is
+-- made for each type it is given (no marker: the use says so). T is still a value: T.size.
+print := import("std").io.print
+type := import("std").type
+point: struct {
+    i32 x,
+    i32 y,
+}
+rgb: struct {
+    u8 r,
+    u8 g,
+    u8 b,
+}
+first(T: type, a: T, b: T): T {
+    return a
+}
+size_of(T: type, v: *T): u64 {
+    return T.size
+}
+pick(T: type, c: bool, a: T, b: T): T {
+    if c {
+        true: return a
+        false: return b
+    }
+}
+main(): u8 {
+    p := point{ x: 1, y: 2 }
+    q := point{ x: 5, y: 6 }
+    c := rgb{ r: 7, g: 8, b: 9 }
+    r := first(point, p, q)
+    n := first(u32, 3, 4)
+    k := pick(rgb, false, c, rgb{ r: 1, g: 1, b: 1 })
+    print(r.x, r.y, n, k.r, size_of(point, &p), size_of(rgb, &c))
+    print(pick(u8, true, 10, 20), pick(point, false, p, q).y)
+    return 0
+}

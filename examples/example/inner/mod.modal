@@ -1,0 +1,2 @@
+-- a subfolder is internal to its parent: only `example` and what is below it can import this
+deep := import("./deep")

@@ -1,0 +1,18 @@
+-- Conditions as patterns: what is reported.
+print := import("std").io.print
+bad_input: error
+parse(s: u64): u64, error {
+    if s {
+        0: return bad_input
+        _: return s
+    }
+}
+[]u8 sign(u64 n) {
+    return if n { n > 3: "big", 0: "zero" }      -- a value match: a condition takes nothing for sure
+}
+main(): u8 {
+    u64 k = 2
+    n, e := parse(k).(k > 1: 5)                      -- not on a call that can fail yet
+    print(sign(k), n, e)
+    return 0
+}

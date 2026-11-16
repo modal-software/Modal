@@ -1,0 +1,17 @@
+-- a generic recursion of 100M turns: a tail call on every backend, C included (T is not passed:
+-- the specialization reads the descriptor it was made for)
+
+print := import("std").io.print
+type := import("std").type
+
+T loop(T: type, n: T) {
+    (_, 0..100000000): loop(u64, n + 1)
+    _: return n
+}
+u64 size_of(T: type): T.size
+T first(T: type, a: T, b: T): a
+
+main(): u8 {
+    print(loop(u64, 1), size_of(u32), first(u8, 3, 4))
+    return 0
+}

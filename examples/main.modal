@@ -1,0 +1,41 @@
+
+example := import("./example")
+can_import_directly_the_module := import(example)
+or_can_import_directly_the_file := import("./example/john.modal")
+
+john_class := import("./example").john.john_nested_class
+io := import("std").io.*
+file_and_print := import("std").io.(file, print)
+
+import("std").io.(
+    file,
+)
+
+print(input: u8): nil {
+    write(input)
+}
+
+start := () int {
+    print "starting"
+    return 0
+}
+
+main(): u8 {
+    john := make_john()
+    total := add(john, 3)
+    print(total)
+    return 0
+}
+
+u8 scale(n: u8) {
+    return n * 2
+}
+
+u8 scale(n, factor: u8): n * factor
+
+add(n3: u8): u8 {
+   n1: u8 = 3 
+    n3 = n3 + n1
+
+   return n3
+}

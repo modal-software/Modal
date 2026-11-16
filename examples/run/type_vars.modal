@@ -1,0 +1,45 @@
+-- Type variables (context.md §67): `T: type` with no value, declared once (std/type.modal has T;
+-- a program declares its own the same way). A parameter typed by one makes the function generic:
+-- each call reads the type from the argument in that place, and the function is made once per
+-- type. Nothing is passed for it at run time.
+
+print := import("std").io.print
+type := import("std").type
+T := import("std").T
+
+map := import("std").map
+fold := import("std").fold
+
+K: type                                     -- the program's own
+
+point: struct { u64 x, y }
+
+max(a: T, b: T): T {
+    return if a > b { true: a, _: b }
+}
+T first(xs: []T): xs[0]                     -- from the array's element type
+K second(xs: []K): xs[1]
+
+u64 px(p: *T): p.x                          -- through a reference: T is point
+zero(T: type): T {                          -- no argument has T: the caller names it
+    T z
+    return z
+}
+
+main(): u8 {
+    u16 small = 7
+    u64 y = 9
+    [3]u16 a
+    a[0] = 42
+    a[1] = 5
+    [2]point ps
+    ps[1].x = 30
+    print(max(small, u16(3)), max(y, 4), max(3, y), first(a), second(a))
+    point q = ps[1]
+    print(first(ps).x, second(ps).x, px(&q), zero(u64))
+    doubled := map(a, v: u64(v) * 2)        -- T = u16, U = u64 (what the literal gives)
+    print(doubled[0], doubled[1], fold(doubled, u64(1), (s, v): s + v))
+    xs := map(ps, p: p.x)
+    print(fold(xs, u64(0), (s, v): max(s, v)))
+    return 0
+}

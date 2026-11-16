@@ -1,0 +1,9 @@
+-- fits: 64 bytes of output buffer, a value stack sized from the call graph
+print := import("std").io.print
+
+u8 twice(n: u8): n * 2
+
+main(): u8 {
+    print("small:", twice(21))
+    return 0
+}
