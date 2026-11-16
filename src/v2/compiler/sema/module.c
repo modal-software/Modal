@@ -1229,13 +1229,34 @@ SymId module_member(Unit *u, NodeId base, uint32_t name_tok)
     return scope_find_token(t.scope, TOK(u, name_tok));
 }
 
+// A body just parsed: one walk finds its imports and whether it has a path to check at all (an
+// import, a selector, a val); most bodies have neither, and the two walks of module_check_paths
+// are not made for them.
 void module_body_nodes(Unit *u, NodeId from)
 {
-    if (discover_imports(u, from, (NodeId)u->nodes.size))
+    NodeId to = (NodeId)u->nodes.size;
+    uint32_t found = 0;
+    int paths = 0;
+    for (NodeId id = from; id < to; id++)
+    {
+        uint8_t kind = NODE(u, id)->kind;
+        if (kind == AST_IMPORT)
+        {
+            Unit *target = compiler_namespace(u, id) ? NULL : import_target(u, id);
+            NODE(u, id)->aux = target ? (uint16_t)(target->id + 1) : 0;
+            found++;
+        }
+        paths |= kind == AST_IMPORT || kind == AST_VAL_DECL || is_chain_segment(kind);
+    }
+    u->nimports += found;
+    if (found)
     {
         link_new_units(); // an import inside a body: its file must be linked before use
     }
-    module_check_paths(u, from, (NodeId)u->nodes.size);
+    if (paths)
+    {
+        module_check_paths(u, from, (NodeId)u->nodes.size);
+    }
 }
 
 // Files in checking order: the ones a file imports before it (a depth-first walk over the imports

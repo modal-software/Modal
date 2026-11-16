@@ -47,8 +47,6 @@ typedef struct
     int errors;
     uint32_t top, max_top, perm;
     LowerLocal *locals; // local_pool[pool], or NULL until the first local
-    struct LocalSlot *lmap; // past LOCALS_BY_WALK locals: name -> latest local (local_index)
-    uint32_t lmap_cap, lmap_used;
     uint32_t locals_cap;
     int pool;
     int nlocals;
@@ -63,6 +61,10 @@ typedef struct
     int for_compiler; // lowered for the compiler to run (comptime.c): descriptors are its own
     TypeId ret;
     uint8_t is_local[MAX_TRACKED];
+    // past LOCALS_BY_WALK locals: name -> latest local (local_index). Last, as it is rarely
+    // read: the fields above keep their offsets from &L
+    struct LocalSlot *lmap;
+    uint32_t lmap_cap, lmap_used;
 } Lower;
 
 static Lower L;
@@ -1231,14 +1233,28 @@ static int lower_walk(NameId name)
     return i;
 }
 
-static int local_index(NameId name) // the index in L.locals, or -1
+static int local_index_map(NameId name);
+
+// The index in L.locals, or -1. The walk of a small function stays in place at each caller (it is
+// always right: a map, when there is one, is kept too).
+__attribute__((always_inline)) static inline int local_index(NameId name)
+{
+    if (L.nlocals <= LOCALS_BY_WALK)
+    {
+        int i = L.nlocals - 1;
+        while (i >= 0 && L.locals[i].name != name)
+        {
+            i--;
+        }
+        return i;
+    }
+    return local_index_map(name);
+}
+
+static int local_index_map(NameId name)
 {
     if (!L.lmap)
     {
-        if (L.nlocals <= LOCALS_BY_WALK)
-        {
-            return lower_walk(name);
-        }
         uint32_t cap = 256;
         while (cap < (uint32_t)L.nlocals * 4)
         {
@@ -1264,7 +1280,7 @@ static int local_index(NameId name) // the index in L.locals, or -1
     return i;
 }
 
-static int find_local_ref(NameId name, MirSlot *slot, int *ref)
+__attribute__((always_inline)) static inline int find_local_ref(NameId name, MirSlot *slot, int *ref)
 {
     int i = local_index(name);
     if (i < 0)
@@ -1276,7 +1292,7 @@ static int find_local_ref(NameId name, MirSlot *slot, int *ref)
     return 1;
 }
 
-static int find_local(NameId name, MirSlot *slot)
+__attribute__((always_inline)) static inline int find_local(NameId name, MirSlot *slot)
 {
     int i = local_index(name);
     if (i < 0)

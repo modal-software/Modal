@@ -386,6 +386,31 @@ static SymId field_of(SymId s, const Unit *home, NodeId m)
 static uint8_t *binding_bits;
 static uint32_t binding_bits_cap, binding_bits_upto = 1;
 
+// A new compilation: the caches were in the arena, emptied with it; the facts (malloc) are cleared.
+void layout_reset(void)
+{
+    structs = NULL;
+    field_off = NULL;
+    cache_cap = 0;
+    F.done = F.off = F.pin_all = 0;
+    if (F.n)
+    {
+        memset(F.bits, 0, F.n);
+        memset(F.value, 0, F.n * sizeof(uint64_t));
+    }
+    if (F.nstate)
+    {
+        memset(F.state, 0, F.nstate);
+        memset(F.field_value, 0, F.nstate * sizeof(uint64_t));
+    }
+    binding_bits_upto = 1;
+    if (binding_bits)
+    {
+        memset(binding_bits, 0, binding_bits_cap);
+    }
+}
+
+
 static int struct_marked(SymId s, uint8_t bit)
 {
     NameId own = cx.sym_names[s];

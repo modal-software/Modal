@@ -38,6 +38,10 @@ typedef struct
     uint64_t value;
 } Fact;
 static Fact facts[MAX_FACTS];
+
+// A short function: the scan forward from each instruction (live_after) costs less than the
+// table of the sweep (Live, below), and gives the same answer (it stops short of its 4,096 steps).
+#define DCE_BY_SCAN 512
 static int nfacts;
 
 static int produces(uint8_t op)
@@ -239,10 +243,15 @@ static size_t value_text(uint8_t sub, uint64_t v, char *buf)
 
 // ---- fold ------------------------------------------------------------------------------------
 
+static uint8_t *write_dead(Opt *o);
+
 static int fold(Opt *o)
 {
     MirFunc *f = o->f;
     int changed = 0;
+    // (in a long function, whether a write's slot is read after it is read once for all, as in
+    // merge_output: fold changes no code after the instruction it is at)
+    uint8_t *dead = f->n > DCE_BY_SCAN ? write_dead(o) : NULL;
     forget_block(o);
     for (size_t i = 0; i < f->n; i++)
     {
@@ -437,7 +446,7 @@ static int fold(Opt *o)
             break;
         case MIR_WRITE:
             if ((in->sub == MW_INT || in->sub == MW_UINT || in->sub == MW_BOOL) &&
-                is_known(o, in->a, &a) && !live_after(o, i, in->a))
+                is_known(o, in->a, &a) && (dead ? dead[i] : !live_after(o, i, in->a)))
             {
                 char text[24];
                 size_t len = value_text(in->sub, a, text);
@@ -493,11 +502,15 @@ static void expand_writes(Opt *o)
 // ---- output -----------------------------------------------------------------------------------
 
 // Runs of constant output: `str s = A; write.str s`, `write.space`, `write.nl`, one after the
-// other, become one string. Every slot of the run is dead after it (checked).
+// other, become one string. Every slot of the run is dead after it (checked). In a long function
+// that is read for every write at once, from the end (write_dead): a scan forward per string was
+// up to 4,096 steps each. A merge changes only the code before where the next query is, and a
+// slot's liveness after an instruction depends only on the code after it, so the answers hold.
 static int merge_output(Opt *o)
 {
     MirFunc *f = o->f;
     int changed = 0;
+    uint8_t *dead = f->n > DCE_BY_SCAN ? write_dead(o) : NULL;
     for (size_t i = 0; i < f->n; i++)
     {
         size_t j = i, parts = 0, len = 0;
@@ -511,7 +524,7 @@ static int merge_output(Opt *o)
             }
             else if (in->op == MIR_STR && j + 1 < f->n && f->code[j + 1].op == MIR_WRITE &&
                      f->code[j + 1].sub == MW_STR && f->code[j + 1].a == in->d &&
-                     !live_after(o, j + 1, in->d))
+                     (dead ? dead[j + 1] : !live_after(o, j + 1, in->d)))
             {
                 len += f->strings[in->imm].len;
                 j += 2;
@@ -869,10 +882,44 @@ static void live_step(Live *l, const MirInst *in)
     live_reads(l, in); // (LOADN's a and MOVE's own slots: read, so live again)
 }
 
+
+static int dce_scan(Opt *o)
+{
+    MirFunc *f = o->f;
+    int changed = 0;
+    for (size_t i = f->n; i-- > 0;)
+    {
+        MirInst *in = &f->code[i];
+        if (produces(in->op) && !live_after(o, i, in->d))
+        {
+            delete_inst(in);
+            changed = 1;
+        }
+        else if (in->op == MIR_ZERO)
+        {
+            int any = 0;
+            for (uint64_t k = 0; k < in->imm && !any; k++)
+            {
+                any = live_after(o, i, (MirSlot)(in->a + k));
+            }
+            if (!any)
+            {
+                delete_inst(in);
+                changed = 1;
+            }
+        }
+    }
+    return changed;
+}
+
 static int dce(Opt *o)
 {
     MirFunc *f = o->f;
     int changed = 0;
+    if (f->n <= DCE_BY_SCAN)
+    {
+        return dce_scan(o);
+    }
     // (a region leaving its shared page starts again elsewhere: then nothing is given back)
     char *base = cx.regions[REGION_MIR].base;
     size_t mark = cx.regions[REGION_MIR].used;
@@ -909,6 +956,24 @@ static int dce(Opt *o)
         region_set_end(REGION_MIR, base + mark);
     }
     return changed;
+}
+
+// Per instruction: 1 when it is a write whose slot nobody reads after it (fold, merge_output).
+// In the region, after the code: given back with the region's next start (it is small: n bytes).
+static uint8_t *write_dead(Opt *o)
+{
+    MirFunc *f = o->f;
+    uint8_t *dead = (uint8_t *)region_push(REGION_MIR, (f->n + 7) & ~(size_t)7);
+    Live l = {o, (uint32_t *)region_push(REGION_MIR, ((size_t)o->nslots * 4 + 7) & ~(size_t)7),
+              (uint8_t *)region_push(REGION_MIR, (o->nslots + 7) & ~(size_t)7), 1, 0};
+    memset(l.stamp, 0, (size_t)o->nslots * 4);
+    for (size_t i = f->n; i-- > 0;)
+    {
+        const MirInst *in = &f->code[i];
+        dead[i] = in->op == MIR_WRITE && in->sub != MW_SPACE && in->sub != MW_NL && !live_get(&l, in->a);
+        live_step(&l, in);
+    }
+    return dead;
 }
 
 // ---- bounds ----------------------------------------------------------------------------------

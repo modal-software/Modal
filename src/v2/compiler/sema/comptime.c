@@ -56,9 +56,19 @@ uint32_t comptime_folded(void)
     return fold_count;
 }
 
+static void vms_reset(void);
+static int nct_descs;
+static uint8_t *fold_notes;
+static size_t fold_notes_cap;
+
+// A new compilation (modules_link): what the arena held is gone with it.
 void comptime_reset(void)
 {
     mir_reset();
+    vms_reset();
+    nct_descs = 0;
+    fold_notes = NULL;
+    fold_notes_cap = 0;
     folds = NULL;
     fold_steps = 0;
     fold_count = 0;
@@ -388,7 +398,6 @@ static struct
     uint64_t *at;
     uint32_t words;
 } ct_descs[CT_DESCS];
-static int nct_descs;
 
 static int ct_desc_index(TypeId t)
 {
@@ -927,9 +936,16 @@ static int evaluate_value(Vm *vm, Unit *u, NodeId expr, TypeId type, SymId s, co
 
 // A number known while compiling that the checker could not fold (it calls std code, as
 // `T.at(i).offset` does): run now by the interpreter. 0 when it cannot be.
+static Vm nvm, tvm; // their stacks are in the arena: comptime_reset forgets them
+
+static void vms_reset(void)
+{
+    memset(&nvm, 0, sizeof(nvm));
+    memset(&tvm, 0, sizeof(tvm));
+}
+
 int comptime_value_u64(Unit *u, NodeId expr, uint64_t *out)
 {
-    static Vm nvm;
     const char *why;
     int nested = mir_nest_begin();
     int ok = nested && evaluate(&nvm, u, expr, u->types[expr], 0, &why);
@@ -956,7 +972,6 @@ const char *comptime_type_value_why(void)
 int comptime_type_value(Unit *u, NodeId expr, TypeId *out)
 {
     type_value_why[0] = 0;
-    static Vm tvm;
     TypeId t = u->types[expr];
     const char *why;
     int nested = mir_nest_begin();
@@ -1247,8 +1262,6 @@ int comptime_param_slots(SymId fn)
 }
 
 // What the folds of each function came to, for --sig: FOLD_NOTE_* bits, by symbol.
-static uint8_t *fold_notes;
-static size_t fold_notes_cap;
 
 static void fold_note(SymId fn, uint8_t bit)
 {

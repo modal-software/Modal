@@ -954,6 +954,11 @@ static void out_sink_name(Emit *e, SymId method)
     put(e, buf);
 }
 
+// print(e) with more names than this calls m__error_text, made once at the end (as the native
+// backend's out.error); with fewer, the tests are written in place.
+#define ERRORS_INLINE 8
+static int error_text_used;
+
 // write(a, b) / print(a, b): one runtime call per argument, chosen by its type. write emits
 // its arguments as they are; print puts a space between them and a newline after. With a
 // `put` (AST_F_SINK), the first argument is the `out` every byte goes to.
@@ -1012,7 +1017,32 @@ static void emit_output(Emit *e, NodeId args, int newline, SymId sink)
             PUT(e, " = ");
             emit_expr(e, a);
             PUT(e, "; ");
-            for (uint32_t i = 0; i <= ne; i++)
+            if (ne > ERRORS_INLINE && !sink)
+            {
+                // past a few names, one routine for the program writes it: a call per print
+                error_text_used = 1;
+                PUT(e, "m__write_error(");
+                put(e, var);
+                PUT(e, "); }), ");
+                continue;
+            }
+            if (ne > ERRORS_INLINE)
+            {
+                // with a `put`: the routine gives the name, the put writes it
+                error_text_used = 1;
+                PUT(e, "m_str m_t");
+                put(e, var + 3);
+                PUT(e, "; if (m__error_text(");
+                put(e, var);
+                PUT(e, ", &m_t");
+                put(e, var + 3);
+                PUT(e, ")) ");
+                OPEN("str");
+                PUT(e, "m_t");
+                put(e, var + 3);
+                PUT(e, "); else ");
+            }
+            for (uint32_t i = 0; i <= ne && ne <= ERRORS_INLINE; i++)
             {
                 uint64_t id = i ? ids[i - 1] : 0;
                 char name[80];
@@ -3615,6 +3645,7 @@ static void backend_c_begin(const BackendJob *job)
     {
         memset(clause_places, 0, clause_places_cap * sizeof(uint32_t));
     }
+    error_text_used = 0;
 
     // Other files (std, imported modules) give their functions to the program: each is emitted
     // in its own file's context, named m_u<file>_... Their types and module-level values are
@@ -3651,6 +3682,15 @@ static void backend_c_begin(const BackendJob *job)
     }
 
     put(e, prelude);
+    // print(e)'s names: made once, at the end, and called (inlined at every print it would be a
+    // copy of the table per print)
+    PUT(e, "#if defined(__GNUC__) || defined(__clang__)\n"
+           "static __attribute__((unused, noinline, cold)) int m__error_text(uint64_t e, m_str *s);\n"
+           "static __attribute__((unused, noinline, cold)) void m__write_error(uint64_t e);\n"
+           "#else\n"
+           "static int m__error_text(uint64_t e, m_str *s);\n"
+           "static void m__write_error(uint64_t e);\n"
+           "#endif\n");
 
     // 1. Types, of every file the program reaches: each struct is declared before any is
     //    defined, so they can refer to each other through pointers in any order, and each is
@@ -3873,6 +3913,28 @@ static int backend_c_end(const BackendJob *job)
         PUT(e, "int main(void)\n{\n    int status = (int)");
         out_fn_name(e, entry);
         PUT(e, "();\n    mrt_flush();\n    return status;\n}\n");
+    }
+
+    if (error_text_used)
+    {
+        // The names of print(e): one switch for the program (the compiler makes it a table or a
+        // search), with every error the program declares, known only now.
+        uint32_t ne;
+        const uint64_t *ids = sema_errors(&ne);
+        PUT(e, "static int m__error_text(uint64_t e, m_str *s)\n{\n    switch (e)\n    {\n    case 0: *s = M_STR(\"nil\"); return 1;\n");
+        for (uint32_t i = 0; i < ne; i++)
+        {
+            char name[80], line[64];
+            sema_error_name(ids[i], name, sizeof(name));
+            snprintf(line, sizeof(line), "    case %lluull: *s = M_STR(", (unsigned long long)ids[i]);
+            put(e, line);
+            put_c_bytes(e, (const uint8_t *)name, strlen(name));
+            PUT(e, "); return 1;\n");
+        }
+        PUT(e, "    default: return 0;\n    }\n}\n");
+        PUT(e, "static void m__write_error(uint64_t e)\n{\n    m_str s;\n    if (m__error_text(e, &s))\n    {\n"
+               "        m_write_str(s);\n        return;\n    }\n    m_write_str(M_STR(\"error \"));\n"
+               "    m_write_uint(e);\n}\n");
     }
 
     flush(e);

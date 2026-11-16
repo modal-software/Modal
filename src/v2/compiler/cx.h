@@ -496,6 +496,7 @@ void sema_kinds_reset(void); // a fresh compilation: no function facts yet
 // Compile time (sema/comptime.c, docs/comptime.md step 1): module-level initializers the compiler
 // runs. comptime_unit evaluates those of u (after its declarations, before its bodies).
 void comptime_reset(void);
+void layout_reset(void); // a new compilation: the layout caches go with the arena
 void comptime_unit(Unit *u);
 int sema_comptime_value(SymId s, uint64_t *out); // the value the compiler computed for s
 // A string or struct value the compiler computed: its slots in the target's C layout, and for

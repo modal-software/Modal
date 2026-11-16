@@ -571,6 +571,10 @@ static void declare_struct(Unit *u, Scope *scope, SymId owner, NodeId decl)
         case AST_FIELD_DECL:
             declare_value(u, members, self, SYM_FIELD, (n->flags & AST_F_MUT) ? SYM_F_MUT : 0,
                           n->tok, m);
+            if (n->flags & AST_F_PLACED)
+            {
+                SYM(self)->flags |= SYM_F_REGISTERS; // read at every field (sema_is_register_block)
+            }
             break;
         case AST_METHOD_DECL:
             check_member_self(u, self, n->a);

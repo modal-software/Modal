@@ -487,6 +487,8 @@ static uint32_t nerror_syms, cerror_syms;
 static SymId error_syms_upto = 1;
 static uint64_t *error_ids;
 static uint32_t cerror_ids;
+static uint32_t error_syms_known; // error_syms[0 .. this) had a value: their ids are error_ids[.. stable)
+static uint32_t error_ids_stable;
 
 const uint64_t *sema_errors(uint32_t *count)
 {
@@ -511,18 +513,31 @@ const uint64_t *sema_errors(uint32_t *count)
         cerror_ids = need * 2;
         error_ids = (uint64_t *)realloc(error_ids, cerror_ids * sizeof(uint64_t));
     }
-    uint32_t n = 0;
-    for (uint64_t k = PANIC_DIVISION; k <= PANIC_STACK; k++)
+    if (!error_ids_stable)
     {
-        error_ids[n++] = k;
+        for (uint64_t k = PANIC_DIVISION; k <= PANIC_STACK; k++)
+        {
+            error_ids[error_ids_stable++] = k;
+        }
     }
-    for (uint32_t i = 0; i < nerror_syms; i++)
+    // The symbols before error_syms_known all had a value when last read: their ids stay, and
+    // only the rest are read again (print(e) asks at every print: reading all was n²).
+    uint32_t n = error_ids_stable;
+    int prefix = 1;
+    for (uint32_t i = error_syms_known; i < nerror_syms; i++)
     {
         uint64_t v;
-        if (sema_comptime_value(error_syms[i], &v) && v >= ERROR_FIRST)
+        int known = sema_comptime_value(error_syms[i], &v);
+        if (known && v >= ERROR_FIRST)
         {
             error_ids[n++] = v;
         }
+        if (prefix && known)
+        {
+            error_syms_known = i + 1;
+            error_ids_stable = n;
+        }
+        prefix = prefix && known;
     }
     *count = n;
     return error_ids;
@@ -666,8 +681,14 @@ static uint32_t *fn_adj;   // the callees of each function: fn_adj_to[fn_adj[f] 
 static SymId *fn_adj_to;
 static size_t fn_adj_edges = SIZE_MAX; // the edges it was built from (rebuilt when more came)
 
+static void check_tables_reset(void);
+
+// A new compilation (modules_link): every table of the checker is emptied. Those in the arena go
+// with it; those in malloc keep their storage. (--repeat compiled the same program again with the
+// tables of the run before: its specializations were found already, and less was done.)
 void sema_kinds_reset(void)
 {
+    check_tables_reset();
     fn_adj = NULL;
     fn_adj_to = NULL;
     fn_adj_edges = SIZE_MAX;
@@ -1970,14 +1991,10 @@ static int local_walk(const Check *c, NameId name)
     return i;
 }
 
-static int local_find(Check *c, NameId name) // the index, or -1
+static int local_find_map(Check *c, NameId name)
 {
     if (!c->lmap)
     {
-        if (c->nlocals <= LOCALS_BY_WALK)
-        {
-            return local_walk(c, name);
-        }
         uint32_t cap = 256;
         while (cap < (uint32_t)c->nlocals * 4)
         {
@@ -2003,11 +2020,39 @@ static int local_find(Check *c, NameId name) // the index, or -1
     return i;
 }
 
+// The index, or -1. A name is looked up at every use: the walk of a small function stays in
+// place at each caller (a call per lookup cost 1.5% of the check), the map is called.
+__attribute__((always_inline)) static inline int local_find(Check *c, NameId name)
+{
+    if (c->nlocals <= LOCALS_BY_WALK) // (the walk is always right: a map, when there is one, is kept too)
+    {
+        int i = c->nlocals - 1;
+        while (i >= 0 && c->locals[i].name != name)
+        {
+            i--;
+        }
+        return i;
+    }
+    return local_find_map(c, name);
+}
+
 static void push_local(Check *c, uint32_t tok, TypeId type, int mut)
 {
     const Token *t = TOK(c->u, tok);
     NameId name = token_name(t);
-    if (local_find(c, name) >= c->block_base)
+    int previous = -1; // the latest of the name, if this block declared it
+    if (c->nlocals > LOCALS_BY_WALK)
+    {
+        previous = local_find(c, name);
+    }
+    else
+    {
+        for (int i = c->nlocals - 1; i >= c->block_base && previous < 0; i--)
+        {
+            previous = c->locals[i].name == name ? i : -1;
+        }
+    }
+    if (previous >= c->block_base)
     {
         diag_at(c->u, tok, "error", "'%.*s' is already declared in this block", t->len,
                 TSTART(t));
@@ -4338,7 +4383,7 @@ static SymId specialize(Check *c, SymId fn, NodeId args, uint32_t at)
                     SPEC_BLOCK * SPEC_BLOCKS_MAX);
             return 0;
         }
-        if (nspecs % SPEC_BLOCK == 0)
+        if (nspecs % SPEC_BLOCK == 0 && !spec_blocks[nspecs / SPEC_BLOCK]) // (kept by a new compilation)
         {
             spec_blocks[nspecs / SPEC_BLOCK] = (Spec *)malloc(SPEC_BLOCK * sizeof(Spec));
         }
@@ -7058,22 +7103,29 @@ static int place_value(const Unit *u, NodeId n, uint64_t *v)
     return number_value(TSTART(t), t->len, v, &overflow) && !overflow;
 }
 
+static SymId placed_owner; // check_register's count of the fields with an offset, of this struct
+static NodeId placed_body;
+static int placed_count;
+
 static void check_register(Check *c, NodeId decl, SymId owner, TypeId declared)
 {
     Unit *u = c->u;
     const AstNode *n = NODE(u, decl);
     char buf[64];
-    // all or none: the fields of a register block each say where they are
+    // all or none: the fields of a register block each say where they are. The count is taken
+    // once per struct, not once per field (n² in a struct of n fields).
     NodeId body = NODE(&cx.units[SYM(owner)->unit], SYM(owner)->decl)->a;
-    int placed = 0, plain = 0;
-    for (NodeId m = body; m; m = NEXT(u, m))
+    if (placed_owner != owner || placed_body != body)
     {
-        if (NODE(u, m)->kind == AST_FIELD_DECL)
+        placed_owner = owner;
+        placed_body = body;
+        placed_count = 0;
+        for (NodeId m = body; m; m = NEXT(u, m))
         {
-            placed += (NODE(u, m)->flags & AST_F_PLACED) != 0;
-            plain += !(NODE(u, m)->flags & AST_F_PLACED);
+            placed_count += NODE(u, m)->kind == AST_FIELD_DECL && (NODE(u, m)->flags & AST_F_PLACED);
         }
     }
+    int placed = placed_count;
     if (!(n->flags & AST_F_PLACED))
     {
         if (placed)
@@ -7092,7 +7144,6 @@ static void check_register(Check *c, NodeId decl, SymId owner, TypeId declared)
                 type_str(declared, buf, sizeof(buf)));
         return;
     }
-    (void)plain;
     uint64_t off;
     if (!place_value(u, n->b, &off) || off > 0xffffffffu)
     {
@@ -7176,15 +7227,7 @@ static void check_device(Check *c, NodeId decl, TypeId declared)
 
 int sema_is_register_block(SymId s)
 {
-    const Unit *home = &cx.units[SYM(s)->unit];
-    for (NodeId m = NODE(home, SYM(s)->decl)->a; m; m = NEXT(home, m))
-    {
-        if (NODE(home, m)->kind == AST_FIELD_DECL && (NODE(home, m)->flags & AST_F_PLACED))
-        {
-            return 1;
-        }
-    }
-    return 0;
+    return (SYM(s)->flags & SYM_F_REGISTERS) != 0; // set as its fields are declared
 }
 
 uint64_t sema_device_address(SymId s)
@@ -7858,8 +7901,8 @@ void sema_syntax_only(Unit *u)
 typedef struct
 {
     uint32_t hash; // of the declaration's name, as text
-    uint32_t idx;  // the first declaration with that name: its index + 1 (0: empty)
-    uint32_t last; // the last one (index + 1): the others follow `next` from idx, as written
+    uint32_t idx;  // the first declaration with that name: its index + 1 (0: empty); the others
+                   // follow `next` from it, as written
 } OrderSlot;
 typedef struct
 {
@@ -7872,6 +7915,7 @@ typedef struct
     OrderSlot *slots; // the functions by their names' text: one slot per name (one probe per call)
     uint32_t mask;
     uint32_t *next;   // the next declaration with the same name (index + 1, 0: none)
+    uint32_t *last;   // by a name's first declaration: its last one (index + 1)
 } Order;
 
 static int is_function_decl(const Unit *u, NodeId d)
@@ -7903,14 +7947,14 @@ static void order_calls_text(Order *o, const char *w, size_t n)
         {
             return;
         }
-        if (sl->hash != h)
+        if (sl->hash != h || (o->state[sl->idx - 1] && (!o->next || !o->next[sl->idx - 1])))
         {
-            continue;
+            continue; // (a single definition placed already: nothing to compare)
         }
         const Token *t = TOK(o->u, NODE(o->u, o->decls[sl->idx - 1])->tok);
         if (t->len == n && memcmp(TSTART(t), w, n) == 0)
         {
-            for (uint32_t i = sl->idx; i; i = o->next[i - 1])
+            for (uint32_t i = sl->idx; i; i = o->next ? o->next[i - 1] : 0)
             {
                 if (!o->state[i - 1])
                 {
@@ -7986,7 +8030,7 @@ static void order_visit(Order *o, uint32_t i)
 // The file's declarations in checking order (out holds n): callees first.
 static uint32_t check_order(Unit *u, NodeId **out)
 {
-    Order o = {u, NULL, 0, NULL, NULL, 0, NULL, 0, NULL};
+    Order o = {u, NULL, 0, NULL, NULL, 0, NULL, 0, NULL, NULL};
     for (NodeId d = NODE(u, u->root)->a; d; d = NEXT(u, d))
     {
         o.n++;
@@ -8001,8 +8045,7 @@ static uint32_t check_order(Unit *u, NodeId **out)
     o.out = (NodeId *)malloc((o.n + 1) * sizeof(NodeId));
     o.state = (uint8_t *)calloc(o.n + 1, 1);
     o.slots = (OrderSlot *)calloc(cap, sizeof(OrderSlot));
-    o.next = (uint32_t *)calloc(o.n + 1, sizeof(uint32_t));
-    if (!o.decls || !o.out || !o.state || !o.slots || !o.next)
+    if (!o.decls || !o.out || !o.state || !o.slots)
     {
         fprintf(stderr, "fatal: out of memory\n");
         exit(2);
@@ -8024,14 +8067,33 @@ static uint32_t check_order(Unit *u, NodeId **out)
                 }
                 k = (k + 1) & o.mask;
             }
+            if (o.slots[k].idx && !o.next) // the first name defined twice: the chains are made now
+            {
+                o.next = (uint32_t *)calloc(2 * (o.n + 1), sizeof(uint32_t));
+                if (!o.next)
+                {
+                    fprintf(stderr, "fatal: out of memory\n");
+                    exit(2);
+                }
+                o.last = o.next + o.n + 1;
+                for (uint32_t j = 0; j < i; j++)
+                {
+                    o.last[j] = j + 1; // each name so far: defined once, at j
+                }
+            }
             if (o.slots[k].idx)
             {
-                o.next[o.slots[k].last - 1] = i + 1;
-                o.slots[k].last = i + 1;
+                uint32_t first = o.slots[k].idx - 1;
+                o.next[o.last[first] - 1] = i + 1;
+                o.last[first] = i + 1;
             }
             else
             {
-                o.slots[k] = (OrderSlot){h, i + 1, i + 1};
+                o.slots[k] = (OrderSlot){h, i + 1};
+                if (o.last)
+                {
+                    o.last[i] = i + 1;
+                }
             }
         }
     }
@@ -8062,6 +8124,8 @@ static uint32_t check_order(Unit *u, NodeId **out)
 
 void sema_check_decls(Unit *u)
 {
+    placed_owner = 0; // (SymIds of another compilation)
+    placed_body = 0;
     // One type and one resolved declaration per node (8 bytes), which is all a backend
     // reads. They cover the declarations now and grow to fit the largest body later.
     side_tables(u, 0);
@@ -8377,4 +8441,48 @@ size_t sema_fn_text(Unit *u, SymId fn, char *buf, size_t cap)
     }
 #undef ADD
     return n < cap ? n : cap ? cap - 1 : 0;
+}
+
+static void check_tables_reset(void)
+{
+    nspecs = 0; // (the blocks stay allocated)
+    ngenerics = 0;
+    if (spec_syms)
+    {
+        memset(spec_syms, 0, spec_syms_cap * sizeof(SpecSym));
+    }
+    if (spec_hash)
+    {
+        memset(spec_hash, 0, spec_hash_cap * sizeof(uint32_t));
+    }
+    spec_queue_head = spec_queue_tail = 0;
+    if (ef_cap)
+    {
+        memset(ef_panics, 0, ef_cap);
+        memset(ef_flags, 0, ef_cap);
+    }
+    ef_nedges = ef_nids = 0;
+    ef_seen_count = 0;
+    nerror_syms = 0;
+    error_syms_upto = 1;
+    error_syms_known = error_ids_stable = 0;
+    err_matches = NULL; // (in the arena)
+    nerr_matches = err_matches_cap = 0;
+    ntaken = nknown = 0;
+    ncaptures = 0;
+    ngeneric_names = 0;
+    generic_names_units = 0xffff;
+    if (generic_cache)
+    {
+        memset(generic_cache, 0, generic_cap);
+    }
+    if (lit_owner)
+    {
+        memset(lit_owner, 0, lit_owner_cap * sizeof(SymId));
+    }
+    npending_lits = 0;
+    placed_owner = 0;
+    placed_body = 0;
+    decl_last_first = decl_last = 0;
+    layout_reset();
 }
