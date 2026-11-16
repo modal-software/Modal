@@ -71,6 +71,28 @@ awk 'BEGIN {
     print "}"
 }' > "$W/specs.modal"
 
+# wide.modal: what one declaration can hold, at scale (context.md §71): 3,000 clauses of one
+# function, a function of 3,000 locals, a struct of 4,000 fields, and 100 error names printed.
+# `big` has none of them, so it cannot see a cost that grows with their size.
+awk 'BEGIN {
+    print "print := import(\"std\").io.print"
+    print "u64 seed = 9\nu64 zero = 0"
+    for (i = 0; i < 3000; i++) printf "u64 f(u64 %d): %d\n", i * 2, i
+    print "u64 f(u64 k): 7"
+    print "w(a: u64): u64 {"
+    for (i = 0; i < 3000; i++) printf "    u64 x%d = a + %d\n", i, i
+    print "    return x0 + x2999\n}"
+    print "wide: struct {"
+    for (i = 0; i < 4000; i++) printf "    u64 m%d,\n", i
+    print "}"
+    for (i = 0; i < 100; i++) printf "bad%d: error\n", i
+    for (i = 0; i < 100; i++) printf "e%d(u64 a): u64, error {\n    if a { 0: return bad%d, _: return a }\n}\n", i, i
+    print "main(): u8 {\n    wide b\n    b.m0 = seed\n    b.m3999 = 2"
+    print "    print(\"wide\", f(seed * 222), w(seed), b.m0 + b.m3999)"
+    for (i = 0; i < 100; i++) printf "    n%d, x%d := e%d(zero)\n    print(x%d)\n", i, i, i, i
+    print "    return 0\n}"
+}' > "$W/wide.modal"
+
 # best of $N of the `--time` line for a phase, of a full compile to an executable
 phase_best() { # phase file
     i=0
@@ -97,11 +119,11 @@ done
 echo "| program | check warm | emit | -o | exec | --run | code B | file B | RAM B | memory used / taken KB | RSS MB | faults |"
 echo "|---|---|---|---|---|---|---|---|---|---|---|---|"
 for f in examples/secret.modal examples/run/hello.modal examples/run/output.modal \
-    examples/run/structs.modal examples/run/patterns.modal "$W/big.modal" "$W/reached.modal" "$W/specs.modal"; do
+    examples/run/structs.modal examples/run/patterns.modal "$W/big.modal" "$W/reached.modal" "$W/specs.modal" "$W/wide.modal"; do
     name=$(basename "$f" .modal)
     reps=200
     runs=$N
-    { [ "$name" = big ] || [ "$name" = reached ] || [ "$name" = specs ]; } && reps=20 && runs=$(( N < 10 ? N : 10 ))
+    { [ "$name" = big ] || [ "$name" = reached ] || [ "$name" = specs ] || [ "$name" = wide ]; } && reps=20 && runs=$(( N < 10 ? N : 10 ))
     if ! $BIN --backend native -o "$W/ok-$name" "$f" >/dev/null 2>&1; then
         echo "| $name | does not compile: $($BIN "$f" 2>&1 | grep -m1 error | cut -c1-90) |"
         continue
