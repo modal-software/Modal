@@ -44,6 +44,7 @@ Done (details in context.md):
 | std 5 (part 1), patterns | `nil`; overloads by type; range and string patterns; arms (`value { ... }`, bodies of arms) with coverage errors; a loop written as arms is one function and a loop | §29 |
 | audit | specializations found by index, not by walking the table: bench `specs` (4,000 specializations) `-o` 841.0 → 59.3 ms, `big` unchanged | §69 |
 | scale | no fixed limit on locals, specializations, files, labels, error names; walks inside walks removed (12,000 structs 508 → 21 ms; 400 unused generics 97 → 21 ms); C arms past 5,000 compile; a function of another file main cannot reach is not generated; native arena on big 20.3 → 15.0 MB | §70 |
+| scale 2 | one declaration at scale is linear: 8,000 clauses 1,430 → 4 ms (check), 12,800 locals 944 → 6.5 ms (native), 16,000 fields 469 → 4.8 ms (C); C `print(e)` one routine; `--repeat` does the same work each run; big check −2% instructions | §71 |
 
 Not done: the Cortex-M backend (register allocation, its base, is done: §20), interrupts (need
 QEMU or a board to verify).

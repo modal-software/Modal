@@ -276,6 +276,15 @@ worse, say so; don't present that version as the "before".
 - **What main reaches is found from the text** (module.c, before any body is checked). A new
   way to call a function without naming it in a reached declaration (beyond a struct's methods
   and a specialization's generic) must be added there, or the function is not generated.
+- **A static table outlives a compilation.** `--repeat` compiles again in one process after
+  `context_reset`; a table kept in a static (by SymId, or pointing into the arena) must be emptied
+  in `sema_kinds_reset` / `comptime_reset` / `layout_reset`, or the next run reads the last one's
+  (context.md §71). Check with `--repeat 3`: its counts must be those of one run.
+- **A hot lookup stays inline.** Replacing a loop written at each caller with a call cost 1.5%
+  of big's check (§71): keep the common case in an `always_inline` function and call out only
+  for the rare one.
+- **A per-declaration table on every file costs memory faults.** Allocate it when the case it
+  is for appears (the order chains: 430 KB on big, +1% of its check).
 - **A stencil change needs `make stencils`**, and the emitter refuses stale headers
   ("its stencils are out of date"). After `git stash` and back, touch the sources: make compares
   whole seconds, and a stash round trip within one second leaves a stale `./modal`.
@@ -484,11 +493,23 @@ walk):
 - ~~`print(e)` wrote a compare per error at each print~~, capped at 512 names (100 prints × 100
   names did not compile on native; §70: one routine).
 - ~~C: a match past about 5,000 arms crashed clang~~ (§70: a flat chain past 64).
-- **Clauses:** one group of n pattern clauses is O(n²) in `sema_declare` (2,000: 93.7 ms). Not
-  fixed.
+- ~~**Clauses:** one group of n pattern clauses is O(n²) in `sema_declare` (2,000: 93.7 ms)~~
+  (context.md §71: n in the declare, the order, the check and the C names; 8,000: 4 ms).
 - **`val` is still a keyword** (v1): a module-level `val(...)` parses as an import list.
-- The C backend's chain per `print(e)`, the duplicate-local check (O(locals²) in a block), and
-  the 200-level nesting guard stay.
+- ~~The C backend's chain per `print(e)`~~ (§71: one routine), ~~the duplicate-local check
+  (O(locals²) in a block)~~ (§71: a map past 32 locals, in the check and the lowering). The
+  200-level nesting guard stays.
+
+Found by the generators again (§71):
+
+- ~~`dce` scanned forward from each instruction~~ (up to 4,096 steps: 12,800 locals took 944 ms
+  on native; a sweep from the end past 512 instructions).
+- ~~A struct's fields were walked per field~~ (`check_register`, `sema_is_register_block`: 16,000
+  fields 469 ms on C).
+- ~~`sema_errors` built its list again at each `print(e)`~~.
+- ~~`--repeat` kept the checker's tables across runs~~: its later runs did less work, and
+  pointed into the emptied arena. Its numbers before §71 were too low for generic programs.
+- ~~Each body was walked three times for import paths~~ (big's check −2% instructions).
 - **`--time` costs time:** two `clock_gettime` per deferred body, about 2% of the samples. Its
   numbers are slightly above the real ones.
 

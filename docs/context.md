@@ -2930,16 +2930,133 @@ inside a walk) and by profiling what was slow.
   statement, a pipe stage that passes a value on, `return x.(...)`), 1,000-field recursion.
 
 **Not yet**
-- **Clauses:** a group of n pattern clauses is O(n²) in `sema_declare`, from the duplicate and
+- ~~**Clauses:** a group of n pattern clauses is O(n²) in `sema_declare`, from the duplicate and
   catch-all checks in `declare_callable` and the pairwise overlap check (2,000 clauses 93.7 ms,
-  500 11.8 ms). Sorted intervals would make it n log n.
+  500 11.8 ms). Sorted intervals would make it n log n.~~ §71.
 - **`val` is still a keyword** (v1's `AST_VAL_DECL`): a module-level `val(k: u64)` parses as an
   import list. The no-keywords rule says it should be a name.
 - **Native memory** still about 100 B a function above C: the MIR kept for inlining
   (`Inlinable`, kept to the end), `fn ranges` (57 B a function), `fn_at` regrown in the arena.
-- The C backend still writes a chain of compares per `print(e)` (code O(prints × errors)).
-- A body's duplicate-local check walks the block's locals (O(locals²) in one block).
+- ~~The C backend still writes a chain of compares per `print(e)` (code O(prints × errors)).~~
+  §71.
+- ~~A body's duplicate-local check walks the block's locals (O(locals²) in one block).~~ §71.
 - Nesting is still limited to 200 levels (a guard, not a gap).
+
+## 71. Scale, continued: one declaration at scale, and `--repeat` measuring the same work
+
+The owner (2026-11-15): go on with what §70 left, always after the most speed there is, in any
+phase. The generators of §70 were run again on every feature (n and 4n), past the first gaps.
+
+**What works**
+- One function of n clauses costs n in every phase (it was n² in four places).
+- A function of n locals costs n in the check, the lowering and the optimizer.
+- A struct of n fields costs n in the check and in both backends.
+- `print(e)` past 8 names is a call on C too (`m__write_error`), as on native since §70.
+- `--repeat N` does the same work in every run. The tables of the checker, the layout and the
+  interpreter lived across runs: a second run found the specializations of the first one already
+  made (generic.modal: 55 declarations instead of 62), and the interpreter's stacks and the layout
+  caches pointed into an arena emptied in between (`fields_each.modal` crashed under `--repeat`).
+- big is cheaper than at the end of §70: a body with no import, selector or `val` is walked once
+  for its paths instead of three times.
+
+**How**
+- **Clauses, declared** (resolve.c): `declare_callable` walked the group for a definition with
+  the same signature and for a catch-all of the same types. An index per unit (open addressing,
+  made when a name gets its second definition) holds a tail entry per group, one entry per
+  signature hash (types and patterns, as `same_signature` compares them) and one per catch-all;
+  a hash match is confirmed by the exact comparison.
+- **Clauses, checked together** (resolve.c): the end of `sema_declare` walked every symbol of the
+  program for each file, and every later clause for each clause. Now each chain is read once
+  (from the file's first symbol); its definitions are grouped by the hash of their types, and the
+  single-pattern clauses of a group are sorted by column and low end (`sema_pattern_span` gives
+  each one as an interval of order keys, the sign bit flipped for a signed type). A clause that
+  starts at or before the highest end seen overlaps; strings are grouped by the hash of their
+  bytes and compared. A clause is reported against one clause it overlaps (it was every pair).
+  A pattern that does not fit its type is left out: it overlapped everything before, which gave
+  messages next to the one that says it does not fit.
+- **Clauses, in order** (`check_order`, check.c): every definition of a name had its own slot,
+  all in one probe cluster, so inserting n of them took n² probes. One slot per name now, with
+  the others chained in order (`next`, `last`, allocated when a name is defined twice). A single
+  definition placed already is skipped without comparing its text, as before.
+- **Clauses, found** (`decl_symbol`): the definition after the last one found is tried first.
+- **Clauses, named in C** (`clause_index`, c/emit.c): a clause's place among the definitions of
+  its arity was counted from the first at every mention of its name; the places of a chain are
+  counted once.
+- **Locals** (check.c `local_find`, lower.c `local_index`): past 32 locals, a map from name to
+  the latest local. An entry is exact for what was pushed since the map was made: a name missing
+  from it has no local, a push writes its entry. A block that ended may have taken the local an
+  entry points to; then the walk finds the one it shadowed and writes it down. The one place that
+  lowers `nlocals` and raises it again (a pending literal) drops the map. Up to 32, the walk is
+  written in place at each caller: a call per lookup cost 1.5% of big's check. The duplicate check
+  walks only the block, as before.
+- **Dead code** (opt.c): `dce` asked `live_after` (a scan forward of up to 4,096 steps) for each
+  instruction: n² in a long block, bounded only by the cap. Past 512 instructions it reads every
+  slot's liveness in one sweep from the end (`Live`: a value per slot, stamped, and a base value a
+  label, a branch or an end sets for all at once). Up to 512 the scan stays: it costs less there,
+  and gives the same answer. `fold` and `merge_output` read whether a write's slot is read after it
+  from the same sweep (`write_dead`) in a long function.
+- **Fields:** `check_register` counted the struct's fields with an offset for each field (once
+  per struct now), and `sema_is_register_block` walked the fields at every query, in layout and
+  both backends (a symbol flag now, `SYM_F_REGISTERS`, set when a placed field is declared).
+- **Error names** (`sema_errors`): the list was built again at each `print(e)`; the ids of the
+  symbols that had a value stay, and only the rest are read again.
+- **C `print(e)`:** past 8 names, `m__error_text` (a `switch` with every name) and
+  `m__write_error`, made once at the end, `noinline` and `cold`: inlined, the table was copied at
+  every print. With a `put`, the name comes from `m__error_text` and goes through the put.
+- **`--repeat`:** `sema_kinds_reset` (called by `modules_link`) empties the checker's tables
+  (`check_tables_reset`) and the layout's (`layout_reset`); `comptime_reset` forgets the
+  interpreter's two static machines, its type descriptors and its fold notes, all in the arena.
+- **Paths** (`module_body_nodes`, module.c): the walk that finds a body's imports also says
+  whether it has an import, a selector or a `val`; without one, `module_check_paths` (two more
+  walks) is not called.
+- A mark taken as a pointer into the MIR region was wrong after the region left its shared page
+  (it starts again elsewhere): `dce` keeps the offset and gives nothing back then.
+
+**Measured** (best of 3, ms, `-o`; before is the source at the end of §70)
+
+| program | check | native | C |
+|---|---|---|---|
+| 2,000 clauses | 92.0 → 1.9 | 94.0 → 3.7 | 118.4 → 3.4 |
+| 8,000 clauses | 1,429.8 → 4.0 | 1,431.8 → 10.8 | 1,859.7 → 9.7 |
+| 3,200 locals | 5.6 → 1.7 | 42.3 → 2.7 | 6.0 → 2.0 |
+| 12,800 locals | 81.0 → 2.9 | 944.2 → 6.5 | 83.0 → 4.2 |
+| 16,000 fields | 94.4 → 2.4 | 220.0 → 4.0 | 468.9 → 4.8 |
+| 3,200 errors printed | 22.8 → 4.6 | 252.7 → 35.8 | 1,627.4 → 11.1 |
+| bench `wide` | 212.1 → 2.9 | 242.4 → 7.9 | 302.0 → 6.6 |
+
+- C `print(e)`, 100 prints × 100 names: the C file 679 → 74 KB, clang 0.61 → 0.10 s, the
+  executable 50 → 34 KB.
+- **big, instructions retired** (min of 3, against the end of §70): check 675.9M → 662.6M (−2.0%), native `-o`
+  1,588.1M → 1,575.8M (−0.8%), C `-o` 1,307.6M → 1,296.1M (−0.9%); reached about the same.
+  Interleaved best of 15, three rounds: check 27.9, 28.1, 28.1 → 27.5, 27.5, 27.6 ms; native
+  65.1, 65.7, 66.1 → 65.2, 66.7, 65.5; C 53.8, 54.4, 54.2 → 54.3, 53.9, 53.8; reached 71.1,
+  71.0, 71.9 → 70.6, 71.4, 71.5.
+- Passes that were tried and measured, not kept: the map consulted whenever it exists (two
+  checks per lookup: +0.5% on big's check), the sweep for every function (+0.4% on big's native:
+  its table costs more than the scan of a short function), the order chains allocated always
+  (430 KB on big, +1% of its check time).
+
+**Verified**
+- Tests 516 ok (513 and 3 new: 3,000 clauses on C and native, two overlap reports); the
+  failures are the 51 of before. ASan/UBSan: 516 ok, no report; `--repeat` on every example
+  under it.
+- The MIR of every example, big, reached and the scale programs is byte for byte the one of the
+  end of §70, but for one: in a `main` of 9,000 instructions the sweep finds dead copies that the
+  scan's 4,096 steps did not reach. The output is the same.
+- Clause diagnostics against the old compiler on overlapping ranges, signed ranges, strings,
+  several arities and methods: the same, but one partner per overlapping clause, and no message
+  for a pattern that does not fit.
+- `--repeat 3` gives every example and error file the counts and diagnostics of one run.
+- Fuzz 0 differ: mix, struct, scalar, pressure (N=120), `MODAL_REGS=0`, `MODAL_TREE=0`
+  (N=80).
+
+**Not yet**
+- **`val` is still a keyword** (v1), with a dozen others (`fun`, `use`, `test`, `defer`, ...):
+  removing them is a language decision, not a speed one.
+- **Native memory** still about 100 B a function above C (§70).
+- `merge_output` and `fold` keep the scan below 512 instructions; `known_bounds` and
+  `dead_stores` were not looked at for long blocks.
+- The 200-level nesting guard stays.
 
 ## Appendix A. The owner's original specification inputs
 
